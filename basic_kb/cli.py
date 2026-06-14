@@ -152,7 +152,7 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
     kb = _build_kb(args, config)
     for source in sources:
         kb.index(source=source, chunk_size=chunk_size, overlap=overlap,
-                 min_chunk=min_chunk, force=args.force)
+                 min_chunk=min_chunk, force=args.force, limit=getattr(args, "limit", None))
 
 
 def _preview_chunks(sources: list[DataSourceBase], config: Config,
@@ -187,6 +187,9 @@ def _preview_chunks(sources: list[DataSourceBase], config: Config,
                 if not files:
                     print(f"[{source.source_id}] No file named '{file_filter}' found.", file=sys.stderr)
                     continue
+            limit = getattr(args, "limit", None)
+            if limit is not None:
+                files = files[:limit]
 
             p(f"\n{'='*60}")
             p(f"Source: {source.source_id}  |  {len(files)} file(s)  |  chunk_size={chunk_size}")
@@ -296,6 +299,9 @@ def build_parser() -> argparse.ArgumentParser:
     _shared_args(p_index)
     p_index.add_argument("--force", action="store_true",
                          help="Clear existing index and re-embed from scratch")
+    p_index.add_argument("--limit", type=int, default=None, metavar="N",
+                         help="Index only the first N files per source (test runs). "
+                              "Example: index --limit 10")
     p_index.add_argument("--preview", action="store_true",
                          help="Preview chunks without embedding (dry-run). "
                               "Example: index --source notes --preview --file some.md")

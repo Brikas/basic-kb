@@ -63,12 +63,20 @@ class KnowledgeBase:
         overlap: int = DEFAULT_OVERLAP,
         min_chunk: int = DEFAULT_MIN_CHUNK,
         force: bool = False,
+        limit: Optional[int] = None,
     ) -> None:
-        """Index all files from a DataSource into its own ChromaDB collection."""
+        """Index all files from a DataSource into its own ChromaDB collection.
+
+        `limit` caps the number of files (first N, stable order) — handy for test
+        runs before committing to a long full embed.
+        """
         files = source.get_files()
         if not files:
             print(f"No files found for source '{source.label}'. Nothing to index.", file=sys.stderr)
             return
+        if limit is not None:
+            files = files[:limit]
+            print(f"[limit] indexing only the first {len(files)} file(s) of this source.")
 
         client = self._client()
         if force:
