@@ -1,0 +1,340 @@
+"""basic-kb command-line interface.
+
+  python -m basic_kb index  --config CFG [--source ID|all] [--force] [--preview]
+  python -m basic_kb search "..." --config CFG [--source ID|all] [--n N]
+  python -m basic_kb status --config CFG [--source ID|all]
+
+Every command needs --config pointing at an instance config (see README).
+Multi-query search improves recall:
+  python -m basic_kb search "price too high" "budget concern" --config CFG
+
+Embedding / chunking overrides (override config defaults for one run):
+  --model NAME  --chunk-size N  --overlap N  --min-chunk N
+
+Reranking (search only; on by default when JINA_API_KEY is set):
+  --no-rerank | --rerank (strict)  --reranker-model M  --rerank-candidates N
+
+Secrets: set JINA_API_KEY in the environment, pass --env-file PATH, or set
+`env_file:` in the config (CLI/shell win over the config file).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import sys
+from pathlib import Path
+from typing import Optional
+
+from .config import Config, load_config, load_env_file
+from .core import DEFAULT_N, KnowledgeBase
+from .embedders import FastEmbedEmbedder
+from .models import SearchResult
+from .rerankers import JinaReranker, RerankerBase
+from .sources import DataSourceBase, build_source
+
+
+# ---------------------------------------------------------------------------
+# Building blocks
+# ---------------------------------------------------------------------------
+
+def _effective(args: argparse.Namespace, config: Config) -> tuple[str, int, int, int]:
+    """Resolve model + chunk params: CLI flag wins, else config default."""
+    model = getattr(args, "model", None) or config.embedding_model
+    chunk_size = getattr(args, "chunk_size", None) or config.chunk_size
+    overlap = getattr(args, "overlap", None) if getattr(args, "overlap", None) is not None else config.overlap
+    min_chunk = getattr(args, "min_chunk", None) or config.min_chunk
+    return model, chunk_size, overlap, min_chunk
+
+
+def _build_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
+    model, *_ = _effective(args, config)
+    embedder = FastEmbedEmbedder(alias=model)
+
+    reranker: Optional[RerankerBase] = None
+    no_rerank = getattr(args, "no_rerank", False)
+    explicit_rerank = getattr(args, "rerank", False)
+    if not no_rerank:
+        import os
+        if os.environ.get("JINA_API_KEY"):
+            reranker = JinaReranker(model=getattr(args, "reranker_model", "jina-reranker-v3"))
+        elif explicit_rerank:
+            print("Error: --rerank requires JINA_API_KEY (env, --env-file, or config env_file).",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    return KnowledgeBase(embedder=embedder, chroma_dir=config.store_dir, reranker=reranker)
+
+
+def _print_sources(config: Config) -> None:
+    print(f"\nInstance '{config.name}' sources (use with --source):\n")
+    for s in config.sources:
+        try:
+            src = build_source(s, config.base_dir)
+            n_files = len(src.get_files())
+            where = src.directory
+        except Exception as e:  # bad source entry — report, don't hide
+            print(f"  {s.get('id', '?'):<16}  [config error: {e}]")
+            continue
+        print(f"  {src.source_id:<16}  {src.label}  ({s.get('type', 'markdown')}, {n_files} files)")
+        if src.description:
+            print(f"                    {src.description}")
+        print(f"                    {where}")
+        print()
+    print("  all               All sources combined (default)\n")
+
+
+def _load_sources(config: Config, source_arg: str,
+                  content_type: Optional[str] = None) -> list[DataSourceBase]:
+    """Resolve --source into DataSource objects. 'list' prints and exits."""
+    configured = {s["id"]: s for s in config.sources}
+    if source_arg == "list":
+        _print_sources(config)
+        sys.exit(0)
+    ids = list(configured) if source_arg == "all" else [s.strip() for s in source_arg.split(",") if s.strip()]
+    out: list[DataSourceBase] = []
+    for sid in ids:
+        if sid not in configured:
+            print(f"Unknown source {sid!r}. Configured: {', '.join(configured)} (or 'all', 'list').",
+                  file=sys.stderr)
+            sys.exit(1)
+        out.append(build_source(configured[sid], config.base_dir, content_type))
+    return out
+
+
+def _print_results(hits: list[SearchResult], max_chars: int) -> None:
+    reranked = any(r.rerank_score is not None for r in hits)
+    print(f"Top {len(hits)} results{'  [reranked]' if reranked else ''}\n")
+
+    for rank, r in enumerate(hits, 1):
+        meta = r.metadata
+        score_str = f"score={round(r.score, 3)}"
+        if r.rerank_score is not None:
+            score_str += f"  rerank={round(r.rerank_score, 4)}"
+
+        # Web-style metadata (url/content_type) gets a richer header; else date.
+        if meta.get("url") or meta.get("content_type", "unknown") != "unknown":
+            header = (
+                f"[{rank}] {meta.get('title', '?')}  "
+                f"[{meta.get('content_type', '?')}]  {score_str}"
+            )
+            ref = meta.get("url") or meta.get("file", "?")
+        else:
+            header = (
+                f"[{rank}] {meta.get('title', '?')}  "
+                f"({meta.get('date', '?')})  {score_str}"
+            )
+            ref = meta.get("file", "?")
+
+        print("=" * 60)
+        print(header)
+        print(f"    {ref}")
+        print("─" * 60)
+        output = r.doc if not max_chars else r.doc[:max_chars]
+        print(output)
+        if max_chars and len(r.doc) > max_chars:
+            print(f"  [...{len(r.doc) - max_chars} more chars]")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_index(args: argparse.Namespace, config: Config) -> None:
+    sources = _load_sources(config, getattr(args, "source", "all"))
+    _, chunk_size, overlap, min_chunk = _effective(args, config)
+
+    if getattr(args, "preview", False):
+        _preview_chunks(sources, config, chunk_size, overlap, min_chunk, args)
+        return
+
+    kb = _build_kb(args, config)
+    for source in sources:
+        kb.index(source=source, chunk_size=chunk_size, overlap=overlap,
+                 min_chunk=min_chunk, force=args.force)
+
+
+def _preview_chunks(sources: list[DataSourceBase], config: Config,
+                    chunk_size: int, overlap: int, min_chunk: int,
+                    args: argparse.Namespace) -> None:
+    """Write chunks for each source to a file without embedding anything."""
+    file_filter = getattr(args, "file", None)
+    max_chars = getattr(args, "max_chars", 0)
+    out_arg = getattr(args, "out", None)
+
+    source_ids = "-".join(s.source_id for s in sources)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    if out_arg:
+        out_path = Path(out_arg)
+    else:
+        tmp_dir = config.base_dir / "tmp"
+        tmp_dir.mkdir(exist_ok=True)
+        out_path = tmp_dir / f"kb-preview-{source_ids}-{ts}.txt"
+
+    total_files = total_chunks = 0
+
+    with out_path.open("w", encoding="utf-8") as fh:
+        def p(*a, **kw):
+            kw.setdefault("file", fh)
+            print(*a, **kw)
+
+        for source in sources:
+            chunker = source.make_chunker(chunk_size, overlap, min_chunk)
+            files = source.get_files()
+            if file_filter:
+                files = [f for f in files if f.name == file_filter]
+                if not files:
+                    print(f"[{source.source_id}] No file named '{file_filter}' found.", file=sys.stderr)
+                    continue
+
+            p(f"\n{'='*60}")
+            p(f"Source: {source.source_id}  |  {len(files)} file(s)  |  chunk_size={chunk_size}")
+            p(f"{'='*60}")
+
+            for f in files:
+                doc = source.parse_file(f)
+                if doc is None:
+                    p(f"\n[{f.name}] — empty/unparseable, skipped")
+                    continue
+                chunks = chunker.chunk(doc)
+                total_files += 1
+                total_chunks += len(chunks)
+
+                p(f"\n{'─'*60}")
+                p(f"FILE: {f.name}  ({len(doc.body)} chars body → {len(chunks)} chunks)")
+                p(f"{'─'*60}")
+                for i, c in enumerate(chunks):
+                    body_preview = c.text if not max_chars else c.text[:max_chars]
+                    suffix = "…" if max_chars and len(c.text) > max_chars else ""
+                    p(f"\n  Chunk {i+1}/{len(chunks)}  ({len(c.text)} chars)")
+                    p(f"  breadcrumb: {c.metadata.get('breadcrumb', '(none)')}")
+                    p()
+                    for line in (body_preview + suffix).splitlines():
+                        p(f"    {line}")
+
+        p(f"\n{'='*60}")
+        p(f"Total: {total_files} file(s), {total_chunks} chunks")
+        p(f"{'='*60}")
+
+    print(f"Preview written to: {out_path}")
+
+
+def cmd_search(args: argparse.Namespace, config: Config) -> None:
+    content_type = getattr(args, "content_type", None)
+    sources = _load_sources(config, getattr(args, "source", "all"), content_type)
+    if not args.queries:
+        print("Error: at least one query is required.", file=sys.stderr)
+        sys.exit(1)
+    kb = _build_kb(args, config)
+
+    hits = kb.search(
+        sources=sources,
+        queries=args.queries,
+        n=args.n,
+        content_type_filter=content_type,
+        rerank_candidates=getattr(args, "rerank_candidates", None),
+        strict_rerank=getattr(args, "rerank", False),
+    )
+    if not hits:
+        print("No results.")
+        return
+    if len(args.queries) > 1:
+        print(f"[{len(args.queries)} queries merged]")
+    _print_results(hits, args.max_chars)
+
+
+def cmd_status(args: argparse.Namespace, config: Config) -> None:
+    sources = _load_sources(config, getattr(args, "source", "all"))
+    kb = _build_kb(args, config)
+    kb.status(sources)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _shared_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", required=True, metavar="FILE",
+                        help="Path to the instance config YAML (required).")
+    parser.add_argument("--env-file", metavar="FILE",
+                        help="Dotenv file to load (e.g. for JINA_API_KEY). Overrides config env_file.")
+    known = ", ".join(FastEmbedEmbedder.SUPPORTED)
+    parser.add_argument("--model", default=None, metavar="NAME",
+                        help=f"Embedding model alias or HF id (default: from config). Known: {known}")
+    parser.add_argument("--chunk-size", type=int, default=None, metavar="N",
+                        help="Max chunk size in chars (default: from config)")
+    parser.add_argument("--overlap", type=int, default=None, metavar="N",
+                        help="Overlap between chunks in chars (default: from config)")
+    parser.add_argument("--min-chunk", type=int, default=None, metavar="N",
+                        help="Minimum chunk size to keep in chars (default: from config)")
+    parser.add_argument("--source", default="all", metavar="ID",
+                        help="Source id(s) to operate on, comma-separated; 'all' (default) or 'list'.")
+
+
+def _rerank_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--no-rerank", action="store_true", help="Disable Jina reranking entirely")
+    group.add_argument("--rerank", action="store_true",
+                       help="Strict mode: error on rerank failure (requires JINA_API_KEY)")
+    parser.add_argument("--reranker-model", default="jina-reranker-v3", metavar="MODEL",
+                        help="Jina reranker model (default: jina-reranker-v3)")
+    parser.add_argument("--rerank-candidates", type=int, default=None, metavar="N",
+                        help="Candidates to fetch before reranking (default: 3× --n, max 50)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="basic_kb",
+        description="basic-kb — local semantic search over markdown/text sources",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_index = sub.add_parser("index", help="Embed and index documents")
+    _shared_args(p_index)
+    p_index.add_argument("--force", action="store_true",
+                         help="Clear existing index and re-embed from scratch")
+    p_index.add_argument("--preview", action="store_true",
+                         help="Preview chunks without embedding (dry-run). "
+                              "Example: index --source notes --preview --file some.md")
+    p_index.add_argument("--file", metavar="FILENAME",
+                         help="Limit --preview to a single file by name, e.g. some-page.md")
+    p_index.add_argument("--max-chars", type=int, default=0, metavar="N",
+                         help="Truncate chunk content in --preview output to N chars (default: 0 = full)")
+    p_index.add_argument("--out", metavar="FILE",
+                         help="Write --preview output to FILE instead of the auto tmp/ path.")
+
+    p_search = sub.add_parser("search", help="Search the index")
+    _shared_args(p_search)
+    _rerank_args(p_search)
+    p_search.add_argument("queries", nargs="*",
+                          help="One or more queries (multiple are merged for better recall).")
+    p_search.add_argument("--n", type=int, default=DEFAULT_N, metavar="N",
+                          help=f"Number of results (default: {DEFAULT_N})")
+    p_search.add_argument("--content-type", default=None, metavar="TYPE",
+                          help="Filter by frontmatter content_type (markdown sources).")
+    p_search.add_argument("--max-chars", type=int, default=0, metavar="N",
+                          help="Truncate each result to N chars (default: 0 = full)")
+
+    p_status = sub.add_parser("status", help="Show index stats")
+    _shared_args(p_status)
+
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # Load secrets first: --env-file (explicit) wins over config env_file (both setdefault).
+    if getattr(args, "env_file", None):
+        load_env_file(Path(args.env_file).expanduser())
+    config = load_config(Path(args.config))
+    if config.env_file and config.env_file.exists():
+        load_env_file(config.env_file)
+
+    {"index": cmd_index, "search": cmd_search, "status": cmd_status}[args.cmd](args, config)
+
+
+if __name__ == "__main__":
+    main()

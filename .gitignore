@@ -1,0 +1,17 @@
+# Vector stores (instances keep their own .chroma next to their config)
+.chroma/
+**/.chroma/
+
+# Preview / scratch output
+tmp/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local env / secrets
+.env

@@ -1,0 +1,31 @@
+# basic-kb instance config. Copy next to where you want the index to live.
+# All relative paths are anchored to THIS file's directory.
+
+name: my-notes              # label only
+store_dir: .chroma          # ChromaDB store for this instance (gitignore it)
+embedding_model: bge-small-en-v1.5
+
+# Optional: dotenv file to pull secrets from (e.g. JINA_API_KEY for reranking).
+# The path is relative to this config. CLI --env-file and real env vars win over it.
+# env_file: ../../.env
+
+chunker:                    # defaults; override per-run with CLI flags
+  max_chunk_size: 1200
+  overlap: 100
+  min_chunk_size: 50
+
+# Each source -> its own collection. Query one (--source notes), several
+# (--source notes,docs), or all (default). See --source list.
+sources:
+  - id: notes
+    type: markdown          # markdown | transcript
+    path: data/notes        # folder of .md files (searched recursively)
+    chunker: recursive      # recursive (no headings) | breadcrumb (heading-aware)
+    label: My Notes
+    description: Personal markdown notes.
+
+  # - id: transcripts
+  #   type: transcript
+  #   path: data/transcripts
+  #   chunker: recursive
+  #   label: Meeting Transcripts
