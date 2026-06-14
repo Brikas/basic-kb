@@ -15,12 +15,23 @@ pip install -e .            # or: pip install -e /path/to/basic-kb
 
 ## Use
 
+Put a `basic-kb.yaml` in your instance folder, then just run the commands from
+inside it — the config is found automatically (like `git` finds `.git`):
+
 ```bash
-python -m basic_kb index  --config mykb.yaml            # build/refresh the index
-python -m basic_kb search "the thing I'm looking for" --config mykb.yaml
-python -m basic_kb status --config mykb.yaml
-python -m basic_kb search --source list --config mykb.yaml   # list configured sources
+cd my-instance/            # the folder holding basic-kb.yaml
+basic-kb index             # build/refresh the index
+basic-kb search "the thing I'm looking for"
+basic-kb status
+basic-kb search --source list      # list configured sources
 ```
+
+(`basic-kb …` and `python -m basic_kb …` are equivalent.)
+
+**Config resolution**, in precedence order:
+1. `--config PATH` — explicit override
+2. `BASIC_KB_CONFIG=PATH` — set once per shell/instance
+3. `basic-kb.yaml` found by walking up from the current directory
 
 `--source` picks one (`--source notes`), several (`--source notes,docs`), or all
 (default). Index is incremental; use `--force` to rebuild. `index --preview`
@@ -31,9 +42,10 @@ searching. Full guide: [docs/rag-query-guide.md](docs/rag-query-guide.md).
 
 ## Config
 
-Copy [config.example.yaml](config.example.yaml). All relative paths anchor to the
-config file's own directory. Sources have a `type` (`markdown` or `transcript`)
-and a `chunker` (`recursive` or `breadcrumb`).
+Copy [config.example.yaml](config.example.yaml) into your instance folder as
+`basic-kb.yaml` (the name auto-discovery looks for). All relative paths anchor to
+the config file's own directory. Sources have a `type` (`markdown` or
+`transcript`) and a `chunker` (`recursive` or `breadcrumb`).
 
 ## Secrets
 

@@ -35,6 +35,29 @@ def load_env_file(path: Path) -> int:
     return count
 
 
+# Conventional config filename discovered by walking up from the working dir.
+CONFIG_FILENAMES = ("basic-kb.yaml", "basic-kb.yml")
+
+
+def find_config(start: Optional[Path] = None) -> Optional[Path]:
+    """Locate an instance config the way git/npm find theirs.
+
+    Precedence: $BASIC_KB_CONFIG, else walk up from `start` (default: cwd)
+    looking for basic-kb.yaml. Returns None if nothing is found — the caller
+    decides how to report that.
+    """
+    env = os.environ.get("BASIC_KB_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    start = (start or Path.cwd()).resolve()
+    for directory in (start, *start.parents):
+        for name in CONFIG_FILENAMES:
+            candidate = directory / name
+            if candidate.exists():
+                return candidate
+    return None
+
+
 def _resolve(base_dir: Path, raw: str) -> Path:
     """Absolute paths pass through; relative paths anchor to the config's dir."""
     p = Path(raw).expanduser()

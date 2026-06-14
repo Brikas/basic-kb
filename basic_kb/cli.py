@@ -4,7 +4,8 @@
   python -m basic_kb search "..." --config CFG [--source ID|all] [--n N]
   python -m basic_kb status --config CFG [--source ID|all]
 
-Every command needs --config pointing at an instance config (see README).
+Config is resolved automatically: --config flag > $BASIC_KB_CONFIG > a basic-kb.yaml
+found by walking up from the current directory (see README).
 Multi-query search improves recall:
   python -m basic_kb search "price too high" "budget concern" --config CFG
 
@@ -25,7 +26,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .config import Config, load_config, load_env_file
+from .config import Config, find_config, load_config, load_env_file
 from .core import DEFAULT_N, KnowledgeBase
 from .embedders import FastEmbedEmbedder
 from .models import SearchResult
@@ -254,8 +255,9 @@ def cmd_status(args: argparse.Namespace, config: Config) -> None:
 # ---------------------------------------------------------------------------
 
 def _shared_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", required=True, metavar="FILE",
-                        help="Path to the instance config YAML (required).")
+    parser.add_argument("--config", default=None, metavar="FILE",
+                        help="Instance config YAML. If omitted: $BASIC_KB_CONFIG, "
+                             "else basic-kb.yaml found by walking up from the current dir.")
     parser.add_argument("--env-file", metavar="FILE",
                         help="Dotenv file to load (e.g. for JINA_API_KEY). Overrides config env_file.")
     known = ", ".join(FastEmbedEmbedder.SUPPORTED)
@@ -326,10 +328,22 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # Resolve the config: explicit flag > $BASIC_KB_CONFIG > basic-kb.yaml up the tree.
+    config_path = Path(args.config).expanduser() if args.config else find_config()
+    if config_path is None:
+        print(
+            "No config found. Do one of:\n"
+            "  • pass --config PATH\n"
+            "  • set BASIC_KB_CONFIG=PATH\n"
+            "  • add a basic-kb.yaml to this directory (or any parent).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Load secrets first: --env-file (explicit) wins over config env_file (both setdefault).
     if getattr(args, "env_file", None):
         load_env_file(Path(args.env_file).expanduser())
-    config = load_config(Path(args.config))
+    config = load_config(config_path)
     if config.env_file and config.env_file.exists():
         load_env_file(config.env_file)
 
