@@ -14,6 +14,15 @@ chunker:                    # defaults; override per-run with CLI flags
   overlap: 100
   min_chunk_size: 50
 
+# Optional second-stage reranking of the top candidates (better precision).
+# type: local (on-device cross-encoder, no key, private) | jina (cloud, needs
+# JINA_API_KEY) | none. Omit the whole block for none.
+reranker:
+  type: local
+  model: jina-v2-multilingual   # optional; per-type default otherwise
+
+# timing: true                  # print per-phase search timings (embed/retrieve/rerank/total)
+
 # Each source -> its own collection. Query one (--source notes), several
 # (--source notes,docs), or all (default). See --source list.
 sources:

@@ -58,3 +58,6 @@ dotenv file.
 
 Architecture and gotchas: [docs/developing.md](docs/developing.md). Modules:
 `models`, `embedders`, `rerankers`, `textsplit`, `chunkers`, `sources`, `core`, `cli`.
+
+Planned capabilities (chunk filter/transform hook, reference expansion, LogSeq-aware
+chunker): [ROADMAP.md](ROADMAP.md).

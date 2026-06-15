@@ -17,8 +17,9 @@ any specific dataset lives in the code.
 KnowledgeBase
 ├── EmbedderBase (ABC)
 │   └── FastEmbedEmbedder   — ONNX-backed local embeddings via fastembed
-├── RerankerBase (ABC)
-│   └── JinaReranker        — Calls Jina AI API (/v1/rerank)
+├── RerankerBase (ABC)         — pluggable via RERANKER_TYPES; `reranker:` config picks one
+│   ├── FastEmbedReranker   — local ONNX cross-encoder (no API key)
+│   └── JinaReranker        — Jina AI API (/v1/rerank)
 └── SearchResult (dataclass) — carries doc, metadata, cosine score, rerank_score
 ```
 
@@ -42,7 +43,7 @@ KnowledgeBase
 |---|---|
 | `basic_kb/models.py` | Dataclasses: SearchResult, ParsedDocument, Chunk |
 | `basic_kb/embedders.py` | EmbedderBase, FastEmbedEmbedder, ChromaDB EF wrapper |
-| `basic_kb/rerankers.py` | RerankerBase, JinaReranker |
+| `basic_kb/rerankers.py` | RerankerBase, FastEmbedReranker, JinaReranker, `build_reranker` |
 | `basic_kb/textsplit.py` | Recursive character splitter (`split_text`) |
 | `basic_kb/chunkers.py` | ChunkerBase, RecursiveChunker, BreadcrumbHeadingChunker, `build_chunker` |
 | `basic_kb/sources.py` | DataSourceBase, MarkdownSource, TranscriptSource, `build_source` |
@@ -68,7 +69,8 @@ Changing the embedding model requires `index --force` — ChromaDB detects misma
 
 Adding a new FastEmbed model: add an entry to `FastEmbedEmbedder.SUPPORTED` dict. The key is the CLI alias; value is the full HuggingFace model ID. Any FastEmbed-supported HF id also works directly via `--model` without registering. Validate speed on your hardware before committing to a slow model — indexing is CPU-bound (see the CPU gotcha below).
 
-Adding a new reranker: subclass `RerankerBase`, implement `rerank()`, wire it up in `_build_kb()`.
+Adding a new reranker: subclass `RerankerBase`, implement `rerank()`, and register it in
+`RERANKER_TYPES` (rerankers.py). It then becomes selectable via `reranker: <key>` in any config.
 
 ---
 

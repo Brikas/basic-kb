@@ -1,7 +1,9 @@
 """KnowledgeBase — orchestrates indexing and semantic search over DataSources."""
 from __future__ import annotations
 
+import hashlib
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +14,11 @@ from .rerankers import RerankerBase
 from .sources import DataSourceBase
 
 DEFAULT_N = 15
+
+
+def _file_hash(path: Path) -> str:
+    """Content fingerprint of a file (sha1 of its bytes). Identity only, not security."""
+    return hashlib.sha1(path.read_bytes()).hexdigest()
 
 
 class KnowledgeBase:
@@ -87,7 +94,17 @@ class KnowledgeBase:
                 pass
 
         col = self._get_collection(client, source.source_id)
-        existing_ids: set[str] = set(col.get(include=[])["ids"])
+
+        # Snapshot what's already indexed, keyed by each file's relative path.
+        # rel_path is the stable per-file identity; content_hash detects edits.
+        snap = col.get(include=["metadatas"])
+        stored_hash: dict[str, Optional[str]] = {}   # rel_path -> indexed content hash
+        ids_by_file: dict[str, list[str]] = {}       # rel_path -> its chunk ids
+        for cid, meta in zip(snap["ids"], snap["metadatas"]):
+            # Fall back to legacy 'file' key for chunks indexed before rel_path existed.
+            rp = meta.get("rel_path") or meta.get("file") or cid.split("::")[0]
+            stored_hash.setdefault(rp, meta.get("content_hash"))
+            ids_by_file.setdefault(rp, []).append(cid)
 
         chunker = source.make_chunker(chunk_size, overlap, min_chunk)
         print(
@@ -96,38 +113,63 @@ class KnowledgeBase:
             f"chunk={chunk_size}, overlap={overlap})"
         )
 
-        added = skipped = empty = 0
+        added = updated = unchanged = empty = pruned = 0
+        total_files = len(files)
+        live: set[str] = set()
 
-        for f in files:
-            doc = source.parse_file(f)
-            if doc is None:
-                empty += 1
+        for i, f in enumerate(files, 1):
+            try:
+                rel_path = f.relative_to(source.directory).as_posix()
+            except ValueError:
+                rel_path = f.name
+            live.add(rel_path)
+            file_hash = _file_hash(f)
+
+            # Unchanged: same content already indexed → skip without parsing/embedding.
+            if stored_hash.get(rel_path) == file_hash and rel_path in ids_by_file:
+                unchanged += 1
                 continue
 
-            chunks = chunker.chunk(doc)
+            was_indexed = rel_path in ids_by_file
+            doc = source.parse_file(f)
+            chunks = chunker.chunk(doc) if doc is not None else []
+            if not chunks:
+                empty += 1
+                if was_indexed:  # used to have content, now none → drop stale chunks
+                    col.delete(ids=ids_by_file[rel_path])
+                continue
+
+            # Print right before embedding (the slow step) so a stall points at this file.
+            verb = "re-embedding" if was_indexed else "embedding"
+            print(f"  [{i}/{total_files}] {verb} {rel_path}  ({len(chunks)} chunks)", flush=True)
+
+            if was_indexed:  # changed file → remove old chunks before re-adding
+                col.delete(ids=ids_by_file[rel_path])
 
             new_ids, new_docs, new_metas = [], [], []
             for chunk in chunks:
-                chunk_id = f"{doc.id}::{chunk.id_suffix}"
-                if chunk_id in existing_ids:
-                    continue
-                new_ids.append(chunk_id)
+                new_ids.append(f"{rel_path}::{chunk.id_suffix}")
                 new_docs.append(chunk.text)
-                new_metas.append(chunk.metadata)
-
-            if not new_ids:
-                skipped += 1
-                continue
-
+                new_metas.append({**chunk.metadata, "rel_path": rel_path, "content_hash": file_hash})
             col.add(documents=new_docs, metadatas=new_metas, ids=new_ids)
-            added += len(new_ids)
-            print(f"  {f.name}  ({len(new_ids)} chunks)")
+            updated += 1 if was_indexed else 0
+            added += 0 if was_indexed else 1
+
+        # Prune files that no longer exist on disk. Only on a full run — a --limit
+        # run sees a subset, so absent files there are not actually deleted.
+        if limit is None:
+            stale_ids = [cid for rp, ids in ids_by_file.items() if rp not in live for cid in ids]
+            if stale_ids:
+                col.delete(ids=stale_ids)
+                pruned = sum(1 for rp in ids_by_file if rp not in live)
 
         total = col.count()
+        embedded = added + updated + unchanged   # files that contributed chunks to the index
         print(
-            f"\nDone [{source.source_id}]. "
-            f"added={added} | skipped={skipped} already-indexed | "
-            f"empty={empty} no-content | total={total}"
+            f"\nDone [{source.source_id}].\n"
+            f"  files:  new={added} updated={updated} unchanged={unchanged} "
+            f"empty={empty} pruned={pruned}  ({embedded} of {total_files} indexed)\n"
+            f"  chunks: {total} total in index  (files are split into chunks; one file = many chunks)"
         )
 
     def search(
@@ -138,18 +180,21 @@ class KnowledgeBase:
         content_type_filter: Optional[str] = None,
         rerank_candidates: Optional[int] = None,
         strict_rerank: bool = False,
+        timing: bool = False,
     ) -> list[SearchResult]:
         """
         Multi-source, multi-query semantic search.
 
         Each query is run against every source collection independently.
         Results are merged by score (highest wins per unique chunk ID),
-        then optionally reranked with Jina.
+        then optionally reranked. With timing=True, prints per-phase durations.
         """
         if not self.chroma_dir.exists():
             print("No index found. Run: python -m basic_kb index")
             return []
 
+        t0 = time.perf_counter()
+        t_embed = t_retrieve = t_rerank = 0.0
         client = self._client()
         best: dict[str, SearchResult] = {}
 
@@ -176,15 +221,20 @@ class KnowledgeBase:
                 where = {"content_type": {"$eq": content_type_filter}}
 
             for q in queries:
+                _te = time.perf_counter()
+                q_emb = self.embedder.query_embed([q])
+                t_embed += time.perf_counter() - _te
                 kwargs: dict = {
-                    "query_embeddings": self.embedder.query_embed([q]),
+                    "query_embeddings": q_emb,
                     "n_results": fetch_n,
                     "include": ["documents", "metadatas", "distances"],
                 }
                 if where:
                     kwargs["where"] = where
                 try:
+                    _tr = time.perf_counter()
                     results = col.query(**kwargs)
+                    t_retrieve += time.perf_counter() - _tr
                 except Exception as e:
                     print(f"  Query error on '{source.source_id}': {e}", file=sys.stderr)
                     continue
@@ -202,6 +252,7 @@ class KnowledgeBase:
 
         hits = sorted(best.values(), key=lambda r: r.score, reverse=True)
 
+        _trr = time.perf_counter()
         if self.reranker and hits:
             candidates = hits[: rerank_candidates or n]
             try:
@@ -213,6 +264,15 @@ class KnowledgeBase:
                 hits = hits[:n]
         else:
             hits = hits[:n]
+        t_rerank = time.perf_counter() - _trr
+
+        if timing:
+            print(
+                f"timing (ms): embed={t_embed*1000:.0f}  retrieve={t_retrieve*1000:.0f}  "
+                f"rerank={t_rerank*1000:.0f}  total={(time.perf_counter()-t0)*1000:.0f}"
+                "   [cold process — embed & rerank include one-time model load]",
+                file=sys.stderr,
+            )
 
         return hits
 

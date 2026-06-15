@@ -30,7 +30,7 @@ from .config import Config, find_config, load_config, load_env_file
 from .core import DEFAULT_N, KnowledgeBase
 from .embedders import FastEmbedEmbedder
 from .models import SearchResult
-from .rerankers import JinaReranker, RerankerBase
+from .rerankers import RerankerBase, build_reranker
 from .sources import DataSourceBase, build_source
 
 
@@ -52,15 +52,24 @@ def _build_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
     embedder = FastEmbedEmbedder(alias=model)
 
     reranker: Optional[RerankerBase] = None
-    no_rerank = getattr(args, "no_rerank", False)
-    explicit_rerank = getattr(args, "rerank", False)
-    if not no_rerank:
-        import os
-        if os.environ.get("JINA_API_KEY"):
-            reranker = JinaReranker(model=getattr(args, "reranker_model", "jina-reranker-v3"))
-        elif explicit_rerank:
-            print("Error: --rerank requires JINA_API_KEY (env, --env-file, or config env_file).",
-                  file=sys.stderr)
+    if not getattr(args, "no_rerank", False):
+        # Type/model: CLI flag wins, else config, else off.
+        rtype = (getattr(args, "reranker", None) or config.reranker_type or "none").lower()
+        rmodel = getattr(args, "reranker_model", None) or config.reranker_model
+        strict = getattr(args, "rerank", False)
+        if rtype != "none":
+            try:
+                reranker = build_reranker(rtype, rmodel)
+            except Exception as e:
+                # e.g. jina selected but no API key. Strict → fail; else cosine-only.
+                if strict:
+                    print(f"Error: reranker '{rtype}' unavailable: {e}", file=sys.stderr)
+                    sys.exit(1)
+                print(f"Warning: reranker '{rtype}' unavailable, using cosine scores only ({e})",
+                      file=sys.stderr)
+        elif strict:
+            print("Error: --rerank set but no reranker chosen. Use --reranker local|jina "
+                  "or set `reranker:` in the config.", file=sys.stderr)
             sys.exit(1)
 
     return KnowledgeBase(embedder=embedder, chroma_dir=config.store_dir, reranker=reranker)
@@ -120,10 +129,10 @@ def _print_results(hits: list[SearchResult], max_chars: int) -> None:
             )
             ref = meta.get("url") or meta.get("file", "?")
         else:
-            header = (
-                f"[{rank}] {meta.get('title', '?')}  "
-                f"({meta.get('date', '?')})  {score_str}"
-            )
+            # Show the date only when there is one (transcripts have it; notes usually don't).
+            date = meta.get("date")
+            date_str = f"  ({date})" if date and date != "unknown" else ""
+            header = f"[{rank}] {meta.get('title', '?')}{date_str}  {score_str}"
             ref = meta.get("file", "?")
 
         print("=" * 60)
@@ -238,6 +247,7 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         content_type_filter=content_type,
         rerank_candidates=getattr(args, "rerank_candidates", None),
         strict_rerank=getattr(args, "rerank", False),
+        timing=getattr(args, "timing", False) or config.timing,
     )
     if not hits:
         print("No results.")
@@ -278,11 +288,13 @@ def _shared_args(parser: argparse.ArgumentParser) -> None:
 
 def _rerank_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--no-rerank", action="store_true", help="Disable Jina reranking entirely")
+    group.add_argument("--no-rerank", action="store_true", help="Disable reranking entirely")
     group.add_argument("--rerank", action="store_true",
-                       help="Strict mode: error on rerank failure (requires JINA_API_KEY)")
-    parser.add_argument("--reranker-model", default="jina-reranker-v3", metavar="MODEL",
-                        help="Jina reranker model (default: jina-reranker-v3)")
+                       help="Strict mode: error instead of falling back if the reranker fails")
+    parser.add_argument("--reranker", choices=["local", "jina", "none"], default=None,
+                        help="Reranker backend, overriding the config (local=on-device, jina=cloud)")
+    parser.add_argument("--reranker-model", default=None, metavar="MODEL",
+                        help="Reranker model/alias for the chosen backend (default: per-backend)")
     parser.add_argument("--rerank-candidates", type=int, default=None, metavar="N",
                         help="Candidates to fetch before reranking (default: 3× --n, max 50)")
 
@@ -291,9 +303,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="basic_kb",
         description="basic-kb — local semantic search over markdown/text sources",
+        epilog=(
+            "Run a command with -h for its full options, e.g.  basic_kb index -h\n\n"
+            "Common usage:\n"
+            "  basic_kb search \"a statement the note would contain\"   search (all sources)\n"
+            "  basic_kb search \"angle one\" \"angle two\"                multi-query, better recall\n"
+            "  basic_kb search --source list                          list configured sources\n"
+            "  basic_kb index                                         incremental: new/changed only\n"
+            "  basic_kb index --force                                 rebuild the whole index\n"
+            "  basic_kb index --limit 10                              embed only the first N files (test)\n"
+            "  basic_kb status                                        chunk/doc counts per source\n\n"
+            "Search flags:  --n N (results)  --max-chars N (truncate)  --content-type T  --timing\n"
+            "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
+            "Index flags:   --force  --limit N  --preview [--file NAME]\n"
+            "Tuning (any):  --model NAME  --chunk-size N  --overlap N  --min-chunk N\n"
+            "Config:        --config FILE, else $BASIC_KB_CONFIG, else basic-kb.yaml up the tree."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    # Not required: a bare `basic_kb` (or `basic_kb help`) prints help instead of erroring.
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("help", help="Show this help (same as -h)")
 
     p_index = sub.add_parser("index", help="Embed and index documents")
     _shared_args(p_index)
@@ -323,6 +354,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Filter by frontmatter content_type (markdown sources).")
     p_search.add_argument("--max-chars", type=int, default=0, metavar="N",
                           help="Truncate each result to N chars (default: 0 = full)")
+    p_search.add_argument("--timing", action="store_true",
+                          help="Print per-phase timings (embed/retrieve/rerank/total) to stderr. "
+                               "Also enabled by `timing: true` in the config.")
 
     p_status = sub.add_parser("status", help="Show index stats")
     _shared_args(p_status)
@@ -333,6 +367,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Bare invocation or `help` → print top-level help and exit (no config needed).
+    if args.cmd in (None, "help"):
+        parser.print_help()
+        return
 
     # Resolve the config: explicit flag > $BASIC_KB_CONFIG > basic-kb.yaml up the tree.
     config_path = Path(args.config).expanduser() if args.config else find_config()

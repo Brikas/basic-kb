@@ -75,6 +75,9 @@ class Config:
     overlap: int
     min_chunk: int
     sources: list[dict]  # raw source entries; built via sources.build_source()
+    reranker_type: str = "none"        # none | local | jina
+    reranker_model: Optional[str] = None
+    timing: bool = False               # print per-phase search timings
     env_file: Optional[Path] = None
 
 
@@ -96,6 +99,15 @@ def load_config(config_path: Path) -> Config:
 
     env_file = _resolve(base_dir, data["env_file"]) if data.get("env_file") else None
 
+    # `reranker:` may be a string ("local") or a mapping ({type: local, model: ...}).
+    rr = data.get("reranker")
+    if isinstance(rr, str):
+        reranker_type, reranker_model = rr.strip(), None
+    elif isinstance(rr, dict):
+        reranker_type, reranker_model = str(rr.get("type", "none")), rr.get("model")
+    else:
+        reranker_type, reranker_model = "none", None
+
     return Config(
         path=config_path,
         base_dir=base_dir,
@@ -106,5 +118,8 @@ def load_config(config_path: Path) -> Config:
         overlap=int(chunker_cfg.get("overlap", DEFAULT_OVERLAP)),
         min_chunk=int(chunker_cfg.get("min_chunk_size", DEFAULT_MIN_CHUNK)),
         sources=sources,
+        reranker_type=reranker_type,
+        reranker_model=reranker_model,
+        timing=bool(data.get("timing", False)),
         env_file=env_file,
     )
