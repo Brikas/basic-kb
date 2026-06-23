@@ -77,6 +77,9 @@ class Config:
     sources: list[dict]  # raw source entries; built via sources.build_source()
     reranker_type: str = "none"        # none | local | jina
     reranker_model: Optional[str] = None
+    cand_multiplier: int = 3           # candidates to rerank = clamp(n*mult, min, max)
+    cand_min: int = 50
+    cand_max: int = 200
     timing: bool = False               # print per-phase search timings
     env_file: Optional[Path] = None
 
@@ -99,12 +102,14 @@ def load_config(config_path: Path) -> Config:
 
     env_file = _resolve(base_dir, data["env_file"]) if data.get("env_file") else None
 
-    # `reranker:` may be a string ("local") or a mapping ({type: local, model: ...}).
+    # `reranker:` may be a string ("local") or a mapping ({type, model, candidates}).
     rr = data.get("reranker")
+    cand: dict = {}
     if isinstance(rr, str):
         reranker_type, reranker_model = rr.strip(), None
     elif isinstance(rr, dict):
         reranker_type, reranker_model = str(rr.get("type", "none")), rr.get("model")
+        cand = rr.get("candidates", {}) or {}
     else:
         reranker_type, reranker_model = "none", None
 
@@ -120,6 +125,9 @@ def load_config(config_path: Path) -> Config:
         sources=sources,
         reranker_type=reranker_type,
         reranker_model=reranker_model,
+        cand_multiplier=int(cand.get("multiplier", 3)),
+        cand_min=int(cand.get("min", 50)),
+        cand_max=int(cand.get("max", 200)),
         timing=bool(data.get("timing", False)),
         env_file=env_file,
     )

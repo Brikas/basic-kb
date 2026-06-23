@@ -179,6 +179,9 @@ class KnowledgeBase:
         n: int = DEFAULT_N,
         content_type_filter: Optional[str] = None,
         rerank_candidates: Optional[int] = None,
+        cand_multiplier: int = 3,
+        cand_min: int = 50,
+        cand_max: int = 200,
         strict_rerank: bool = False,
         timing: bool = False,
     ) -> list[SearchResult]:
@@ -199,7 +202,10 @@ class KnowledgeBase:
         best: dict[str, SearchResult] = {}
 
         if self.reranker and rerank_candidates is None:
-            rerank_candidates = min(n * 3, 50)
+            # How many top hits to rerank: clamp(n × multiplier, min, max).
+            # If min exceeds max (misconfig), min wins.
+            hi = max(cand_max, cand_min)
+            rerank_candidates = min(max(n * cand_multiplier, cand_min), hi)
         fetch_n = (rerank_candidates or n) if self.reranker else n
 
         for source in sources:

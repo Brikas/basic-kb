@@ -20,8 +20,12 @@ chunker:                    # defaults; override per-run with CLI flags
 reranker:
   type: local
   model: jina-v2-multilingual   # optional; per-type default otherwise
+  candidates:                   # how many top hits to rerank: clamp(n*multiplier, min, max)
+    multiplier: 3               # fetch this × the requested result count (--n)
+    min: 50                     # ...but always at least this many
+    max: 200                    # ...and never more than this
 
-# timing: true                  # print per-phase search timings (embed/retrieve/rerank/total)
+timing: false                   # set true to print per-phase search timings (embed/retrieve/rerank/total)
 
 # Each source -> its own collection. Query one (--source notes), several
 # (--source notes,docs), or all (default). See --source list.

@@ -246,6 +246,9 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         n=args.n,
         content_type_filter=content_type,
         rerank_candidates=getattr(args, "rerank_candidates", None),
+        cand_multiplier=config.cand_multiplier,
+        cand_min=config.cand_min,
+        cand_max=config.cand_max,
         strict_rerank=getattr(args, "rerank", False),
         timing=getattr(args, "timing", False) or config.timing,
     )
