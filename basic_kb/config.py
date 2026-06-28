@@ -38,6 +38,15 @@ def load_env_file(path: Path) -> int:
 # Conventional config filename discovered by walking up from the working dir.
 CONFIG_FILENAMES = ("basic-kb.yaml", "basic-kb.yml")
 
+# Shown after a search when a source hasn't been re-indexed in a while and has
+# drifted. Placeholders: {source} {new} {updated} {deleted} {unchanged} {stale}
+# {total} {days}. Override via `freshness.message` in the config.
+DEFAULT_FRESHNESS_MESSAGE = (
+    "[basic-kb] Source '{source}' looks stale since the last index: "
+    "{new} new, {updated} changed, {deleted} deleted file(s). "
+    "Consider prompting the user if they want to re-index (basic-kb index --source {source})."
+)
+
 
 def find_config(start: Optional[Path] = None) -> Optional[Path]:
     """Locate an instance config the way git/npm find theirs.
@@ -81,6 +90,9 @@ class Config:
     cand_min: int = 50
     cand_max: int = 200
     timing: bool = False               # print per-phase search timings
+    freshness_enabled: bool = True     # post-search staleness reminder
+    freshness_every_days: int = 3      # how often to re-check a source
+    freshness_message: str = DEFAULT_FRESHNESS_MESSAGE
     env_file: Optional[Path] = None
 
 
@@ -113,6 +125,8 @@ def load_config(config_path: Path) -> Config:
     else:
         reranker_type, reranker_model = "none", None
 
+    fresh = data.get("freshness", {}) or {}
+
     return Config(
         path=config_path,
         base_dir=base_dir,
@@ -129,5 +143,8 @@ def load_config(config_path: Path) -> Config:
         cand_min=int(cand.get("min", 50)),
         cand_max=int(cand.get("max", 200)),
         timing=bool(data.get("timing", False)),
+        freshness_enabled=bool(fresh.get("enabled", True)),
+        freshness_every_days=int(fresh.get("every_days", 3)),
+        freshness_message=str(fresh.get("message", DEFAULT_FRESHNESS_MESSAGE)),
         env_file=env_file,
     )

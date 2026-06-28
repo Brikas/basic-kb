@@ -27,6 +27,15 @@ reranker:
 
 timing: false                   # set true to print per-phase search timings (embed/retrieve/rerank/total)
 
+# After a search, every `every_days`, basic-kb diffs the queried source(s) against
+# the index and prints a one-line nudge if files are new/changed/deleted. Cheap
+# (hashes files, no embedding). Set enabled: false to turn it off entirely.
+# message placeholders: {source} {new} {updated} {deleted} {unchanged} {stale} {total} {days}
+freshness:
+  enabled: true
+  every_days: 3
+  # message: "[basic-kb] '{source}': {stale} file(s) changed since last index — re-index? (basic-kb index)"
+
 # Each source -> its own collection. Query one (--source notes), several
 # (--source notes,docs), or all (default). See --source list.
 sources:

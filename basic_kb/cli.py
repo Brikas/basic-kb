@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -258,12 +260,83 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
     if len(args.queries) > 1:
         print(f"[{len(args.queries)} queries merged]")
     _print_results(hits, args.max_chars)
+    _freshness_reminder(kb, sources, config)
 
 
 def cmd_status(args: argparse.Namespace, config: Config) -> None:
     sources = _load_sources(config, getattr(args, "source", "all"))
     kb = _build_kb(args, config)
     kb.status(sources)
+
+
+def _scan_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
+    """A KnowledgeBase for scan/freshness — no reranker needed (scan only hashes files)."""
+    model, *_ = _effective(args, config)
+    return KnowledgeBase(embedder=FastEmbedEmbedder(alias=model), chroma_dir=config.store_dir)
+
+
+def cmd_scan(args: argparse.Namespace, config: Config) -> None:
+    sources = _load_sources(config, getattr(args, "source", "all"))
+    kb = _scan_kb(args, config)
+    any_stale = False
+    for source in sources:
+        res = kb.scan(source)
+        if not res.tracked:
+            print(f"Scan [{res.source_id}]: not tracked yet — run "
+                  f"`basic_kb index --source {res.source_id}` once to enable change detection.")
+            continue
+        line = (f"Scan [{res.source_id}]: {res.files_on_disk} files on disk  |  "
+                f"new={res.new} changed={res.updated} unchanged={res.unchanged} deleted={res.deleted}")
+        if res.stale:
+            any_stale = True
+            print(f"{line}  ->  {res.stale} stale")
+        else:
+            print(f"{line}  ->  up to date")
+    if any_stale:
+        print("\nRe-index with: basic_kb index")
+
+
+def _format_freshness(template: str, res, days: int) -> str:
+    fields = dict(source=res.source_id, new=res.new, updated=res.updated,
+                  deleted=res.deleted, unchanged=res.unchanged, stale=res.stale,
+                  total=res.files_on_disk, days=days)
+    try:
+        return template.format(**fields)
+    except (KeyError, IndexError) as e:
+        return (f"[basic-kb] freshness message has an invalid placeholder {e}; "
+                f"valid: {', '.join(fields)}. Source '{res.source_id}' is stale "
+                f"({res.stale} file(s)).")
+
+
+def _freshness_reminder(kb: KnowledgeBase, sources: list[DataSourceBase], config: Config) -> None:
+    """After a search, every `every_days`, check the queried sources and nudge if stale."""
+    if not config.freshness_enabled:
+        return
+    state_path = config.store_dir / "freshness_state.json"
+    state: dict = {}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            state = {}   # treat corrupt state as "never checked"; it gets rewritten below
+
+    now = time.time()
+    interval = max(0, config.freshness_every_days) * 86400
+    due = [s for s in sources if now - float(state.get(s.source_id, 0)) >= interval]
+    if not due:
+        return
+
+    messages: list[str] = []
+    for s in due:
+        res = kb.scan(s)
+        state[s.source_id] = now   # reset the timer whether or not it was stale
+        if res.tracked and res.stale:
+            messages.append(_format_freshness(config.freshness_message, res, config.freshness_every_days))
+
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    for m in messages:
+        print(m, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +388,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb index                                         incremental: new/changed only\n"
             "  basic_kb index --force                                 rebuild the whole index\n"
             "  basic_kb index --limit 10                              embed only the first N files (test)\n"
-            "  basic_kb status                                        chunk/doc counts per source\n\n"
+            "  basic_kb status                                        chunk/doc counts per source\n"
+            "  basic_kb scan                                          new/changed/deleted files vs the index\n\n"
             "Search flags:  --n N (results)  --max-chars N (truncate)  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --limit N  --preview [--file NAME]\n"
@@ -364,6 +438,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Show index stats")
     _shared_args(p_status)
 
+    p_scan = sub.add_parser("scan", help="Check staleness: new/changed/deleted files vs the index (no embedding)")
+    _shared_args(p_scan)
+
     return parser
 
 
@@ -395,7 +472,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     if config.env_file and config.env_file.exists():
         load_env_file(config.env_file)
 
-    {"index": cmd_index, "search": cmd_search, "status": cmd_status}[args.cmd](args, config)
+    {"index": cmd_index, "search": cmd_search, "status": cmd_status,
+     "scan": cmd_scan}[args.cmd](args, config)
 
 
 if __name__ == "__main__":
