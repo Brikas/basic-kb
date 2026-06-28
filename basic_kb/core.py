@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +21,24 @@ DEFAULT_N = 15
 def _file_hash(path: Path) -> str:
     """Content fingerprint of a file (sha1 of its bytes). Identity only, not security."""
     return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+@dataclass
+class ScanResult:
+    """Read-only diff of a source's files on disk vs. what was last indexed."""
+    source_id: str
+    label: str
+    tracked: bool        # False if no manifest yet (never indexed under the new scheme)
+    files_on_disk: int
+    new: int
+    updated: int
+    unchanged: int
+    deleted: int
+
+    @property
+    def stale(self) -> int:
+        """Files that differ from the index (would change it on re-index)."""
+        return self.new + self.updated + self.deleted
 
 
 class KnowledgeBase:
@@ -42,6 +62,56 @@ class KnowledgeBase:
     def _client(self):
         import chromadb
         return chromadb.PersistentClient(path=str(self.chroma_dir))
+
+    # --- Manifest: every file seen at index time -> content hash, per source. -----
+    # Lets `scan` diff disk against the index without re-parsing, and correctly
+    # treats files too short to chunk as "seen" (not perpetually "new").
+    def _manifest_path(self) -> Path:
+        return self.chroma_dir / "manifest.json"
+
+    def _load_manifest(self) -> dict:
+        p = self._manifest_path()
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"Warning: manifest at {p} is corrupt ({e}); treating as empty.", file=sys.stderr)
+            return {}
+
+    def _save_manifest(self, manifest: dict) -> None:
+        self.chroma_dir.mkdir(parents=True, exist_ok=True)
+        self._manifest_path().write_text(
+            json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _rel_path(source: DataSourceBase, f: Path) -> str:
+        try:
+            return f.relative_to(source.directory).as_posix()
+        except ValueError:
+            return f.name
+
+    def scan(self, source: DataSourceBase) -> ScanResult:
+        """Diff the source's files on disk against the manifest. Read-only; no embedding."""
+        manifest = self._load_manifest().get(source.source_id, {})
+        tracked = bool(manifest)
+        live = {self._rel_path(source, f): _file_hash(f) for f in source.get_files()}
+
+        new = updated = unchanged = 0
+        for rp, h in live.items():
+            if rp not in manifest:
+                new += 1
+            elif manifest[rp] != h:
+                updated += 1
+            else:
+                unchanged += 1
+        deleted = sum(1 for rp in manifest if rp not in live)
+        return ScanResult(
+            source_id=source.source_id, label=source.label, tracked=tracked,
+            files_on_disk=len(live), new=new, updated=updated,
+            unchanged=unchanged, deleted=deleted,
+        )
 
     def _get_collection(self, client, collection_name: str):
         """Get or create a named ChromaDB collection, clearing on EF conflict."""
@@ -115,15 +185,12 @@ class KnowledgeBase:
 
         added = updated = unchanged = empty = pruned = 0
         total_files = len(files)
-        live: set[str] = set()
+        seen: dict[str, str] = {}   # rel_path -> hash, for the manifest (all files, incl. empty)
 
         for i, f in enumerate(files, 1):
-            try:
-                rel_path = f.relative_to(source.directory).as_posix()
-            except ValueError:
-                rel_path = f.name
-            live.add(rel_path)
+            rel_path = self._rel_path(source, f)
             file_hash = _file_hash(f)
+            seen[rel_path] = file_hash
 
             # Unchanged: same content already indexed → skip without parsing/embedding.
             if stored_hash.get(rel_path) == file_hash and rel_path in ids_by_file:
@@ -158,10 +225,19 @@ class KnowledgeBase:
         # Prune files that no longer exist on disk. Only on a full run — a --limit
         # run sees a subset, so absent files there are not actually deleted.
         if limit is None:
-            stale_ids = [cid for rp, ids in ids_by_file.items() if rp not in live for cid in ids]
+            stale_ids = [cid for rp, ids in ids_by_file.items() if rp not in seen for cid in ids]
             if stale_ids:
                 col.delete(ids=stale_ids)
-                pruned = sum(1 for rp in ids_by_file if rp not in live)
+                pruned = sum(1 for rp in ids_by_file if rp not in seen)
+
+        # Persist the manifest. Full run replaces this source's entry (drops deleted
+        # files); a --limit run merges, since it only saw a subset.
+        manifest = self._load_manifest()
+        if limit is None:
+            manifest[source.source_id] = seen
+        else:
+            manifest[source.source_id] = {**manifest.get(source.source_id, {}), **seen}
+        self._save_manifest(manifest)
 
         total = col.count()
         embedded = added + updated + unchanged   # files that contributed chunks to the index
