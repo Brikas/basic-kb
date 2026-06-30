@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional
 
 # Default embedding model alias (see FastEmbedEmbedder.SUPPORTED for the full set).
 DEFAULT_MODEL = "bge-small-en-v1.5"
@@ -58,15 +58,16 @@ class FastEmbedEmbedder(EmbedderBase):
         "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
     }
 
-    def __init__(self, alias: str = DEFAULT_MODEL) -> None:
+    def __init__(self, alias: str = DEFAULT_MODEL, threads: Optional[int] = None) -> None:
         self._alias = alias
         self._model_id = self.SUPPORTED.get(alias, alias)
+        self._threads = threads   # cap ONNX threads (CPU cores) used; None = all
         self._model: Any = None
 
     def _load(self):
         if self._model is None:
             from fastembed import TextEmbedding
-            self._model = TextEmbedding(self._model_id, show_progress=False)
+            self._model = TextEmbedding(self._model_id, show_progress=False, threads=self._threads)
 
     @property
     def model_id(self) -> str:

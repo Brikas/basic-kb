@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import Config, find_config, load_config, load_env_file
-from .core import DEFAULT_N, KnowledgeBase
+from .core import DEFAULT_N, KnowledgeBase, cores_to_threads, lower_process_priority, setup_file_logging
 from .embedders import FastEmbedEmbedder
 from .models import SearchResult
 from .rerankers import RerankerBase, build_reranker
@@ -49,9 +49,9 @@ def _effective(args: argparse.Namespace, config: Config) -> tuple[str, int, int,
     return model, chunk_size, overlap, min_chunk
 
 
-def _build_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
+def _build_kb(args: argparse.Namespace, config: Config, threads: Optional[int] = None) -> KnowledgeBase:
     model, *_ = _effective(args, config)
-    embedder = FastEmbedEmbedder(alias=model)
+    embedder = FastEmbedEmbedder(alias=model, threads=threads)
 
     reranker: Optional[RerankerBase] = None
     if not getattr(args, "no_rerank", False):
@@ -152,6 +152,26 @@ def _print_results(hits: list[SearchResult], max_chars: int) -> None:
 # Commands
 # ---------------------------------------------------------------------------
 
+def _resolve_throttle(args: argparse.Namespace, config: Config) -> tuple[Optional[float], str, int, int]:
+    """Resolve throttle settings: CLI flag > config. Bare --throttle fills sensible
+    defaults (half cores + low priority) for anything not otherwise set."""
+    cores = getattr(args, "cores_fraction", None)
+    if cores is None:
+        cores = config.throttle_cores
+    priority = getattr(args, "priority", None) or config.throttle_priority
+    pause_ms = getattr(args, "pause_ms", None)
+    pause_ms = config.throttle_pause_ms if pause_ms is None else pause_ms
+    pause_every = getattr(args, "pause_every", None)
+    pause_every = config.throttle_pause_every if pause_every is None else pause_every
+
+    if getattr(args, "throttle", False):
+        if cores is None:
+            cores = 0.5
+        if priority == "normal" and getattr(args, "priority", None) is None:
+            priority = "low"
+    return cores, priority, pause_ms, pause_every
+
+
 def cmd_index(args: argparse.Namespace, config: Config) -> None:
     sources = _load_sources(config, getattr(args, "source", "all"))
     _, chunk_size, overlap, min_chunk = _effective(args, config)
@@ -160,10 +180,19 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
         _preview_chunks(sources, config, chunk_size, overlap, min_chunk, args)
         return
 
-    kb = _build_kb(args, config)
+    cores, priority, pause_ms, pause_every = _resolve_throttle(args, config)
+    threads = cores_to_threads(cores)
+    if threads or priority == "low" or pause_ms:
+        print(f"[throttle] cores={cores if cores else 'all'} (threads={threads or 'default'})  "
+              f"priority={priority}  pause={pause_ms}ms/{pause_every} files", file=sys.stderr)
+    if priority == "low":
+        lower_process_priority()
+
+    kb = _build_kb(args, config, threads=threads)
     for source in sources:
         kb.index(source=source, chunk_size=chunk_size, overlap=overlap,
-                 min_chunk=min_chunk, force=args.force, limit=getattr(args, "limit", None))
+                 min_chunk=min_chunk, force=args.force, limit=getattr(args, "limit", None),
+                 pause_ms=pause_ms, pause_every=pause_every)
 
 
 def _preview_chunks(sources: list[DataSourceBase], config: Config,
@@ -393,6 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Search flags:  --n N (results)  --max-chars N (truncate)  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --limit N  --preview [--file NAME]\n"
+            "Throttle:      --throttle  --cores-fraction F  --priority low|normal  --pause-ms MS [--pause-every N]\n"
             "Tuning (any):  --model NAME  --chunk-size N  --overlap N  --min-chunk N\n"
             "Config:        --config FILE, else $BASIC_KB_CONFIG, else basic-kb.yaml up the tree."
         ),
@@ -419,6 +449,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Truncate chunk content in --preview output to N chars (default: 0 = full)")
     p_index.add_argument("--out", metavar="FILE",
                          help="Write --preview output to FILE instead of the auto tmp/ path.")
+    p_index.add_argument("--throttle", action="store_true",
+                         help="Ease CPU load while indexing: ~half the cores + low OS priority.")
+    p_index.add_argument("--cores-fraction", type=float, default=None, metavar="F",
+                         help="Fraction of CPU cores the embedder may use, e.g. 0.5 (overrides --throttle/config).")
+    p_index.add_argument("--priority", choices=["low", "normal"], default=None,
+                         help="OS process priority while indexing (default: config, else normal).")
+    p_index.add_argument("--pause-ms", type=int, default=None, metavar="MS",
+                         help="Sleep MS milliseconds every --pause-every embedded files (hard CPU duty cap).")
+    p_index.add_argument("--pause-every", type=int, default=None, metavar="N",
+                         help="Pause cadence in embedded files (used with --pause-ms; default 50).")
 
     p_search = sub.add_parser("search", help="Search the index")
     _shared_args(p_search)
@@ -471,6 +511,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     config = load_config(config_path)
     if config.env_file and config.env_file.exists():
         load_env_file(config.env_file)
+    if config.log_file:
+        setup_file_logging(config.log_file, config.log_level,
+                           config.log_max_bytes, config.log_backup_count)
 
     {"index": cmd_index, "search": cmd_search, "status": cmd_status,
      "scan": cmd_scan}[args.cmd](args, config)
