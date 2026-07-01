@@ -15,3 +15,7 @@ venv/
 
 # Local env / secrets
 .env
+
+# Machine-specific config overrides (paths differ per machine)
+**/basic-kb.local.yaml
+**/basic-kb.local.yml

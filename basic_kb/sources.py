@@ -218,7 +218,7 @@ def build_source(cfg: dict, base_dir: Path, content_type_filter: Optional[str] =
             f"Unknown source type {type_name!r} for source {cfg.get('id')!r}. "
             f"Options: {', '.join(sorted(SOURCE_TYPES))}"
         )
-    raw_path = Path(cfg["path"])
+    raw_path = Path(cfg["path"]).expanduser()
     directory = raw_path if raw_path.is_absolute() else base_dir / raw_path
     kwargs: dict = dict(
         source_id=cfg["id"],

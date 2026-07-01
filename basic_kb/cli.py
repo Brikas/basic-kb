@@ -24,7 +24,26 @@ import argparse
 import datetime
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import IO, Optional
+
+
+class _Tee:
+    """Mirror writes to two streams simultaneously (e.g. stdout + log file)."""
+
+    def __init__(self, primary: IO, secondary: IO) -> None:
+        self._primary = primary
+        self._secondary = secondary
+
+    def write(self, data: str) -> int:
+        self._secondary.write(data)
+        return self._primary.write(data)
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._secondary.flush()
+
+    def fileno(self) -> int:
+        return self._primary.fileno()
 
 from .config import Config, find_config, load_config, load_env_file
 from .core import DEFAULT_N, KnowledgeBase
@@ -394,6 +413,15 @@ def main(argv: Optional[list[str]] = None) -> None:
     config = load_config(config_path)
     if config.env_file and config.env_file.exists():
         load_env_file(config.env_file)
+
+    if config.log_file:
+        config.log_file.parent.mkdir(parents=True, exist_ok=True)
+        _log_fh = config.log_file.open("a", encoding="utf-8")
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _log_fh.write(f"\n{'='*60}\n[{ts}]  {' '.join(sys.argv)}\n{'='*60}\n")
+        _log_fh.flush()
+        sys.stdout = _Tee(sys.stdout, _log_fh)
+        sys.stderr = _Tee(sys.stderr, _log_fh)
 
     {"index": cmd_index, "search": cmd_search, "status": cmd_status}[args.cmd](args, config)
 

@@ -38,6 +38,10 @@ def load_env_file(path: Path) -> int:
 # Conventional config filename discovered by walking up from the working dir.
 CONFIG_FILENAMES = ("basic-kb.yaml", "basic-kb.yml")
 
+# Local-override suffix: basic-kb.local.yaml / basic-kb.local.yml sit alongside
+# the main config and deep-merge on top of it. Gitignored; machine-specific paths go here.
+_LOCAL_SUFFIXES = (".local.yaml", ".local.yml")
+
 
 def find_config(start: Optional[Path] = None) -> Optional[Path]:
     """Locate an instance config the way git/npm find theirs.
@@ -56,6 +60,16 @@ def find_config(start: Optional[Path] = None) -> Optional[Path]:
             if candidate.exists():
                 return candidate
     return None
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base* (in-place). Lists replace entirely."""
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
 
 
 def _resolve(base_dir: Path, raw: str) -> Path:
@@ -82,6 +96,7 @@ class Config:
     cand_max: int = 200
     timing: bool = False               # print per-phase search timings
     env_file: Optional[Path] = None
+    log_file: Optional[Path] = None   # append stdout+stderr here when set
 
 
 def load_config(config_path: Path) -> Config:
@@ -93,6 +108,15 @@ def load_config(config_path: Path) -> Config:
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+
+    stem = config_path.stem  # e.g. "basic-kb"
+    for suffix in _LOCAL_SUFFIXES:
+        local_path = config_path.with_name(stem + suffix)
+        if local_path.exists():
+            local_data = yaml.safe_load(local_path.read_text(encoding="utf-8")) or {}
+            _deep_merge(data, local_data)
+            break
+
     base_dir = config_path.parent
     chunker_cfg = data.get("chunker", {}) or {}
 
@@ -130,4 +154,5 @@ def load_config(config_path: Path) -> Config:
         cand_max=int(cand.get("max", 200)),
         timing=bool(data.get("timing", False)),
         env_file=env_file,
+        log_file=_resolve(base_dir, data["log_file"]) if data.get("log_file") else None,
     )

@@ -47,6 +47,16 @@ Copy [config.example.yaml](config.example.yaml) into your instance folder as
 the config file's own directory. Sources have a `type` (`markdown` or
 `transcript`) and a `chunker` (`recursive` or `breadcrumb`).
 
+## Local overrides
+
+Place a `basic-kb.local.yaml` (or `.yml`) next to your `basic-kb.yaml`. It's
+deep-merged on top of the base config at load time — scalar and dict values
+override, lists replace entirely.
+
+Useful for machine-specific paths (e.g. a symlink that resolves differently per OS),
+without touching the committed config. Add `**/basic-kb.local.yaml` to your
+`.gitignore`.
+
 ## Secrets
 
 The engine reads `JINA_API_KEY` from the environment (reranking is skipped if
