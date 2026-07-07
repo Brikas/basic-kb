@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
+import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -15,10 +19,84 @@ from .sources import DataSourceBase
 
 DEFAULT_N = 15
 
+logger = logging.getLogger("basic_kb")
+
+
+def setup_file_logging(path: Path, level: str = "INFO",
+                       max_bytes: int = 10_000_000, backup_count: int = 20) -> None:
+    """Attach a rotating file handler to the basic_kb logger so events go to `path`.
+
+    Rotates at ~max_bytes (default 10 MB) keeping backup_count old files (default 20,
+    ~200 MB of history) — logs neither grow unbounded nor get wiped. Idempotent per file.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = str(path.resolve())
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and getattr(h, "_bkb_target", None) == target:
+            return  # already logging to this file
+    handler = RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    handler._bkb_target = target  # type: ignore[attr-defined]
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.propagate = False
+
 
 def _file_hash(path: Path) -> str:
     """Content fingerprint of a file (sha1 of its bytes). Identity only, not security."""
     return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def lower_process_priority() -> None:
+    """Drop this process's OS scheduling priority so heavy work yields to foreground apps.
+    Best-effort: warns (does not abort) if the platform call fails."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            # restype/argtypes are required so the 64-bit pseudo-handle isn't
+            # truncated to 32 bits (which makes SetPriorityClass fail).
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            k32.SetPriorityClass.restype = ctypes.c_bool
+            BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+            if not k32.SetPriorityClass(k32.GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS):
+                raise OSError(f"SetPriorityClass failed (err={ctypes.get_last_error()})")
+        else:
+            os.nice(10)  # raise niceness (lower priority)
+    except Exception as e:
+        print(f"Warning: could not lower process priority ({e}).", file=sys.stderr)
+
+
+def cores_to_threads(fraction: Optional[float]) -> Optional[int]:
+    """Map a fraction of CPU cores (e.g. 0.5) to a thread count. None → None (use all)."""
+    if not fraction:
+        return None
+    cpu = os.cpu_count() or 1
+    return max(1, round(fraction * cpu))
+
+
+@dataclass
+class ScanResult:
+    """Read-only diff of a source's files on disk vs. what was last indexed."""
+    source_id: str
+    label: str
+    tracked: bool        # False if no manifest yet (never indexed under the new scheme)
+    files_on_disk: int
+    new: int
+    updated: int
+    unchanged: int
+    deleted: int
+
+    @property
+    def stale(self) -> int:
+        """Files that differ from the index (would change it on re-index)."""
+        return self.new + self.updated + self.deleted
 
 
 class KnowledgeBase:
@@ -42,6 +120,58 @@ class KnowledgeBase:
     def _client(self):
         import chromadb
         return chromadb.PersistentClient(path=str(self.chroma_dir))
+
+    # --- Manifest: every file seen at index time -> content hash, per source. -----
+    # Lets `scan` diff disk against the index without re-parsing, and correctly
+    # treats files too short to chunk as "seen" (not perpetually "new").
+    def _manifest_path(self) -> Path:
+        return self.chroma_dir / "manifest.json"
+
+    def _load_manifest(self) -> dict:
+        p = self._manifest_path()
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"Warning: manifest at {p} is corrupt ({e}); treating as empty.", file=sys.stderr)
+            return {}
+
+    def _save_manifest(self, manifest: dict) -> None:
+        self.chroma_dir.mkdir(parents=True, exist_ok=True)
+        self._manifest_path().write_text(
+            json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _rel_path(source: DataSourceBase, f: Path) -> str:
+        try:
+            return f.relative_to(source.directory).as_posix()
+        except ValueError:
+            return f.name
+
+    def scan(self, source: DataSourceBase) -> ScanResult:
+        """Diff the source's files on disk against the manifest. Read-only; no embedding."""
+        manifest = self._load_manifest().get(source.source_id, {})
+        tracked = bool(manifest)
+        live = {self._rel_path(source, f): _file_hash(f) for f in source.get_files()}
+
+        new = updated = unchanged = 0
+        for rp, h in live.items():
+            if rp not in manifest:
+                new += 1
+            elif manifest[rp] != h:
+                updated += 1
+            else:
+                unchanged += 1
+        deleted = sum(1 for rp in manifest if rp not in live)
+        logger.info("scan: source=%s tracked=%s on_disk=%d new=%d updated=%d unchanged=%d deleted=%d",
+                    source.source_id, tracked, len(live), new, updated, unchanged, deleted)
+        return ScanResult(
+            source_id=source.source_id, label=source.label, tracked=tracked,
+            files_on_disk=len(live), new=new, updated=updated,
+            unchanged=unchanged, deleted=deleted,
+        )
 
     def _get_collection(self, client, collection_name: str):
         """Get or create a named ChromaDB collection, clearing on EF conflict."""
@@ -71,11 +201,14 @@ class KnowledgeBase:
         min_chunk: int = DEFAULT_MIN_CHUNK,
         force: bool = False,
         limit: Optional[int] = None,
+        pause_ms: int = 0,
+        pause_every: int = 50,
     ) -> None:
         """Index all files from a DataSource into its own ChromaDB collection.
 
         `limit` caps the number of files (first N, stable order) — handy for test
-        runs before committing to a long full embed.
+        runs before committing to a long full embed. `pause_ms`/`pause_every` throttle
+        CPU duty by sleeping between batches of embedded files.
         """
         files = source.get_files()
         if not files:
@@ -112,18 +245,18 @@ class KnowledgeBase:
             f"(model={self.embedder.model_id}, chunker={chunker.name}, "
             f"chunk={chunk_size}, overlap={overlap})"
         )
+        logger.info("index start: source=%s files=%d model=%s force=%s limit=%s",
+                    source.source_id, len(files), self.embedder.model_id, force, limit)
 
         added = updated = unchanged = empty = pruned = 0
         total_files = len(files)
-        live: set[str] = set()
+        seen: dict[str, str] = {}   # rel_path -> hash, for the manifest (all files, incl. empty)
+        since_pause = 0             # embedded files since the last throttle pause
 
         for i, f in enumerate(files, 1):
-            try:
-                rel_path = f.relative_to(source.directory).as_posix()
-            except ValueError:
-                rel_path = f.name
-            live.add(rel_path)
+            rel_path = self._rel_path(source, f)
             file_hash = _file_hash(f)
+            seen[rel_path] = file_hash
 
             # Unchanged: same content already indexed → skip without parsing/embedding.
             if stored_hash.get(rel_path) == file_hash and rel_path in ids_by_file:
@@ -155,13 +288,29 @@ class KnowledgeBase:
             updated += 1 if was_indexed else 0
             added += 0 if was_indexed else 1
 
+            # Throttle: brief sleep between batches of embedded files to free the CPU.
+            if pause_ms > 0 and pause_every > 0:
+                since_pause += 1
+                if since_pause >= pause_every:
+                    time.sleep(pause_ms / 1000.0)
+                    since_pause = 0
+
         # Prune files that no longer exist on disk. Only on a full run — a --limit
         # run sees a subset, so absent files there are not actually deleted.
         if limit is None:
-            stale_ids = [cid for rp, ids in ids_by_file.items() if rp not in live for cid in ids]
+            stale_ids = [cid for rp, ids in ids_by_file.items() if rp not in seen for cid in ids]
             if stale_ids:
                 col.delete(ids=stale_ids)
-                pruned = sum(1 for rp in ids_by_file if rp not in live)
+                pruned = sum(1 for rp in ids_by_file if rp not in seen)
+
+        # Persist the manifest. Full run replaces this source's entry (drops deleted
+        # files); a --limit run merges, since it only saw a subset.
+        manifest = self._load_manifest()
+        if limit is None:
+            manifest[source.source_id] = seen
+        else:
+            manifest[source.source_id] = {**manifest.get(source.source_id, {}), **seen}
+        self._save_manifest(manifest)
 
         total = col.count()
         embedded = added + updated + unchanged   # files that contributed chunks to the index
@@ -171,6 +320,8 @@ class KnowledgeBase:
             f"empty={empty} pruned={pruned}  ({embedded} of {total_files} indexed)\n"
             f"  chunks: {total} total in index  (files are split into chunks; one file = many chunks)"
         )
+        logger.info("index done: source=%s new=%d updated=%d unchanged=%d empty=%d pruned=%d chunks=%d",
+                    source.source_id, added, updated, unchanged, empty, pruned, total)
 
     def search(
         self,
@@ -280,6 +431,13 @@ class KnowledgeBase:
                 file=sys.stderr,
             )
 
+        logger.info(
+            "search: sources=%s queries=%r n=%d candidates=%s hits=%d "
+            "embed_ms=%d retrieve_ms=%d rerank_ms=%d reranker=%s",
+            [s.source_id for s in sources], queries, n, rerank_candidates, len(hits),
+            t_embed * 1000, t_retrieve * 1000, t_rerank * 1000,
+            type(self.reranker).__name__ if self.reranker else None,
+        )
         return hits
 
     def status(self, sources: list[DataSourceBase]) -> None:

@@ -22,7 +22,8 @@ inside it — the config is found automatically (like `git` finds `.git`):
 cd my-instance/            # the folder holding basic-kb.yaml
 basic-kb index             # build/refresh the index
 basic-kb search "the thing I'm looking for"
-basic-kb status
+basic-kb status            # chunk/doc counts
+basic-kb scan              # what's new/changed/deleted vs the index (no embedding)
 basic-kb search --source list      # list configured sources
 ```
 
@@ -36,6 +37,11 @@ basic-kb search --source list      # list configured sources
 `--source` picks one (`--source notes`), several (`--source notes,docs`), or all
 (default). Index is incremental; use `--force` to rebuild. `index --preview`
 dry-runs the chunker without embedding.
+
+`scan` diffs the files on disk against the index (using a manifest written at index
+time) and reports new/changed/deleted counts without embedding anything. After a
+search, basic-kb runs this check every few days and prints a one-line nudge if a
+source has drifted — tune or disable it under `freshness:` in the config.
 
 Write queries as **statements**, not keywords — match the form of the text you're
 searching. Full guide: [docs/rag-query-guide.md](docs/rag-query-guide.md).

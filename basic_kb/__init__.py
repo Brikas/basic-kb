@@ -25,6 +25,10 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# basic-kb's own event logger. Quiet by default (NullHandler drops records when no
+# log_file is configured); the CLI attaches a FileHandler when `log_file` is set.
+logging.getLogger("basic_kb").addHandler(logging.NullHandler())
+
 from .config import Config, load_config, load_env_file
 from .core import KnowledgeBase
 from .embedders import EmbedderBase, FastEmbedEmbedder

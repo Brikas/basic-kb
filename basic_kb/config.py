@@ -41,6 +41,14 @@ CONFIG_FILENAMES = ("basic-kb.yaml", "basic-kb.yml")
 # Local-override suffix: basic-kb.local.yaml / basic-kb.local.yml sit alongside
 # the main config and deep-merge on top of it. Gitignored; machine-specific paths go here.
 _LOCAL_SUFFIXES = (".local.yaml", ".local.yml")
+# Shown after a search when a source hasn't been re-indexed in a while and has
+# drifted. Placeholders: {source} {new} {updated} {deleted} {unchanged} {stale}
+# {total} {days}. Override via `freshness.message` in the config.
+DEFAULT_FRESHNESS_MESSAGE = (
+    "[basic-kb] Source '{source}' looks stale since the last index: "
+    "{new} new, {updated} changed, {deleted} deleted file(s). "
+    "Consider prompting the user if they want to re-index (basic-kb index --source {source})."
+)
 
 
 def find_config(start: Optional[Path] = None) -> Optional[Path]:
@@ -95,6 +103,17 @@ class Config:
     cand_min: int = 50
     cand_max: int = 200
     timing: bool = False               # print per-phase search timings
+    freshness_enabled: bool = True     # post-search staleness reminder
+    freshness_every_days: int = 3      # how often to re-check a source
+    freshness_message: str = DEFAULT_FRESHNESS_MESSAGE
+    throttle_cores: Optional[float] = None   # fraction of CPU cores for indexing (None = all)
+    throttle_priority: str = "normal"        # normal | low (OS process priority while indexing)
+    throttle_pause_ms: int = 0               # sleep this many ms ...
+    throttle_pause_every: int = 50           # ... every N embedded files
+    log_file: Optional[Path] = None          # if set, write event log here (relative to config dir)
+    log_level: str = "INFO"
+    log_max_bytes: int = 10_000_000          # rotate at ~10 MB ...
+    log_backup_count: int = 20               # ... keeping 20 old files (~200 MB of history)
     env_file: Optional[Path] = None
     log_file: Optional[Path] = None   # append stdout+stderr here when set
 
@@ -137,6 +156,11 @@ def load_config(config_path: Path) -> Config:
     else:
         reranker_type, reranker_model = "none", None
 
+    fresh = data.get("freshness", {}) or {}
+
+    thr = data.get("throttle", {}) or {}
+    thr_cores = thr.get("cores_fraction")
+
     return Config(
         path=config_path,
         base_dir=base_dir,
@@ -153,6 +177,16 @@ def load_config(config_path: Path) -> Config:
         cand_min=int(cand.get("min", 50)),
         cand_max=int(cand.get("max", 200)),
         timing=bool(data.get("timing", False)),
-        env_file=env_file,
+        freshness_enabled=bool(fresh.get("enabled", True)),
+        freshness_every_days=int(fresh.get("every_days", 3)),
+        freshness_message=str(fresh.get("message", DEFAULT_FRESHNESS_MESSAGE)),
+        throttle_cores=float(thr_cores) if thr_cores is not None else None,
+        throttle_priority=str(thr.get("priority", "normal")),
+        throttle_pause_ms=int(thr.get("pause_ms", 0)),
+        throttle_pause_every=int(thr.get("pause_every", 50)),
         log_file=_resolve(base_dir, data["log_file"]) if data.get("log_file") else None,
+        log_level=str(data.get("log_level", "INFO")),
+        log_max_bytes=int(data.get("log_max_bytes", 10_000_000)),
+        log_backup_count=int(data.get("log_backup_count", 20)),
+        env_file=env_file,
     )

@@ -5,6 +5,8 @@
 # Preview / scratch output
 tmp/
 build/
+logs/
+**/logs/
 
 # Python
 __pycache__/

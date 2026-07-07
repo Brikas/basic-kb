@@ -47,7 +47,9 @@ KnowledgeBase
 | `basic_kb/textsplit.py` | Recursive character splitter (`split_text`) |
 | `basic_kb/chunkers.py` | ChunkerBase, RecursiveChunker, BreadcrumbHeadingChunker, `build_chunker` |
 | `basic_kb/sources.py` | DataSourceBase, MarkdownSource, TranscriptSource, `build_source` |
-| `basic_kb/core.py` | KnowledgeBase — index / search / status |
+| `basic_kb/core.py` | KnowledgeBase — index / search / status / scan; ScanResult + manifest |
+| `<instance>/.chroma/manifest.json` | per-source `{rel_path: hash}` of every file seen at index time; powers `scan` |
+| `<instance>/.chroma/freshness_state.json` | per-source last freshness-check timestamp |
 | `basic_kb/config.py` | Instance config + dotenv (`env_file`) loading |
 | `basic_kb/cli.py` | argparse, commands, result printing |
 | `<instance>/.chroma/` | Persistent ChromaDB index, lives next to the config (gitignored) |
