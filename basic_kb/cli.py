@@ -188,11 +188,19 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
     if priority == "low":
         lower_process_priority()
 
+    # Mass-change guard: config toggle, minus a per-run override; threshold from flag or config.
+    guard = config.reindex_guard and not getattr(args, "no_reindex_guard", False)
+    guard_threshold = getattr(args, "reindex_threshold", None)
+    if guard_threshold is None:
+        guard_threshold = config.reindex_guard_threshold
+
     kb = _build_kb(args, config, threads=threads)
     for source in sources:
         kb.index(source=source, chunk_size=chunk_size, overlap=overlap,
                  min_chunk=min_chunk, force=args.force, limit=getattr(args, "limit", None),
-                 pause_ms=pause_ms, pause_every=pause_every)
+                 pause_ms=pause_ms, pause_every=pause_every,
+                 guard=guard, guard_threshold=guard_threshold,
+                 assume_yes=getattr(args, "yes", False))
 
 
 def _preview_chunks(sources: list[DataSourceBase], config: Config,
@@ -421,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb scan                                          new/changed/deleted files vs the index\n\n"
             "Search flags:  --n N (results)  --max-chars N (truncate)  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
-            "Index flags:   --force  --limit N  --preview [--file NAME]\n"
+            "Index flags:   --force  --limit N  --preview [--file NAME]  --yes  --no-reindex-guard\n"
             "Throttle:      --throttle  --cores-fraction F  --priority low|normal  --pause-ms MS [--pause-every N]\n"
             "Tuning (any):  --model NAME  --chunk-size N  --overlap N  --min-chunk N\n"
             "Config:        --config FILE, else $BASIC_KB_CONFIG, else basic-kb.yaml up the tree."
@@ -459,6 +467,13 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Sleep MS milliseconds every --pause-every embedded files (hard CPU duty cap).")
     p_index.add_argument("--pause-every", type=int, default=None, metavar="N",
                          help="Pause cadence in embedded files (used with --pause-ms; default 50).")
+    p_index.add_argument("--yes", "-y", action="store_true",
+                         help="Auto-accept the mass-change safety prompt (for unattended re-indexing).")
+    p_index.add_argument("--no-reindex-guard", action="store_true",
+                         help="Skip the mass-change corruption check for this run.")
+    p_index.add_argument("--reindex-threshold", type=float, default=None, metavar="F",
+                         help="Churn fraction 0-1 that triggers the mass-change prompt "
+                              "(default: config, else 0.9). Example: --reindex-threshold 0.75")
 
     p_search = sub.add_parser("search", help="Search the index")
     _shared_args(p_search)

@@ -36,7 +36,15 @@ basic-kb search --source list      # list configured sources
 
 `--source` picks one (`--source notes`), several (`--source notes,docs`), or all
 (default). Index is incremental; use `--force` to rebuild. `index --preview`
-dry-runs the chunker without embedding.
+dry-runs the chunker without embedding. A pre-scan hashes every file first, so
+progress reads `[k/work]` (files actually being embedded), not `[i/all-files]`.
+
+**Corruption guard.** If a large fraction (default 90%) of already-indexed files
+change or disappear at once — usually a moved, corrupted, or re-pointed source —
+an incremental index confirms before re-embedding: it prompts on a terminal and
+aborts unattended, leaving the index untouched. `--yes` accepts, `--no-reindex-guard`
+skips it for one run, `--reindex-threshold F` tunes the trip point. Configure under
+`reindex_guard:` (`enabled`, `threshold`).
 
 `scan` diffs the files on disk against the index (using a manifest written at index
 time) and reports new/changed/deleted counts without embedding anything. After a
@@ -44,7 +52,8 @@ search, basic-kb runs this check every few days and prints a one-line nudge if a
 source has drifted — tune or disable it under `freshness:` in the config.
 
 Write queries as **statements**, not keywords — match the form of the text you're
-searching. Full guide: [docs/rag-query-guide.md](docs/rag-query-guide.md).
+searching. Full guide lives as a skill in consuming workspaces, e.g.
+`.github/skills/rag-query-writing/SKILL.md` in temple1.
 
 ## Config
 

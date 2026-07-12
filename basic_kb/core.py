@@ -19,6 +19,10 @@ from .sources import DataSourceBase
 
 DEFAULT_N = 15
 
+# Absolute floor for the mass-change guard: below this many changed/deleted files a
+# high churn fraction is just a small source being edited, not corruption — don't nag.
+_GUARD_MIN_FILES = 5
+
 logger = logging.getLogger("basic_kb")
 
 
@@ -193,6 +197,41 @@ class KnowledgeBase:
                 metadata={"hnsw:space": "cosine"},
             )
 
+    def _confirm_mass_change(
+        self, source: DataSourceBase, changed: int, deleted: int,
+        base: int, frac: float, threshold: float, assume_yes: bool,
+    ) -> bool:
+        """Guard prompt before re-embedding a source whose files mostly changed at once.
+
+        Such a jump usually means the source was corrupted, moved, or its path
+        re-pointed — not a normal edit. Returns True to proceed. `assume_yes` accepts
+        automatically; otherwise ask on a TTY, and refuse (return False) when running
+        unattended so a bad run can't silently trash a good index.
+        """
+        pct, tpct = round(frac * 100), round(threshold * 100)
+        print(
+            f"\n⚠  Mass change on '{source.source_id}': {changed} changed + {deleted} deleted "
+            f"of {base} indexed files = {pct}% (guard threshold {tpct}%).",
+            file=sys.stderr,
+        )
+        print("   This often means the source was corrupted, moved, or re-pointed — not a normal edit.",
+              file=sys.stderr)
+        print(f"   Directory: {source.directory}", file=sys.stderr)
+        if assume_yes:
+            print("   Proceeding anyway (--yes / auto-accept).", file=sys.stderr)
+            logger.warning("guard auto-accepted: source=%s changed=%d deleted=%d frac=%.2f",
+                           source.source_id, changed, deleted, frac)
+            return True
+        if not sys.stdin.isatty():
+            print("   Refusing to re-embed unattended. Re-run with --yes to accept, --force to "
+                  "rebuild, or --no-reindex-guard to skip this check.", file=sys.stderr)
+            return False
+        try:
+            answer = input("   Re-index anyway? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        return answer in ("y", "yes")
+
     def index(
         self,
         source: DataSourceBase,
@@ -203,12 +242,17 @@ class KnowledgeBase:
         limit: Optional[int] = None,
         pause_ms: int = 0,
         pause_every: int = 50,
+        guard: bool = True,
+        guard_threshold: float = 0.9,
+        assume_yes: bool = False,
     ) -> None:
         """Index all files from a DataSource into its own ChromaDB collection.
 
         `limit` caps the number of files (first N, stable order) — handy for test
         runs before committing to a long full embed. `pause_ms`/`pause_every` throttle
-        CPU duty by sleeping between batches of embedded files.
+        CPU duty by sleeping between batches of embedded files. When `guard` is on and
+        a fraction >= `guard_threshold` of already-indexed files changed/vanished at
+        once (likely corruption), confirm before proceeding unless `assume_yes`.
         """
         files = source.get_files()
         if not files:
@@ -229,40 +273,63 @@ class KnowledgeBase:
         col = self._get_collection(client, source.source_id)
 
         # Snapshot what's already indexed, keyed by each file's relative path.
-        # rel_path is the stable per-file identity; content_hash detects edits.
+        # rel_path is the stable per-file identity used to prune/replace chunks.
         snap = col.get(include=["metadatas"])
-        stored_hash: dict[str, Optional[str]] = {}   # rel_path -> indexed content hash
         ids_by_file: dict[str, list[str]] = {}       # rel_path -> its chunk ids
         for cid, meta in zip(snap["ids"], snap["metadatas"]):
             # Fall back to legacy 'file' key for chunks indexed before rel_path existed.
             rp = meta.get("rel_path") or meta.get("file") or cid.split("::")[0]
-            stored_hash.setdefault(rp, meta.get("content_hash"))
             ids_by_file.setdefault(rp, []).append(cid)
 
+        # Pre-scan: hash every file once and decide the real work up front. The manifest
+        # (which records ALL files incl. empty) is the skip oracle — a file whose hash
+        # still matches is untouched since last index, so it never re-parses. This makes
+        # progress honest ([k/work] not [i/all-files]) and mass-change corruption catchable.
+        prev_manifest: dict = {} if force else self._load_manifest().get(source.source_id, {})
+        entries = [(f, self._rel_path(source, f), _file_hash(f)) for f in files]
+        seen: dict[str, str] = {rp: h for _, rp, h in entries}  # manifest: every file, incl. empty
+        to_process = [(f, rp, h) for f, rp, h in entries if prev_manifest.get(rp) != h]
+        deleted_files = [rp for rp in prev_manifest if rp not in seen] if limit is None else []
+        work_total = len(to_process)
+        unchanged = len(entries) - work_total
+
+        # Corruption guard: a large fraction of previously-indexed files changing or
+        # vanishing at once is more likely a broken/moved source than a real bulk edit.
+        if guard and not force and prev_manifest:
+            changed_existing = sum(1 for _, rp, _ in to_process if rp in prev_manifest)
+            churn = changed_existing + len(deleted_files)
+            base = len(prev_manifest)
+            frac = churn / base if base else 0.0
+            if churn >= _GUARD_MIN_FILES and frac >= guard_threshold:
+                if not self._confirm_mass_change(
+                    source, changed_existing, len(deleted_files), base, frac, guard_threshold, assume_yes
+                ):
+                    print(f"Aborted index for '{source.source_id}' — index left unchanged.", file=sys.stderr)
+                    logger.warning("index aborted by guard: source=%s churn=%d/%d frac=%.2f",
+                                   source.source_id, churn, base, frac)
+                    return
+
         chunker = source.make_chunker(chunk_size, overlap, min_chunk)
+        prune_note = f", {len(deleted_files)} to prune" if deleted_files else ""
         print(
-            f"Indexing {len(files)} {source.label} files  "
+            f"Indexing {source.label}: {len(entries)} files on disk, "
+            f"{work_total} to (re)embed, {unchanged} unchanged{prune_note}  "
             f"(model={self.embedder.model_id}, chunker={chunker.name}, "
             f"chunk={chunk_size}, overlap={overlap})"
         )
-        logger.info("index start: source=%s files=%d model=%s force=%s limit=%s",
-                    source.source_id, len(files), self.embedder.model_id, force, limit)
+        if work_total == 0 and not deleted_files:
+            print("  Already up to date — nothing to embed.")
+        logger.info("index start: source=%s files=%d work=%d unchanged=%d deleted=%d model=%s force=%s limit=%s",
+                    source.source_id, len(entries), work_total, unchanged,
+                    len(deleted_files), self.embedder.model_id, force, limit)
 
-        added = updated = unchanged = empty = pruned = 0
-        total_files = len(files)
-        seen: dict[str, str] = {}   # rel_path -> hash, for the manifest (all files, incl. empty)
+        added = updated = empty = pruned = 0
+        # Work total is known from the pre-scan; "?" only as an honest fallback if it
+        # ever couldn't be determined (it always can here — kept for defensiveness).
+        total_str = str(work_total) if work_total is not None else "?"
         since_pause = 0             # embedded files since the last throttle pause
 
-        for i, f in enumerate(files, 1):
-            rel_path = self._rel_path(source, f)
-            file_hash = _file_hash(f)
-            seen[rel_path] = file_hash
-
-            # Unchanged: same content already indexed → skip without parsing/embedding.
-            if stored_hash.get(rel_path) == file_hash and rel_path in ids_by_file:
-                unchanged += 1
-                continue
-
+        for processed, (f, rel_path, file_hash) in enumerate(to_process, 1):
             was_indexed = rel_path in ids_by_file
             doc = source.parse_file(f)
             chunks = chunker.chunk(doc) if doc is not None else []
@@ -274,7 +341,7 @@ class KnowledgeBase:
 
             # Print right before embedding (the slow step) so a stall points at this file.
             verb = "re-embedding" if was_indexed else "embedding"
-            print(f"  [{i}/{total_files}] {verb} {rel_path}  ({len(chunks)} chunks)", flush=True)
+            print(f"  [{processed}/{total_str}] {verb} {rel_path}  ({len(chunks)} chunks)", flush=True)
 
             if was_indexed:  # changed file → remove old chunks before re-adding
                 col.delete(ids=ids_by_file[rel_path])
@@ -297,11 +364,11 @@ class KnowledgeBase:
 
         # Prune files that no longer exist on disk. Only on a full run — a --limit
         # run sees a subset, so absent files there are not actually deleted.
-        if limit is None:
-            stale_ids = [cid for rp, ids in ids_by_file.items() if rp not in seen for cid in ids]
+        if limit is None and deleted_files:
+            stale_ids = [cid for rp in deleted_files if rp in ids_by_file for cid in ids_by_file[rp]]
             if stale_ids:
                 col.delete(ids=stale_ids)
-                pruned = sum(1 for rp in ids_by_file if rp not in seen)
+            pruned = len(deleted_files)
 
         # Persist the manifest. Full run replaces this source's entry (drops deleted
         # files); a --limit run merges, since it only saw a subset.
@@ -313,11 +380,10 @@ class KnowledgeBase:
         self._save_manifest(manifest)
 
         total = col.count()
-        embedded = added + updated + unchanged   # files that contributed chunks to the index
         print(
             f"\nDone [{source.source_id}].\n"
             f"  files:  new={added} updated={updated} unchanged={unchanged} "
-            f"empty={empty} pruned={pruned}  ({embedded} of {total_files} indexed)\n"
+            f"empty={empty} pruned={pruned}  ({added + updated} embedded this run)\n"
             f"  chunks: {total} total in index  (files are split into chunks; one file = many chunks)"
         )
         logger.info("index done: source=%s new=%d updated=%d unchanged=%d empty=%d pruned=%d chunks=%d",
@@ -454,6 +520,13 @@ class KnowledgeBase:
             print(f"ChromaDB: {self.chroma_dir}")
             print(f"Model   : {self.embedder.model_id}")
 
+            # Warn loudly if the source path itself is gone (moved dir, unmounted drive,
+            # broken symlink). The index can still look healthy while pointing at nothing.
+            if not source.directory.exists():
+                print(f"  ⚠  SOURCE PATH MISSING: {source.directory}")
+                print("     directory does not exist — moved, unmounted, or a broken symlink.")
+                print("     Any indexed chunks are now orphaned; fix the path or re-point the source.")
+
             try:
                 col = client.get_collection(
                     name=source.source_id,
@@ -469,12 +542,29 @@ class KnowledgeBase:
                 continue
 
             all_metas: list[dict] = col.get(include=["metadatas"])["metadatas"]
-            indexed_files: set[str] = {m["file"] for m in all_metas}
-            files_on_disk = len(source.get_files())
-            unindexed = files_on_disk - len(indexed_files)
+            docs_with_chunks = len({m["file"] for m in all_metas})
+            # Use the manifest (via scan) for staleness — it tracks every processed
+            # file incl. those too short to chunk, so empties aren't false "unindexed".
+            res = self.scan(source)
 
             print(f"Chunks  : {total_chunks:,}")
-            print(f"Docs    : {len(indexed_files):,} indexed / {files_on_disk} on disk  ({unindexed} not indexed)")
+            print(f"Docs    : {docs_with_chunks:,} produced chunks / {res.files_on_disk} files on disk")
+            if res.files_on_disk == 0:
+                # Distinguish "path gone" (warned above) from "path exists but empty".
+                if not source.directory.exists():
+                    print(f"  ⚠  0 files — source path is missing (see warning above); {docs_with_chunks} indexed docs orphaned.")
+                else:
+                    print(f"  ⚠  0 files at {source.directory}")
+                    print(f"     directory exists but holds no matching files — the {docs_with_chunks} indexed docs are now stale.")
+            elif not res.tracked:
+                print(f"           no manifest yet — run `python -m basic_kb index --source {source.source_id}` "
+                      f"once so empty files are tracked (until then {res.new} files show as new).")
+            elif res.stale:
+                parts = [f"{res.new} new", f"{res.updated} changed", f"{res.deleted} deleted"]
+                print(f"           {', '.join(p for p, n in zip(parts, (res.new, res.updated, res.deleted)) if n)}"
+                      f" since last index — run: python -m basic_kb index --source {source.source_id}")
+            else:
+                print("           up to date  (files too short to chunk are tracked, not counted as unindexed)")
 
             dates = sorted(
                 m.get("date", "unknown") for m in all_metas

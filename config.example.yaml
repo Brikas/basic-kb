@@ -51,6 +51,14 @@ freshness:
 #   pause_ms: 0         # sleep this many ms every `pause_every` embedded files (hard duty cap)
 #   pause_every: 50
 
+# Corruption guard: if a big fraction of already-indexed files change or vanish at
+# once (a moved/corrupted/re-pointed source), incremental index confirms before
+# re-embedding. On a TTY it prompts; unattended it aborts (leaving the index intact).
+# --yes accepts, --no-reindex-guard skips it for one run. On by default.
+# reindex_guard:
+#   enabled: true
+#   threshold: 0.9      # churn fraction (changed+deleted / indexed) that triggers the prompt
+
 # Each source -> its own collection. Query one (--source notes), several
 # (--source notes,docs), or all (default). See --source list.
 sources:

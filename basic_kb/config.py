@@ -114,8 +114,9 @@ class Config:
     log_level: str = "INFO"
     log_max_bytes: int = 10_000_000          # rotate at ~10 MB ...
     log_backup_count: int = 20               # ... keeping 20 old files (~200 MB of history)
+    reindex_guard: bool = True               # confirm before re-embedding a mass-changed source
+    reindex_guard_threshold: float = 0.9     # churn fraction (changed+deleted / indexed) that triggers it
     env_file: Optional[Path] = None
-    log_file: Optional[Path] = None   # append stdout+stderr here when set
 
 
 def load_config(config_path: Path) -> Config:
@@ -161,6 +162,16 @@ def load_config(config_path: Path) -> Config:
     thr = data.get("throttle", {}) or {}
     thr_cores = thr.get("cores_fraction")
 
+    # `reindex_guard:` may be a bare bool (reindex_guard: false) or a mapping
+    # ({enabled, threshold}). Both disable/tune the mass-change corruption check.
+    rg = data.get("reindex_guard")
+    if isinstance(rg, bool):
+        rg_enabled, rg_threshold = rg, 0.9
+    else:
+        rg = rg or {}
+        rg_enabled = bool(rg.get("enabled", True))
+        rg_threshold = float(rg.get("threshold", 0.9))
+
     return Config(
         path=config_path,
         base_dir=base_dir,
@@ -188,5 +199,7 @@ def load_config(config_path: Path) -> Config:
         log_level=str(data.get("log_level", "INFO")),
         log_max_bytes=int(data.get("log_max_bytes", 10_000_000)),
         log_backup_count=int(data.get("log_backup_count", 20)),
+        reindex_guard=rg_enabled,
+        reindex_guard_threshold=rg_threshold,
         env_file=env_file,
     )
