@@ -389,6 +389,87 @@ class KnowledgeBase:
         logger.info("index done: source=%s new=%d updated=%d unchanged=%d empty=%d pruned=%d chunks=%d",
                     source.source_id, added, updated, unchanged, empty, pruned, total)
 
+    def stale_paths(self, source: DataSourceBase) -> list[Path]:
+        """Files that differ from the manifest (new/changed on disk + deleted).
+
+        Deleted files are returned as their (now non-existent) path so reindex_paths
+        can prune them. Used for the watcher's startup reconcile of offline edits.
+        """
+        manifest = self._load_manifest().get(source.source_id, {})
+        live = {self._rel_path(source, f): f for f in source.get_files()}
+        changed = [f for rp, f in live.items() if manifest.get(rp) != _file_hash(f)]
+        deleted = [source.directory / rp for rp in manifest if rp not in live]
+        return changed + deleted
+
+    def reindex_paths(
+        self,
+        source: DataSourceBase,
+        paths,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        overlap: int = DEFAULT_OVERLAP,
+        min_chunk: int = DEFAULT_MIN_CHUNK,
+    ) -> dict:
+        """Reindex a specific set of files, not the whole source (the watcher's write path).
+
+        Embeds created/changed files, drops chunks for files that became empty, prunes
+        deleted files, and updates just those manifest entries. Returns a counts dict.
+        Callers must serialize this (one writer) — ChromaDB is not multi-writer safe.
+        """
+        rels: dict[str, Path] = {}
+        for p in paths:
+            p = Path(p)
+            rels[self._rel_path(source, p)] = p
+        counts = {"embedded": 0, "empty": 0, "pruned": 0}
+        if not rels:
+            return counts
+
+        client = self._client()
+        col = self._get_collection(client, source.source_id)
+        chunker = source.make_chunker(chunk_size, overlap, min_chunk)
+
+        # Existing chunk ids for just these files. rel_path metadata exists for anything
+        # (re)indexed under the manifest scheme, which the watcher's startup reconcile
+        # guarantees before per-file events are handled.
+        ids_by_file: dict[str, list[str]] = {}
+        got = col.get(where={"rel_path": {"$in": list(rels)}}, include=["metadatas"])
+        for cid, meta in zip(got["ids"], got["metadatas"]):
+            rp = meta.get("rel_path") or cid.split("::")[0]
+            ids_by_file.setdefault(rp, []).append(cid)
+
+        manifest = self._load_manifest()
+        src_manifest = manifest.setdefault(source.source_id, {})
+        for rp, p in rels.items():
+            old_ids = ids_by_file.get(rp, [])
+            if not p.exists():                       # deleted → prune + forget
+                if old_ids:
+                    col.delete(ids=old_ids)
+                src_manifest.pop(rp, None)
+                counts["pruned"] += 1
+                logger.info("reindex_paths: pruned %s/%s", source.source_id, rp)
+                continue
+
+            file_hash = _file_hash(p)
+            doc = source.parse_file(p)
+            chunks = chunker.chunk(doc) if doc is not None else []
+            if old_ids:                              # replace: drop old chunks first
+                col.delete(ids=old_ids)
+            src_manifest[rp] = file_hash             # track even if it yields no chunks
+            if not chunks:
+                counts["empty"] += 1
+                continue
+
+            new_ids, new_docs, new_metas = [], [], []
+            for chunk in chunks:
+                new_ids.append(f"{rp}::{chunk.id_suffix}")
+                new_docs.append(chunk.text)
+                new_metas.append({**chunk.metadata, "rel_path": rp, "content_hash": file_hash})
+            col.add(documents=new_docs, metadatas=new_metas, ids=new_ids)
+            counts["embedded"] += 1
+            logger.info("reindex_paths: embedded %s/%s (%d chunks)", source.source_id, rp, len(chunks))
+
+        self._save_manifest(manifest)
+        return counts
+
     def search(
         self,
         sources: list[DataSourceBase],
@@ -402,20 +483,65 @@ class KnowledgeBase:
         strict_rerank: bool = False,
         timing: bool = False,
     ) -> list[SearchResult]:
-        """
-        Multi-source, multi-query semantic search.
+        """Fused multi-query search: all queries pool into ONE ranked list of n hits.
 
-        Each query is run against every source collection independently.
-        Results are merged by score (highest wins per unique chunk ID),
-        then optionally reranked. With timing=True, prints per-phase durations.
+        Each query is run against every source; hits are merged by score (highest wins
+        per chunk) and optionally reranked. Best when the queries are re-framings of the
+        same information need (they reinforce recall). For n hits *per* query instead,
+        use search_grouped(). With timing=True, prints per-phase durations.
         """
         if not self.chroma_dir.exists():
             print("No index found. Run: python -m basic_kb index")
             return []
+        client = self._client()
+        return self._run_query_group(
+            client, sources, queries, n, content_type_filter, rerank_candidates,
+            cand_multiplier, cand_min, cand_max, strict_rerank, timing,
+        )
 
+    def search_grouped(
+        self,
+        sources: list[DataSourceBase],
+        queries: list[str],
+        n: int = DEFAULT_N,
+        content_type_filter: Optional[str] = None,
+        rerank_candidates: Optional[int] = None,
+        cand_multiplier: int = 3,
+        cand_min: int = 50,
+        cand_max: int = 200,
+        strict_rerank: bool = False,
+        timing: bool = False,
+    ) -> list[tuple[str, list[SearchResult]]]:
+        """Batch search (msearch-style): each query independently returns its OWN top-n.
+
+        Returns [(query, hits), ...] — no cross-query merging. Best when the queries ask
+        for *different* things in one call and you want a full result set for each.
+        """
+        if not self.chroma_dir.exists():
+            print("No index found. Run: python -m basic_kb index")
+            return []
+        client = self._client()
+        out: list[tuple[str, list[SearchResult]]] = []
+        for q in queries:
+            hits = self._run_query_group(
+                client, sources, [q], n, content_type_filter, rerank_candidates,
+                cand_multiplier, cand_min, cand_max, strict_rerank, timing, timing_label=q,
+            )
+            out.append((q, hits))
+        return out
+
+    def _run_query_group(
+        self, client, sources: list[DataSourceBase], queries: list[str], n: int,
+        content_type_filter: Optional[str], rerank_candidates: Optional[int],
+        cand_multiplier: int, cand_min: int, cand_max: int,
+        strict_rerank: bool, timing: bool, timing_label: str = "",
+    ) -> list[SearchResult]:
+        """Run one group of queries into a single ranked list (embed→retrieve→merge→rerank).
+
+        The reranker scores against queries[0], so a group is one information need.
+        """
         t0 = time.perf_counter()
         t_embed = t_retrieve = t_rerank = 0.0
-        client = self._client()
         best: dict[str, SearchResult] = {}
 
         if self.reranker and rerank_candidates is None:
@@ -490,8 +616,9 @@ class KnowledgeBase:
         t_rerank = time.perf_counter() - _trr
 
         if timing:
+            label = f" [{timing_label}]" if timing_label else ""
             print(
-                f"timing (ms): embed={t_embed*1000:.0f}  retrieve={t_retrieve*1000:.0f}  "
+                f"timing (ms){label}: embed={t_embed*1000:.0f}  retrieve={t_retrieve*1000:.0f}  "
                 f"rerank={t_rerank*1000:.0f}  total={(time.perf_counter()-t0)*1000:.0f}"
                 "   [cold process — embed & rerank include one-time model load]",
                 file=sys.stderr,

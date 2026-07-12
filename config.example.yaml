@@ -27,10 +27,10 @@ reranker:
 
 timing: false                   # set true to print per-phase search timings (embed/retrieve/rerank/total)
 
-# log_file: logs/basic-kb.log   # write a timestamped event log (index/search/scan) here; path relative to this config
-# log_level: INFO               # DEBUG | INFO | WARNING
+log_file: logs/basic-kb.log   # write a timestamped event log (index/search/scan) here; path relative to this config
+log_level: INFO               # DEBUG | INFO | WARNING
 # log_max_bytes: 10000000       # rotate at ~10 MB per file ...
-# log_backup_count: 20          # ... keeping 20 old files (~200 MB of history; oldest dropped)
+# log_backup_count: 5          # ... keeping 5 old files (~50 MB of history; oldest dropped)
 
 # After a search, every `every_days`, basic-kb diffs the queried source(s) against
 # the index and prints a one-line nudge if files are new/changed/deleted. Cheap
@@ -43,8 +43,6 @@ freshness:
 
 # Optional throttling so a big index doesn't peg the CPU and make the machine
 # unusable. Off by default (full speed). The three levers compose; all optional.
-# CLI overrides: --throttle (= cores 0.5 + priority low), --cores-fraction F,
-# --priority low|normal, --pause-ms MS, --pause-every N.
 # throttle:
 #   cores_fraction: 0.5 # fraction of CPU cores the embedder may use (portable across machines)
 #   priority: low       # low | normal — OS process priority while indexing
@@ -68,6 +66,9 @@ sources:
     chunker: recursive      # recursive (no headings) | breadcrumb (heading-aware)
     label: My Notes
     description: Personal markdown notes.
+    watch:                  # auto-reindex THIS source on edits (via `basic-kb watch`)
+      enabled: true         # false to exclude this source from watching
+      debounce_seconds: 30  # reindex a file this long after it goes quiet (0 = immediately)
 
   # - id: transcripts
   #   type: transcript

@@ -46,6 +46,19 @@ aborts unattended, leaving the index untouched. `--yes` accepts, `--no-reindex-g
 skips it for one run, `--reindex-threshold F` tunes the trip point. Configure under
 `reindex_guard:` (`enabled`, `threshold`).
 
+## Auto-reindex (`watch`)
+
+`basic-kb watch` is a foreground process that watches every enabled source and
+re-embeds a file once it has been quiet for its debounce window — so the index
+tracks your edits without you running `index` by hand. Ctrl-C to stop.
+
+```bash
+basic-kb watch                 # all sources, config debounce (default 30s)
+basic-kb watch --debounce 300  # reindex 5 min after a file goes quiet (0 = immediately)
+```
+
+Watch is configured **per source**: add a `watch:` block.
+
 `scan` diffs the files on disk against the index (using a manifest written at index
 time) and reports new/changed/deleted counts without embedding anything. After a
 search, basic-kb runs this check every few days and prints a one-line nudge if a
@@ -54,6 +67,21 @@ source has drifted — tune or disable it under `freshness:` in the config.
 Write queries as **statements**, not keywords — match the form of the text you're
 searching. Full guide lives as a skill in consuming workspaces, e.g.
 `.github/skills/rag-query-writing/SKILL.md` in temple1.
+
+### One search vs. many: fused vs. batch
+
+Two ways to pass multiple queries — they answer different needs:
+
+- **Fused (default).** `search "price too high" "budget concern"` runs every query,
+  pools the hits into **one** ranked list, and returns `--n` results total. The queries
+  are treated as re-framings of a *single* information need, so they reinforce each other
+  (higher recall for the same notes). Use it for HyDE / multi-angle phrasing of one thing.
+- **Batch** (`--separate`, alias `--batch`). `search "coffee gear" "tax deadlines" --separate`
+  runs each query **independently** and prints its own block of `--n` results — no merging.
+  Use it when the queries ask for *different* things and you want a full result set for each,
+  in one call. `--n` is then per query (2 queries × `--n 15` = up to 30 results).
+
+Rule of thumb: same target, different words → **fused**; different targets → **batch**.
 
 ## Config
 
@@ -82,7 +110,8 @@ dotenv file.
 ## Develop
 
 Architecture and gotchas: [docs/developing.md](docs/developing.md). Modules:
-`models`, `embedders`, `rerankers`, `textsplit`, `chunkers`, `sources`, `core`, `cli`.
+`models`, `embedders`, `rerankers`, `textsplit`, `chunkers`, `sources`, `core`,
+`watcher`, `cli`.
 
 Planned capabilities (chunk filter/transform hook, reference expansion, LogSeq-aware
 chunker): [ROADMAP.md](ROADMAP.md).

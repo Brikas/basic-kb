@@ -3,11 +3,14 @@
   python -m basic_kb index  --config CFG [--source ID|all] [--force] [--preview]
   python -m basic_kb search "..." --config CFG [--source ID|all] [--n N]
   python -m basic_kb status --config CFG [--source ID|all]
+  python -m basic_kb watch  --config CFG [--source ID|all] [--debounce SEC]
 
 Config is resolved automatically: --config flag > $BASIC_KB_CONFIG > a basic-kb.yaml
 found by walking up from the current directory (see README).
-Multi-query search improves recall:
+Multi-query search, merged into one ranked list (re-framings of one need = better recall):
   python -m basic_kb search "price too high" "budget concern" --config CFG
+Batch mode — each query returns its own top-n block (different needs in one call):
+  python -m basic_kb search "coffee gear" "tax deadlines" --separate --config CFG
 
 Embedding / chunking overrides (override config defaults for one run):
   --model NAME  --chunk-size N  --overlap N  --min-chunk N
@@ -278,8 +281,7 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         print("Error: at least one query is required.", file=sys.stderr)
         sys.exit(1)
     kb = _build_kb(args, config)
-
-    hits = kb.search(
+    common = dict(
         sources=sources,
         queries=args.queries,
         n=args.n,
@@ -291,11 +293,28 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         strict_rerank=getattr(args, "rerank", False),
         timing=getattr(args, "timing", False) or config.timing,
     )
+
+    # Batch mode: each query gets its OWN top-n block (no cross-query merging).
+    if getattr(args, "separate", False):
+        groups = kb.search_grouped(**common)
+        for q, hits in groups:
+            print("#" * 60)
+            print(f"# Query: {q}  ({len(hits)} results)")
+            print("#" * 60 + "\n")
+            if hits:
+                _print_results(hits, args.max_chars)
+            else:
+                print("No results.\n")
+        _freshness_reminder(kb, sources, config)
+        return
+
+    # Fused mode (default): all queries merged into one ranked list.
+    hits = kb.search(**common)
     if not hits:
         print("No results.")
         return
     if len(args.queries) > 1:
-        print(f"[{len(args.queries)} queries merged]")
+        print(f"[{len(args.queries)} queries merged into one ranked list]")
     _print_results(hits, args.max_chars)
     _freshness_reminder(kb, sources, config)
 
@@ -331,6 +350,31 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> None:
             print(f"{line}  ->  up to date")
     if any_stale:
         print("\nRe-index with: basic_kb index")
+
+
+def cmd_watch(args: argparse.Namespace, config: Config) -> None:
+    from .watcher import resolve_settings, run_watch
+
+    sources = _load_sources(config, getattr(args, "source", "all"))
+    raw_by_id = {s["id"]: s for s in config.sources}
+    debounce_override = getattr(args, "debounce", None)
+
+    watched = []
+    for src in sources:
+        settings = resolve_settings(raw_by_id.get(src.source_id, {}), debounce_override)
+        if settings.enabled:
+            watched.append((src, settings))
+        else:
+            print(f"  (skipping '{src.source_id}': watch disabled in config)", file=sys.stderr)
+    if not watched:
+        print("No sources have watching enabled.", file=sys.stderr)
+        sys.exit(1)
+
+    _, chunk_size, overlap, min_chunk = _effective(args, config)
+    kb = _scan_kb(args, config)  # embedder only; reindex needs no reranker
+    if config.log_file:
+        print(f"(logging events to {config.log_file})", file=sys.stderr)
+    run_watch(kb, watched, config, chunk_size, overlap, min_chunk)
 
 
 def _format_freshness(template: str, res, days: int) -> str:
@@ -420,17 +464,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Run a command with -h for its full options, e.g.  basic_kb index -h\n\n"
             "Common usage:\n"
             "  basic_kb search \"a statement the note would contain\"   search (all sources)\n"
-            "  basic_kb search \"angle one\" \"angle two\"                multi-query, better recall\n"
+            "  basic_kb search \"angle one\" \"angle two\"                multi-query, merged (better recall)\n"
+            "  basic_kb search \"topic a\" \"topic b\" --separate         batch: n results per query\n"
             "  basic_kb search --source list                          list configured sources\n"
             "  basic_kb index                                         incremental: new/changed only\n"
             "  basic_kb index --force                                 rebuild the whole index\n"
             "  basic_kb index --limit 10                              embed only the first N files (test)\n"
             "  basic_kb status                                        chunk/doc counts per source\n"
-            "  basic_kb scan                                          new/changed/deleted files vs the index\n\n"
-            "Search flags:  --n N (results)  --max-chars N (truncate)  --content-type T  --timing\n"
+            "  basic_kb scan                                          new/changed/deleted files vs the index\n"
+            "  basic_kb watch                                         auto-reindex edited files (foreground)\n\n"
+            "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --limit N  --preview [--file NAME]  --yes  --no-reindex-guard\n"
             "Throttle:      --throttle  --cores-fraction F  --priority low|normal  --pause-ms MS [--pause-every N]\n"
+            "Watch:         --debounce SEC (0=immediate; per-source `watch:` config otherwise)\n"
             "Tuning (any):  --model NAME  --chunk-size N  --overlap N  --min-chunk N\n"
             "Config:        --config FILE, else $BASIC_KB_CONFIG, else basic-kb.yaml up the tree."
         ),
@@ -479,9 +526,14 @@ def build_parser() -> argparse.ArgumentParser:
     _shared_args(p_search)
     _rerank_args(p_search)
     p_search.add_argument("queries", nargs="*",
-                          help="One or more queries (multiple are merged for better recall).")
+                          help="One or more queries. Default: merged into one ranked list "
+                               "(re-framings of one need). With --separate: one result set each.")
+    p_search.add_argument("--separate", "--batch", dest="separate", action="store_true",
+                          help="Batch mode: return --n results per query in its own block, instead "
+                               "of merging all queries into one list. Use when the queries ask for "
+                               "different things. Example: search \"coffee gear\" \"tax deadlines\" --separate")
     p_search.add_argument("--n", type=int, default=DEFAULT_N, metavar="N",
-                          help=f"Number of results (default: {DEFAULT_N})")
+                          help=f"Number of results (default: {DEFAULT_N}). In --separate mode, per query.")
     p_search.add_argument("--content-type", default=None, metavar="TYPE",
                           help="Filter by frontmatter content_type (markdown sources).")
     p_search.add_argument("--max-chars", type=int, default=0, metavar="N",
@@ -495,6 +547,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_scan = sub.add_parser("scan", help="Check staleness: new/changed/deleted files vs the index (no embedding)")
     _shared_args(p_scan)
+
+    p_watch = sub.add_parser("watch",
+                             help="Watch sources and auto-reindex edited files (foreground; Ctrl-C to stop)")
+    _shared_args(p_watch)
+    p_watch.add_argument("--debounce", type=int, default=None, metavar="SEC",
+                         help="Reindex a file after it's been quiet this long, overriding each source's "
+                              "config for this run (default 30s; 0 = reindex immediately). Example: --debounce 300")
 
     return parser
 
@@ -531,7 +590,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                            config.log_max_bytes, config.log_backup_count)
 
     {"index": cmd_index, "search": cmd_search, "status": cmd_status,
-     "scan": cmd_scan}[args.cmd](args, config)
+     "scan": cmd_scan, "watch": cmd_watch}[args.cmd](args, config)
 
 
 if __name__ == "__main__":

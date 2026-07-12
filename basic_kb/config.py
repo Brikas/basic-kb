@@ -113,10 +113,12 @@ class Config:
     log_file: Optional[Path] = None          # if set, write event log here (relative to config dir)
     log_level: str = "INFO"
     log_max_bytes: int = 10_000_000          # rotate at ~10 MB ...
-    log_backup_count: int = 20               # ... keeping 20 old files (~200 MB of history)
+    log_backup_count: int = 5                # ... keeping 5 old files (~50 MB of history)
     reindex_guard: bool = True               # confirm before re-embedding a mass-changed source
     reindex_guard_threshold: float = 0.9     # churn fraction (changed+deleted / indexed) that triggers it
     env_file: Optional[Path] = None
+    # Watch/auto-reindex is configured PER SOURCE (a `watch:` block on each source),
+    # not instance-wide — see basic_kb.watcher.resolve_settings.
 
 
 def load_config(config_path: Path) -> Config:
@@ -198,7 +200,7 @@ def load_config(config_path: Path) -> Config:
         log_file=_resolve(base_dir, data["log_file"]) if data.get("log_file") else None,
         log_level=str(data.get("log_level", "INFO")),
         log_max_bytes=int(data.get("log_max_bytes", 10_000_000)),
-        log_backup_count=int(data.get("log_backup_count", 20)),
+        log_backup_count=int(data.get("log_backup_count", 5)),
         reindex_guard=rg_enabled,
         reindex_guard_threshold=rg_threshold,
         env_file=env_file,
