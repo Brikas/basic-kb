@@ -32,13 +32,16 @@ log_level: INFO               # DEBUG | INFO | WARNING
 # log_max_bytes: 10000000       # rotate at ~10 MB per file ...
 # log_backup_count: 5          # ... keeping 5 old files (~50 MB of history; oldest dropped)
 
-# After a search, every `every_days`, basic-kb diffs the queried source(s) against
-# the index and prints a one-line nudge if files are new/changed/deleted. Cheap
-# (hashes files, no embedding). Set enabled: false to turn it off entirely.
+# After a search, basic-kb diffs the queried source(s) against the index and, if
+# they've stayed stale, prints a one-line nudge. A source must be stale for
+# `stale_after_days` before the FIRST nudge; then it re-nags at most once per
+# `remind_every_days` until you re-index (re-indexing resets the clock). Cheap
+# (hashes files at most once per remind window, no embedding). enabled: false turns it off.
 # message placeholders: {source} {new} {updated} {deleted} {unchanged} {stale} {total} {days}
 freshness:
   enabled: true
-  every_days: 3
+  stale_after_days: 3     # don't nag until a source has been stale this long
+  remind_every_days: 1    # then nag at most once a day while it stays un-indexed
   # message: "[basic-kb] '{source}': {stale} file(s) changed since last index — re-index? (basic-kb index)"
 
 # Optional throttling so a big index doesn't peg the CPU and make the machine

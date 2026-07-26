@@ -390,7 +390,17 @@ def _format_freshness(template: str, res, days: int) -> str:
 
 
 def _freshness_reminder(kb: KnowledgeBase, sources: list[DataSourceBase], config: Config) -> None:
-    """After a search, every `every_days`, check the queried sources and nudge if stale."""
+    """After a search, nag about sources that have stayed stale for a while.
+
+    A source must be *continuously* stale for `stale_after_days` before the first
+    nudge; after that it re-nags at most once per `remind_every_days` (once/day)
+    for as long as it stays un-indexed. Re-indexing (source goes clean) clears the
+    per-source state, so it must age past the threshold again before it can nag.
+
+    Per-source state is `{first_stale, last_eval}`. The `last_eval` gate means we
+    re-scan a source at most once per remind window, which both bounds the hashing
+    cost to once/day and gives the once/day nag cadence.
+    """
     if not config.freshness_enabled:
         return
     state_path = config.store_dir / "freshness_state.json"
@@ -402,20 +412,30 @@ def _freshness_reminder(kb: KnowledgeBase, sources: list[DataSourceBase], config
             state = {}   # treat corrupt state as "never checked"; it gets rewritten below
 
     now = time.time()
-    interval = max(0, config.freshness_every_days) * 86400
-    due = [s for s in sources if now - float(state.get(s.source_id, 0)) >= interval]
-    if not due:
-        return
+    stale_after = max(0.0, config.freshness_stale_after_days) * 86400
+    remind_every = max(0.0, config.freshness_remind_every_days) * 86400
 
     messages: list[str] = []
-    for s in due:
+    dirty = False
+    for s in sources:
+        st = state.get(s.source_id)
+        st = st if isinstance(st, dict) else {}   # migrate legacy single-timestamp state
+        if now - float(st.get("last_eval", 0)) < remind_every:
+            continue   # evaluated within this window — don't re-scan or re-nag yet
+        dirty = True
         res = kb.scan(s)
-        state[s.source_id] = now   # reset the timer whether or not it was stale
-        if res.tracked and res.stale:
-            messages.append(_format_freshness(config.freshness_message, res, config.freshness_every_days))
+        if not (res.tracked and res.stale):
+            state.pop(s.source_id, None)   # clean or freshly re-indexed → reset the clock
+            continue
+        first_stale = float(st.get("first_stale") or now)   # start counting on first sighting
+        state[s.source_id] = {"first_stale": first_stale, "last_eval": now}
+        if now - first_stale >= stale_after:
+            messages.append(_format_freshness(config.freshness_message, res,
+                                              int(config.freshness_stale_after_days)))
 
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    if dirty:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
     for m in messages:
         print(m, file=sys.stderr)
 

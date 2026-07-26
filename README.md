@@ -39,13 +39,6 @@ basic-kb search --source list      # list configured sources
 dry-runs the chunker without embedding. A pre-scan hashes every file first, so
 progress reads `[k/work]` (files actually being embedded), not `[i/all-files]`.
 
-**Corruption guard.** If a large fraction (default 90%) of already-indexed files
-change or disappear at once — usually a moved, corrupted, or re-pointed source —
-an incremental index confirms before re-embedding: it prompts on a terminal and
-aborts unattended, leaving the index untouched. `--yes` accepts, `--no-reindex-guard`
-skips it for one run, `--reindex-threshold F` tunes the trip point. Configure under
-`reindex_guard:` (`enabled`, `threshold`).
-
 ## Auto-reindex (`watch`)
 
 `basic-kb watch` is a foreground process that watches every enabled source and
@@ -59,10 +52,16 @@ basic-kb watch --debounce 300  # reindex 5 min after a file goes quiet (0 = imme
 
 Watch is configured **per source**: add a `watch:` block.
 
+## Freshness nudges
+
 `scan` diffs the files on disk against the index (using a manifest written at index
 time) and reports new/changed/deleted counts without embedding anything. After a
-search, basic-kb runs this check every few days and prints a one-line nudge if a
-source has drifted — tune or disable it under `freshness:` in the config.
+search, basic-kb nudges you about a source only once it has stayed stale for
+`stale_after_days` (default 3), then at most once per `remind_every_days` (default 1)
+until you re-index — re-indexing resets the clock. Tune or disable it under
+`freshness:` in the config.
+
+## Query writing
 
 Write queries as **statements**, not keywords — match the form of the text you're
 searching. Full guide lives as a skill in consuming workspaces, e.g.

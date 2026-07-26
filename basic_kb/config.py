@@ -104,7 +104,8 @@ class Config:
     cand_max: int = 200
     timing: bool = False               # print per-phase search timings
     freshness_enabled: bool = True     # post-search staleness reminder
-    freshness_every_days: int = 3      # how often to re-check a source
+    freshness_stale_after_days: float = 3  # nag only once a source has been stale this long
+    freshness_remind_every_days: float = 1  # then re-nag at most this often (once/day) until re-indexed
     freshness_message: str = DEFAULT_FRESHNESS_MESSAGE
     throttle_cores: Optional[float] = None   # fraction of CPU cores for indexing (None = all)
     throttle_priority: str = "normal"        # normal | low (OS process priority while indexing)
@@ -191,7 +192,10 @@ def load_config(config_path: Path) -> Config:
         cand_max=int(cand.get("max", 200)),
         timing=bool(data.get("timing", False)),
         freshness_enabled=bool(fresh.get("enabled", True)),
-        freshness_every_days=int(fresh.get("every_days", 3)),
+        # `every_days` is the old key (single re-check interval); kept as a fallback
+        # for the staleness-age threshold so existing configs don't break.
+        freshness_stale_after_days=float(fresh.get("stale_after_days", fresh.get("every_days", 3))),
+        freshness_remind_every_days=float(fresh.get("remind_every_days", 1)),
         freshness_message=str(fresh.get("message", DEFAULT_FRESHNESS_MESSAGE)),
         throttle_cores=float(thr_cores) if thr_cores is not None else None,
         throttle_priority=str(thr.get("priority", "normal")),
