@@ -5,6 +5,19 @@ way. Driven mostly by the LogSeq personal-KB use case, but each item should land
 **general** engine feature, not a LogSeq special-case (configs/source-types carry the
 specifics; the engine stays generic).
 
+## List
+- Fusion
+  - get inspired by qmd ->  Reciprocal Rank Fusion, k=60, top-rank bonus (+0.05/+0.02), position-aware blend (75/60/40% RRF-vs-rerank by rank band) 
+- Query Expansion
+  - inspired by qmd: fine-tuned local 1.7B model emits lex:/vec:/hyde: sub-queries.
+    - Custom fine-tuned tobil/qmd-query-expansion-1.7B (from Qwen3-1.7B), own training pipeline in finetune/
+- Keyword index and Hybrid search
+  - BM25 (like qmd)
+- Deamon
+  - Models stay resident, auto-unload after 5min idle (like qmd)
+
+See temple1\notes\research\qmd-codebase-analysis.md
+
 ## Chunk filter / transform hook
 
 A pluggable, per-source step that runs over each chunk (or its source text) before
