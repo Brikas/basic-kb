@@ -89,6 +89,11 @@ Copy [basic-kb.example.yaml](basic-kb.example.yaml) into your instance folder as
 the config file's own directory. Sources have a `type` (`markdown` or
 `transcript`) and a `chunker` (`recursive` or `breadcrumb`).
 
+Default search parameters live under a `search:` block — `n` (result count),
+`separate` (batch vs fused), `max_chars`, `content_type`, and `timing`. Each is
+overridden per-run by its CLI flag (`--n`, `--separate`/`--fused`, `--max-chars`,
+`--content-type`, `--timing`). Precedence: CLI flag > `search:` > built-in default.
+
 A source can list `exclude:` patterns (gitignore-lite) to skip files under its
 `path`: an unanchored name (`*.tmp`, `TODO*`) matches at any depth, a trailing
 slash (`drafts/`) matches a folder and its contents, a pattern with a slash
@@ -111,6 +116,12 @@ The engine reads `JINA_API_KEY` from the environment (reranking is skipped if
 absent). Provide it three ways, in precedence order: shell env > `--env-file PATH`
 > `env_file:` in the config. Secrets never go in the config — only a path to a
 dotenv file.
+
+`env_file:` is anchored to the config's directory. Set `env_file_search_up: N`
+(default 0) to also climb up to N parent directories, nearest first, for the
+closest dotenv when it isn't beside the config — it looks for the basename of
+`env_file` (or `.env`), goes straight up only, and never enters sibling dirs. Handy
+for a repo-root `.env` shared by several instances.
 
 ## Develop
 

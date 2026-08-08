@@ -86,6 +86,31 @@ def _resolve(base_dir: Path, raw: str) -> Path:
     return p if p.is_absolute() else base_dir / p
 
 
+def _resolve_env_file(base_dir: Path, raw: Optional[str], search_up: int) -> Optional[Path]:
+    """Locate the dotenv file to load.
+
+    `raw` is the explicit `env_file:` path (anchored to base_dir). `search_up`
+    (env_file_search_up) is how many parent directories to climb, nearest first, to
+    find the closest dotenv when it isn't beside the config — 0 keeps the plain
+    behavior (only the explicit path, no walk-up). While climbing it looks for the
+    basename of `raw` (default `.env`); the walk goes straight up and never steps
+    into sibling directories. Returns the path to load, or a declared-but-missing
+    path / None (the caller checks existence before loading).
+    """
+    explicit = _resolve(base_dir, raw) if raw else None
+    if explicit and explicit.exists():
+        return explicit
+    search_up = int(search_up)
+    if search_up > 0:
+        filename = Path(raw).name if raw else ".env"
+        # base_dir first (nearest), then straight up `search_up` parent levels.
+        for directory in (base_dir, *base_dir.parents[:search_up]):
+            candidate = directory / filename
+            if candidate.exists():
+                return candidate
+    return explicit
+
+
 @dataclass
 class Config:
     path: Path           # the config file itself
@@ -102,7 +127,13 @@ class Config:
     cand_multiplier: int = 3           # candidates to rerank = clamp(n*mult, min, max)
     cand_min: int = 50
     cand_max: int = 200
-    timing: bool = False               # print per-phase search timings
+    # Search defaults (`search:` block). None = "unset" → the CLI's own default is
+    # used; a CLI flag always overrides these.
+    search_n: Optional[int] = None            # default result count (else engine DEFAULT_N)
+    search_separate: bool = False             # default to batch (per-query blocks) vs fused
+    search_max_chars: Optional[int] = None    # truncate each result (else 0 = full)
+    search_content_type: Optional[str] = None # default frontmatter content_type filter
+    search_timing: bool = False               # print per-phase search timings to stderr
     freshness_enabled: bool = True     # post-search staleness reminder
     freshness_stale_after_days: float = 3  # nag only once a source has been stale this long
     freshness_remind_every_days: float = 1  # then re-nag at most this often (once/day) until re-indexed
@@ -117,7 +148,8 @@ class Config:
     log_backup_count: int = 5                # ... keeping 5 old files (~50 MB of history)
     reindex_guard: bool = True               # confirm before re-embedding a mass-changed source
     reindex_guard_threshold: float = 0.9     # churn fraction (changed+deleted / indexed) that triggers it
-    env_file: Optional[Path] = None
+    env_file: Optional[Path] = None          # resolved dotenv path to load (may walk up — see below)
+    env_file_search_up: int = 0              # parent levels to climb for the nearest dotenv (0 = no walk-up)
     # Watch/auto-reindex is configured PER SOURCE (a `watch:` block on each source),
     # not instance-wide — see basic_kb.watcher.resolve_settings.
 
@@ -147,7 +179,8 @@ def load_config(config_path: Path) -> Config:
     if not sources:
         raise ValueError(f"Config {config_path} defines no `sources:`.")
 
-    env_file = _resolve(base_dir, data["env_file"]) if data.get("env_file") else None
+    env_search_up = int(data.get("env_file_search_up", 0) or 0)
+    env_file = _resolve_env_file(base_dir, data.get("env_file"), env_search_up)
 
     # `reranker:` may be a string ("local") or a mapping ({type, model, candidates}).
     rr = data.get("reranker")
@@ -159,6 +192,13 @@ def load_config(config_path: Path) -> Config:
         cand = rr.get("candidates", {}) or {}
     else:
         reranker_type, reranker_model = "none", None
+
+    # `search:` block holds default search params. `timing` used to be a top-level
+    # key; still honored as a fallback so existing configs keep working.
+    srch = data.get("search", {}) or {}
+    search_n = srch.get("n")
+    search_max_chars = srch.get("max_chars")
+    search_content_type = srch.get("content_type")
 
     fresh = data.get("freshness", {}) or {}
 
@@ -190,7 +230,11 @@ def load_config(config_path: Path) -> Config:
         cand_multiplier=int(cand.get("multiplier", 3)),
         cand_min=int(cand.get("min", 50)),
         cand_max=int(cand.get("max", 200)),
-        timing=bool(data.get("timing", False)),
+        search_n=int(search_n) if search_n is not None else None,
+        search_separate=bool(srch.get("separate", srch.get("batch", False))),
+        search_max_chars=int(search_max_chars) if search_max_chars is not None else None,
+        search_content_type=str(search_content_type) if search_content_type is not None else None,
+        search_timing=bool(srch.get("timing", data.get("timing", False))),
         freshness_enabled=bool(fresh.get("enabled", True)),
         # `every_days` is the old key (single re-check interval); kept as a fallback
         # for the staleness-age threshold so existing configs don't break.
@@ -208,4 +252,5 @@ def load_config(config_path: Path) -> Config:
         reindex_guard=rg_enabled,
         reindex_guard_threshold=rg_threshold,
         env_file=env_file,
+        env_file_search_up=env_search_up,
     )

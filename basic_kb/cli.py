@@ -274,8 +274,24 @@ def _preview_chunks(sources: list[DataSourceBase], config: Config,
     print(f"Preview written to: {out_path}")
 
 
+def _search_defaults(args: argparse.Namespace, config: Config) -> tuple[int, bool, int, Optional[str], bool]:
+    """Resolve search params: CLI flag > `search:` config block > built-in default."""
+    n = args.n if args.n is not None else (config.search_n or DEFAULT_N)
+    # separate/fused: --fused forces off, --separate forces on, else the config default.
+    if getattr(args, "fused", False):
+        separate = False
+    elif getattr(args, "separate", False):
+        separate = True
+    else:
+        separate = config.search_separate
+    max_chars = args.max_chars if args.max_chars is not None else (config.search_max_chars or 0)
+    content_type = getattr(args, "content_type", None) or config.search_content_type
+    timing = getattr(args, "timing", False) or config.search_timing
+    return n, separate, max_chars, content_type, timing
+
+
 def cmd_search(args: argparse.Namespace, config: Config) -> None:
-    content_type = getattr(args, "content_type", None)
+    n, separate, max_chars, content_type, timing = _search_defaults(args, config)
     sources = _load_sources(config, getattr(args, "source", "all"), content_type)
     if not args.queries:
         print("Error: at least one query is required.", file=sys.stderr)
@@ -284,25 +300,25 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
     common = dict(
         sources=sources,
         queries=args.queries,
-        n=args.n,
+        n=n,
         content_type_filter=content_type,
         rerank_candidates=getattr(args, "rerank_candidates", None),
         cand_multiplier=config.cand_multiplier,
         cand_min=config.cand_min,
         cand_max=config.cand_max,
         strict_rerank=getattr(args, "rerank", False),
-        timing=getattr(args, "timing", False) or config.timing,
+        timing=timing,
     )
 
     # Batch mode: each query gets its OWN top-n block (no cross-query merging).
-    if getattr(args, "separate", False):
+    if separate:
         groups = kb.search_grouped(**common)
         for q, hits in groups:
             print("#" * 60)
             print(f"# Query: {q}  ({len(hits)} results)")
             print("#" * 60 + "\n")
             if hits:
-                _print_results(hits, args.max_chars)
+                _print_results(hits, max_chars)
             else:
                 print("No results.\n")
         _freshness_reminder(kb, sources, config)
@@ -315,7 +331,7 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         return
     if len(args.queries) > 1:
         print(f"[{len(args.queries)} queries merged into one ranked list]")
-    _print_results(hits, args.max_chars)
+    _print_results(hits, max_chars)
     _freshness_reminder(kb, sources, config)
 
 
@@ -548,19 +564,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("queries", nargs="*",
                           help="One or more queries. Default: merged into one ranked list "
                                "(re-framings of one need). With --separate: one result set each.")
-    p_search.add_argument("--separate", "--batch", dest="separate", action="store_true",
-                          help="Batch mode: return --n results per query in its own block, instead "
-                               "of merging all queries into one list. Use when the queries ask for "
-                               "different things. Example: search \"coffee gear\" \"tax deadlines\" --separate")
-    p_search.add_argument("--n", type=int, default=DEFAULT_N, metavar="N",
-                          help=f"Number of results (default: {DEFAULT_N}). In --separate mode, per query.")
+    mode = p_search.add_mutually_exclusive_group()
+    mode.add_argument("--separate", "--batch", dest="separate", action="store_true",
+                      help="Batch mode: return --n results per query in its own block, instead "
+                           "of merging all queries into one list. Use when the queries ask for "
+                           "different things. Example: search \"coffee gear\" \"tax deadlines\" --separate")
+    mode.add_argument("--fused", "--merge", dest="fused", action="store_true",
+                      help="Force fused mode (one merged ranked list), overriding a "
+                           "`search.separate: true` default in the config.")
+    p_search.add_argument("--n", type=int, default=None, metavar="N",
+                          help=f"Number of results (default: {DEFAULT_N}, or `search.n` in the config). "
+                               f"In --separate mode, per query.")
     p_search.add_argument("--content-type", default=None, metavar="TYPE",
-                          help="Filter by frontmatter content_type (markdown sources).")
-    p_search.add_argument("--max-chars", type=int, default=0, metavar="N",
-                          help="Truncate each result to N chars (default: 0 = full)")
+                          help="Filter by frontmatter content_type (markdown sources). "
+                               "Default: `search.content_type` in the config, else none.")
+    p_search.add_argument("--max-chars", type=int, default=None, metavar="N",
+                          help="Truncate each result to N chars (default: `search.max_chars`, else 0 = full)")
     p_search.add_argument("--timing", action="store_true",
                           help="Print per-phase timings (embed/retrieve/rerank/total) to stderr. "
-                               "Also enabled by `timing: true` in the config.")
+                               "Also enabled by `search.timing: true` in the config.")
 
     p_status = sub.add_parser("status", help="Show index stats")
     _shared_args(p_status)
