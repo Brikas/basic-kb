@@ -5,25 +5,20 @@ name: my-notes              # label only
 store_dir: .chroma          # ChromaDB store for this instance (gitignore it)
 embedding_model: bge-small-en-v1.5
 
-# Optional: dotenv file to pull secrets from (e.g. JINA_API_KEY for reranking).
-# The path is relative to this config. CLI --env-file and real env vars win over it.
-# env_file: ../../.env
+# env_file: ../../.env # Relative to config file. Optional: dotenv file to pull secrets from
 
 chunker:                    # defaults; override per-run with CLI flags
   max_chunk_size: 1200
   overlap: 100
   min_chunk_size: 50
 
-# Optional second-stage reranking of the top candidates (better precision).
-# type: local (on-device cross-encoder, no key, private) | jina (cloud, needs
-# JINA_API_KEY) | none. Omit the whole block for none.
 reranker:
-  type: local
-  model: jina-v2-multilingual   # optional; per-type default otherwise
-  candidates:                   # how many top hits to rerank: clamp(n*multiplier, min, max)
-    multiplier: 3               # fetch this × the requested result count (--n)
-    min: 50                     # ...but always at least this many
-    max: 200                    # ...and never more than this
+  type: local                   # local | jina (needs JINA_API_KEY) | none
+  model: jina-v2-multilingual   # optional; per-type default otherwise. Such as jina-reranker-v3 (API) or jina-v2-multilingual (local)
+  # candidates:                   # how many top hits to rerank: clamp(n*multiplier, min, max)
+  #   multiplier: 3               # fetch this × the requested result count (--n). DEF=3
+  #   min: 50                     # ...but always at least this many. DEF=50
+  #   max: 200                    # ...and never more than this. DEF=200
 
 timing: false                   # set true to print per-phase search timings (embed/retrieve/rerank/total)
 
@@ -35,7 +30,7 @@ log_level: INFO               # DEBUG | INFO | WARNING
 # After a search, basic-kb diffs the queried source(s) against the index and, if
 # they've stayed stale, prints a one-line nudge. A source must be stale for
 # `stale_after_days` before the FIRST nudge; then it re-nags at most once per
-# `remind_every_days` until you re-index (re-indexing resets the clock). Cheap
+# `remind_every_days` until you re-index (re-indexing resets the clock). 
 # (hashes files at most once per remind window, no embedding). enabled: false turns it off.
 # message placeholders: {source} {new} {updated} {deleted} {unchanged} {stale} {total} {days}
 freshness:
@@ -46,8 +41,8 @@ freshness:
 
 # Optional throttling so a big index doesn't peg the CPU and make the machine
 # unusable. Off by default (full speed). The three levers compose; all optional.
-# throttle:
-#   cores_fraction: 0.5 # fraction of CPU cores the embedder may use (portable across machines)
+throttle:
+  cores_fraction: 0.5 # fraction of CPU cores the embedder may use (portable across machines)
 #   priority: low       # low | normal — OS process priority while indexing
 #   pause_ms: 0         # sleep this many ms every `pause_every` embedded files (hard duty cap)
 #   pause_every: 50
@@ -69,6 +64,12 @@ sources:
     chunker: recursive      # recursive (no headings) | breadcrumb (heading-aware)
     label: My Notes
     description: Personal markdown notes.
+    exclude:                # gitignore-style: skip these files/folders under path
+      - "*.private.md"      #   name pattern at any depth
+      - "drafts/"
+      - "*.log"           #   trailing slash = a folder and everything under it
+      - "archive/old*"      #   contains a slash = anchored at the source root
+      # - "!keep.md"        #   leading '!' re-includes a path an earlier line excluded
     watch:                  # auto-reindex THIS source on edits (via `basic-kb watch`)
       enabled: true         # false to exclude this source from watching
       debounce_seconds: 30  # reindex a file this long after it goes quiet (0 = immediately)

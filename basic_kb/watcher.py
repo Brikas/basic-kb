@@ -129,7 +129,7 @@ class _Handler:
         # Moves report both src (gone) and dest (the new file); handle whichever is a note.
         for attr in ("src_path", "dest_path"):
             p = getattr(event, attr, None)
-            if p and _relevant(p):
+            if p and _relevant(p) and not self.source.is_excluded(Path(p)):
                 self.engine.notify(self.source, Path(p), self.debounce)
 
 

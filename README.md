@@ -84,10 +84,16 @@ Rule of thumb: same target, different words → **fused**; different targets →
 
 ## Config
 
-Copy [config.example.yaml](config.example.yaml) into your instance folder as
+Copy [basic-kb.example.yaml](basic-kb.example.yaml) into your instance folder as
 `basic-kb.yaml` (the name auto-discovery looks for). All relative paths anchor to
 the config file's own directory. Sources have a `type` (`markdown` or
 `transcript`) and a `chunker` (`recursive` or `breadcrumb`).
+
+A source can list `exclude:` patterns (gitignore-lite) to skip files under its
+`path`: an unanchored name (`*.tmp`, `TODO*`) matches at any depth, a trailing
+slash (`drafts/`) matches a folder and its contents, a pattern with a slash
+(`archive/old*`) is anchored at the source root, and a leading `!` re-includes.
+Excludes are honoured everywhere — index, scan, status, and live `watch`.
 
 ## Local overrides
 
