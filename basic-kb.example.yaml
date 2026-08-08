@@ -6,9 +6,9 @@ store_dir: .chroma          # ChromaDB store for this instance (gitignore it)
 embedding_model: bge-small-en-v1.5
 
 # env_file: ../../.env # Relative to config file. Optional: dotenv file to pull secrets from
-# env_file_search_up: 0 # 0 = only the path above. >0 = climb that many parent dirs (nearest first)
-#                       # to find the closest dotenv (basename of env_file, else .env). Straight up only,
-#                       # never into siblings. e.g. 5 = search this dir + up to 5 levels up.
+# env_file_search_up: 5 # DEF=5. Climb this many parent dirs (nearest first) to find the closest
+#                       # dotenv (basename of env_file, else .env). Straight up only, never into
+#                       # siblings. 0 = only the explicit path above, no walk-up.
 
 chunker:                    # defaults; override per-run with CLI flags
   max_chunk_size: 1200

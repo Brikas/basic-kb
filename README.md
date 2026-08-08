@@ -117,11 +117,11 @@ absent). Provide it three ways, in precedence order: shell env > `--env-file PAT
 > `env_file:` in the config. Secrets never go in the config — only a path to a
 dotenv file.
 
-`env_file:` is anchored to the config's directory. Set `env_file_search_up: N`
-(default 0) to also climb up to N parent directories, nearest first, for the
-closest dotenv when it isn't beside the config — it looks for the basename of
-`env_file` (or `.env`), goes straight up only, and never enters sibling dirs. Handy
-for a repo-root `.env` shared by several instances.
+`env_file:` is anchored to the config's directory. `env_file_search_up: N`
+(default 5) climbs up to N parent directories, nearest first, for the closest
+dotenv when it isn't beside the config — it looks for the basename of `env_file`
+(or `.env`), goes straight up only, and never enters sibling dirs. Handy for a
+repo-root `.env` shared by several instances. Set it to 0 to disable the walk-up.
 
 ## Develop
 

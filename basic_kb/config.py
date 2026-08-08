@@ -149,7 +149,7 @@ class Config:
     reindex_guard: bool = True               # confirm before re-embedding a mass-changed source
     reindex_guard_threshold: float = 0.9     # churn fraction (changed+deleted / indexed) that triggers it
     env_file: Optional[Path] = None          # resolved dotenv path to load (may walk up — see below)
-    env_file_search_up: int = 0              # parent levels to climb for the nearest dotenv (0 = no walk-up)
+    env_file_search_up: int = 5              # parent levels to climb for the nearest dotenv (0 = no walk-up)
     # Watch/auto-reindex is configured PER SOURCE (a `watch:` block on each source),
     # not instance-wide — see basic_kb.watcher.resolve_settings.
 
@@ -179,7 +179,10 @@ def load_config(config_path: Path) -> Config:
     if not sources:
         raise ValueError(f"Config {config_path} defines no `sources:`.")
 
-    env_search_up = int(data.get("env_file_search_up", 0) or 0)
+    # Default 5: find a shared dotenv up the tree without config. Explicit 0 disables
+    # the walk-up; an empty value falls back to the default rather than disabling.
+    raw_search_up = data.get("env_file_search_up", 5)
+    env_search_up = int(raw_search_up) if raw_search_up is not None else 5
     env_file = _resolve_env_file(base_dir, data.get("env_file"), env_search_up)
 
     # `reranker:` may be a string ("local") or a mapping ({type, model, candidates}).
