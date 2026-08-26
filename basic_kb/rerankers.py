@@ -8,11 +8,15 @@ Add a new backend: subclass RerankerBase, register it in RERANKER_TYPES.
 """
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from abc import ABC, abstractmethod
 from typing import Optional
 
 from .models import SearchResult
+
+logger = logging.getLogger("basic_kb")
 
 
 class RerankerBase(ABC):
@@ -31,29 +35,61 @@ class JinaReranker(RerankerBase):
     """
 
     API_URL = "https://api.jina.ai/v1/rerank"
+    TIMEOUT_S = 15
+    RETRIES = 2          # total attempts = RETRIES + 1
 
     def __init__(self, model: str = "jina-reranker-v3", api_key: Optional[str] = None) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("JINA_API_KEY", "")
         if not self.api_key:
             raise ValueError("Jina API key not found. Set JINA_API_KEY env var or pass api_key=.")
+        # One Session for the life of the reranker. Without it every search pays a
+        # fresh TCP connect and TLS handshake — on the hot path, per query.
+        self._session = None
+        self._session_lock = threading.Lock()
+
+    def _get_session(self):
+        if self._session is not None:
+            return self._session
+        with self._session_lock:
+            if self._session is None:
+                import requests as _requests
+                self._session = _requests.Session()
+            return self._session
 
     def rerank(self, query: str, results: list[SearchResult], top_n: int) -> list[SearchResult]:
         if not results:
             return results
         import requests as _requests
         docs = [r.doc for r in results]
-        try:
-            resp = _requests.post(
-                self.API_URL,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "query": query, "documents": docs, "top_n": top_n},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except _requests.HTTPError as e:
-            raise RuntimeError(f"Jina rerank API error {e.response.status_code}: {e.response.text}") from e
+        session = self._get_session()
+        payload = {"model": self.model, "query": query, "documents": docs, "top_n": top_n}
+
+        # Retry only transient transport failures. An HTTP error is a real answer
+        # (bad key, bad model, rate limit) — retrying it just delays the report.
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.RETRIES + 1):
+            try:
+                resp = session.post(
+                    self.API_URL,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                    timeout=self.TIMEOUT_S,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except _requests.HTTPError as e:
+                raise RuntimeError(
+                    f"Jina rerank API error {e.response.status_code}: {e.response.text}") from e
+            except (_requests.Timeout, _requests.ConnectionError) as e:
+                last_exc = e
+                logger.warning("jina rerank transport failure (attempt %d/%d): %s",
+                               attempt + 1, self.RETRIES + 1, e)
+        else:
+            raise RuntimeError(
+                f"Jina rerank unreachable after {self.RETRIES + 1} attempts: {last_exc}"
+            ) from last_exc
 
         reranked: list[SearchResult] = []
         for item in data.get("results", []):
@@ -82,11 +118,15 @@ class FastEmbedReranker(RerankerBase):
     def __init__(self, model: Optional[str] = None) -> None:
         self.model = self.ALIASES.get(model or "", model) or self.DEFAULT_MODEL
         self._encoder = None
+        self._load_lock = threading.Lock()   # same lazy-load race as the embedder
 
     def _load(self):
-        if self._encoder is None:
-            from fastembed.rerank.cross_encoder import TextCrossEncoder
-            self._encoder = TextCrossEncoder(self.model)
+        if self._encoder is not None:
+            return
+        with self._load_lock:
+            if self._encoder is None:
+                from fastembed.rerank.cross_encoder import TextCrossEncoder
+                self._encoder = TextCrossEncoder(self.model)
 
     def rerank(self, query: str, results: list[SearchResult], top_n: int) -> list[SearchResult]:
         if not results:

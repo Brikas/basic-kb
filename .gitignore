@@ -21,3 +21,4 @@ venv/
 # Machine-specific config overrides (paths differ per machine)
 **/basic-kb.local.yaml
 **/basic-kb.local.yml
+.DS_Store

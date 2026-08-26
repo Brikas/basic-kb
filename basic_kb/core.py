@@ -6,14 +6,16 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .chunkers import DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK, DEFAULT_OVERLAP
 from .embedders import EmbedderBase
-from .models import SearchResult
+from .errors import IndexNotFound, ManifestCorrupt, MassChangeRefused, QueryFailed
+from .models import FileError, IndexResult, SearchResult, SourceStatus
 from .rerankers import RerankerBase
 from .sources import DataSourceBase
 
@@ -74,14 +76,20 @@ def lower_process_priority() -> None:
         else:
             os.nice(10)  # raise niceness (lower priority)
     except Exception as e:
-        print(f"Warning: could not lower process priority ({e}).", file=sys.stderr)
+        logger.warning("could not lower process priority: %s", e)
 
 
 def cores_to_threads(fraction: Optional[float]) -> Optional[int]:
     """Map a fraction of CPU cores (e.g. 0.5) to a thread count. None → None (use all)."""
     if not fraction:
         return None
-    cpu = os.cpu_count() or 1
+    # os.cpu_count() reports host cores and ignores cgroup limits, so in a container
+    # it sizes the thread pool against hardware the process cannot use. Prefer the
+    # affinity mask where the platform has one.
+    try:
+        cpu = len(os.sched_getaffinity(0))
+    except AttributeError:               # macOS, Windows — no affinity mask
+        cpu = os.cpu_count() or 1
     return max(1, round(fraction * cpu))
 
 
@@ -120,6 +128,13 @@ class KnowledgeBase:
         self.embedder = embedder
         self.chroma_dir = chroma_dir
         self.reranker = reranker
+        # Serialises writes within this process. The manifest is a read-modify-write
+        # over a plain file — two concurrent index runs would lose one another's
+        # entries, and SQLite/WAL does not cover it because it is not in the store.
+        # Reentrant: index() holds it while calling helpers that take it too.
+        # NOTE: process-local. Two processes on one store still need external
+        # coordination — see README.
+        self._write_lock = threading.RLock()
 
     def _client(self):
         import chromadb
@@ -138,14 +153,23 @@ class KnowledgeBase:
         try:
             return json.loads(p.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
-            print(f"Warning: manifest at {p} is corrupt ({e}); treating as empty.", file=sys.stderr)
-            return {}
+            # Absorbing this used to silently re-embed the whole source and leave
+            # scan/status permanently wrong. Fail loudly; deleting the file is a
+            # deliberate act, not something the library should do on your behalf.
+            raise ManifestCorrupt(
+                f"Manifest at {p} is not valid JSON ({e}). The index itself is intact — "
+                f"delete the file to rebuild it from the next full index run."
+            ) from e
 
     def _save_manifest(self, manifest: dict) -> None:
+        """Write the manifest atomically — temp file in the same directory, then
+        os.replace. A plain write_text truncates first, so a crash mid-write leaves
+        a zero-byte file where a valid one used to be."""
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
-        self._manifest_path().write_text(
-            json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
-        )
+        target = self._manifest_path()
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, target)          # atomic within one filesystem
 
     @staticmethod
     def _rel_path(source: DataSourceBase, f: Path) -> str:
@@ -189,7 +213,7 @@ class KnowledgeBase:
         except ValueError as exc:
             if "embedding function conflict" not in str(exc).lower():
                 raise
-            print(f"Note: embedding function changed for '{collection_name}'. Clearing old index.")
+            logger.warning("embedding function changed for %r — clearing old index", collection_name)
             client.delete_collection(collection_name)
             return client.create_collection(
                 name=collection_name,
@@ -197,40 +221,43 @@ class KnowledgeBase:
                 metadata={"hnsw:space": "cosine"},
             )
 
-    def _confirm_mass_change(
+    def _guard_allows(
         self, source: DataSourceBase, changed: int, deleted: int,
         base: int, frac: float, threshold: float, assume_yes: bool,
+        on_confirm: Optional[Callable[[MassChangeRefused], bool]],
     ) -> bool:
-        """Guard prompt before re-embedding a source whose files mostly changed at once.
+        """Decide whether to proceed when a source's files mostly changed at once.
 
-        Such a jump usually means the source was corrupted, moved, or its path
-        re-pointed — not a normal edit. Returns True to proceed. `assume_yes` accepts
-        automatically; otherwise ask on a TTY, and refuse (return False) when running
-        unattended so a bad run can't silently trash a good index.
+        Such a jump usually means the source was corrupted, moved, or re-pointed —
+        not a normal edit. The library never prompts: it accepts when `assume_yes`,
+        otherwise asks `on_confirm` if one was supplied, otherwise refuses. The CLI
+        passes an `on_confirm` that prompts on a TTY; a server passes none and gets
+        a MassChangeRefused it can turn into a 409.
         """
-        pct, tpct = round(frac * 100), round(threshold * 100)
-        print(
-            f"\n⚠  Mass change on '{source.source_id}': {changed} changed + {deleted} deleted "
-            f"of {base} indexed files = {pct}% (guard threshold {tpct}%).",
-            file=sys.stderr,
+        detail = MassChangeRefused(
+            source_id=source.source_id, changed=changed, deleted=deleted,
+            base=base, fraction=frac, threshold=threshold,
         )
-        print("   This often means the source was corrupted, moved, or re-pointed — not a normal edit.",
-              file=sys.stderr)
-        print(f"   Directory: {source.directory}", file=sys.stderr)
         if assume_yes:
-            print("   Proceeding anyway (--yes / auto-accept).", file=sys.stderr)
             logger.warning("guard auto-accepted: source=%s changed=%d deleted=%d frac=%.2f",
                            source.source_id, changed, deleted, frac)
             return True
-        if not sys.stdin.isatty():
-            print("   Refusing to re-embed unattended. Re-run with --yes to accept, --force to "
-                  "rebuild, or --no-reindex-guard to skip this check.", file=sys.stderr)
-            return False
-        try:
-            answer = input("   Re-index anyway? [y/N] ").strip().lower()
-        except EOFError:
-            answer = ""
-        return answer in ("y", "yes")
+        if on_confirm is not None:
+            return bool(on_confirm(detail))
+        logger.warning("guard refused: source=%s changed=%d deleted=%d frac=%.2f",
+                       source.source_id, changed, deleted, frac)
+        return False
+
+    @staticmethod
+    def _emit(on_progress: Optional[Callable[[str], None]], msg: str) -> None:
+        """Progress goes to the caller if it asked for it, and to the log always.
+
+        The library does not print. The CLI passes `on_progress=print`; a server
+        passes nothing and reads the returned IndexResult instead.
+        """
+        logger.info("%s", msg)
+        if on_progress is not None:
+            on_progress(msg)
 
     def index(
         self,
@@ -245,149 +272,189 @@ class KnowledgeBase:
         guard: bool = True,
         guard_threshold: float = 0.9,
         assume_yes: bool = False,
-    ) -> None:
-        """Index all files from a DataSource into its own ChromaDB collection.
+        on_progress: Optional[Callable[[str], None]] = None,
+        on_confirm: Optional[Callable[[MassChangeRefused], bool]] = None,
+    ) -> IndexResult:
+        """Index a DataSource into its own ChromaDB collection.
 
-        `limit` caps the number of files (first N, stable order) — handy for test
-        runs before committing to a long full embed. `pause_ms`/`pause_every` throttle
-        CPU duty by sleeping between batches of embedded files. When `guard` is on and
-        a fraction >= `guard_threshold` of already-indexed files changed/vanished at
-        once (likely corruption), confirm before proceeding unless `assume_yes`.
+        Returns an IndexResult describing what happened — including `aborted=True`
+        when the mass-change guard stopped the run, and `errors` listing any files
+        that could not be parsed. Nothing is printed; pass `on_progress` for a live
+        feed and `on_confirm` to be asked about a mass change.
+
+        `limit` caps the number of files (first N, stable order). `pause_ms` and
+        `pause_every` throttle CPU duty between embedded files.
+
+        The manifest is written even if the run raises partway, recording only the
+        files that actually completed — so an interrupted run resumes rather than
+        starting over.
         """
+        with self._write_lock:
+            return self._index_locked(
+                source, chunk_size, overlap, min_chunk, force, limit, pause_ms,
+                pause_every, guard, guard_threshold, assume_yes, on_progress, on_confirm,
+            )
+
+    def _index_locked(
+        self, source, chunk_size, overlap, min_chunk, force, limit, pause_ms,
+        pause_every, guard, guard_threshold, assume_yes, on_progress, on_confirm,
+    ) -> IndexResult:
         files = source.get_files()
+        result = IndexResult(
+            source_id=source.source_id, label=source.label,
+            files_on_disk=len(files), limited_to=limit,
+        )
         if not files:
-            print(f"No files found for source '{source.label}'. Nothing to index.", file=sys.stderr)
-            return
+            result.abort_reason = f"No files found for source {source.label!r}."
+            logger.warning("index: no files for source=%s", source.source_id)
+            self._emit(on_progress, result.abort_reason)
+            return result
+
         if limit is not None:
             files = files[:limit]
-            print(f"[limit] indexing only the first {len(files)} file(s) of this source.")
+            self._emit(on_progress, f"[limit] indexing only the first {len(files)} file(s).")
 
         client = self._client()
         if force:
             try:
                 client.delete_collection(source.source_id)
-                print(f"Cleared existing index for '{source.source_id}'.")
-            except Exception:
-                pass
+                self._emit(on_progress, f"Cleared existing index for {source.source_id!r}.")
+            except Exception as e:
+                # Nothing to clear is the normal case on a first run; anything else
+                # is worth a log line rather than a silent pass.
+                logger.debug("force delete_collection(%s): %s", source.source_id, e)
 
         col = self._get_collection(client, source.source_id)
 
         # Snapshot what's already indexed, keyed by each file's relative path.
-        # rel_path is the stable per-file identity used to prune/replace chunks.
         snap = col.get(include=["metadatas"])
-        ids_by_file: dict[str, list[str]] = {}       # rel_path -> its chunk ids
+        ids_by_file: dict[str, list[str]] = {}
         for cid, meta in zip(snap["ids"], snap["metadatas"]):
-            # Fall back to legacy 'file' key for chunks indexed before rel_path existed.
             rp = meta.get("rel_path") or meta.get("file") or cid.split("::")[0]
             ids_by_file.setdefault(rp, []).append(cid)
 
-        # Pre-scan: hash every file once and decide the real work up front. The manifest
-        # (which records ALL files incl. empty) is the skip oracle — a file whose hash
-        # still matches is untouched since last index, so it never re-parses. This makes
-        # progress honest ([k/work] not [i/all-files]) and mass-change corruption catchable.
+        # Pre-scan: hash every file once and decide the real work up front.
         prev_manifest: dict = {} if force else self._load_manifest().get(source.source_id, {})
         entries = [(f, self._rel_path(source, f), _file_hash(f)) for f in files]
-        seen: dict[str, str] = {rp: h for _, rp, h in entries}  # manifest: every file, incl. empty
+        seen: dict[str, str] = {rp: h for _, rp, h in entries}
         to_process = [(f, rp, h) for f, rp, h in entries if prev_manifest.get(rp) != h]
         deleted_files = [rp for rp in prev_manifest if rp not in seen] if limit is None else []
         work_total = len(to_process)
-        unchanged = len(entries) - work_total
+        result.unchanged = len(entries) - work_total
 
         # Corruption guard: a large fraction of previously-indexed files changing or
-        # vanishing at once is more likely a broken/moved source than a real bulk edit.
+        # vanishing at once is more likely a broken source than a real bulk edit.
         if guard and not force and prev_manifest:
             changed_existing = sum(1 for _, rp, _ in to_process if rp in prev_manifest)
             churn = changed_existing + len(deleted_files)
             base = len(prev_manifest)
             frac = churn / base if base else 0.0
             if churn >= _GUARD_MIN_FILES and frac >= guard_threshold:
-                if not self._confirm_mass_change(
-                    source, changed_existing, len(deleted_files), base, frac, guard_threshold, assume_yes
-                ):
-                    print(f"Aborted index for '{source.source_id}' — index left unchanged.", file=sys.stderr)
-                    logger.warning("index aborted by guard: source=%s churn=%d/%d frac=%.2f",
-                                   source.source_id, churn, base, frac)
-                    return
+                if not self._guard_allows(source, changed_existing, len(deleted_files),
+                                          base, frac, guard_threshold, assume_yes, on_confirm):
+                    result.aborted = True
+                    result.abort_reason = str(MassChangeRefused(
+                        source.source_id, changed_existing, len(deleted_files),
+                        base, frac, guard_threshold))
+                    self._emit(on_progress, result.abort_reason)
+                    return result
 
         chunker = source.make_chunker(chunk_size, overlap, min_chunk)
         prune_note = f", {len(deleted_files)} to prune" if deleted_files else ""
-        print(
+        self._emit(on_progress, (
             f"Indexing {source.label}: {len(entries)} files on disk, "
-            f"{work_total} to (re)embed, {unchanged} unchanged{prune_note}  "
+            f"{work_total} to (re)embed, {result.unchanged} unchanged{prune_note}  "
             f"(model={self.embedder.model_id}, chunker={chunker.name}, "
             f"chunk={chunk_size}, overlap={overlap})"
-        )
+        ))
         if work_total == 0 and not deleted_files:
-            print("  Already up to date — nothing to embed.")
-        logger.info("index start: source=%s files=%d work=%d unchanged=%d deleted=%d model=%s force=%s limit=%s",
-                    source.source_id, len(entries), work_total, unchanged,
-                    len(deleted_files), self.embedder.model_id, force, limit)
+            self._emit(on_progress, "  Already up to date — nothing to embed.")
 
-        added = updated = empty = pruned = 0
-        # Work total is known from the pre-scan; "?" only as an honest fallback if it
-        # ever couldn't be determined (it always can here — kept for defensiveness).
-        total_str = str(work_total) if work_total is not None else "?"
-        since_pause = 0             # embedded files since the last throttle pause
+        # Manifest entry built as work completes, so an interrupted run records only
+        # what really finished. A full run starts empty (deleted files drop out); a
+        # --limit run starts from the previous entry, since it only sees a subset.
+        done: dict[str, str] = {} if limit is None else dict(prev_manifest)
+        for _, rp, h in entries:
+            if prev_manifest.get(rp) == h:
+                done[rp] = h                      # unchanged: already correct
 
-        for processed, (f, rel_path, file_hash) in enumerate(to_process, 1):
-            was_indexed = rel_path in ids_by_file
-            doc = source.parse_file(f)
-            chunks = chunker.chunk(doc) if doc is not None else []
-            if not chunks:
-                empty += 1
-                if was_indexed:  # used to have content, now none → drop stale chunks
+        since_pause = 0
+        try:
+            for processed, (f, rel_path, file_hash) in enumerate(to_process, 1):
+                was_indexed = rel_path in ids_by_file
+                try:
+                    doc = source.parse_file(f)
+                    chunks = chunker.chunk(doc) if doc is not None else []
+                except Exception as e:
+                    # One unreadable file must not abandon a run that has already
+                    # embedded hundreds. Record it and carry on; the manifest simply
+                    # does not learn this file, so the next run retries it.
+                    logger.exception("index: failed to parse %s/%s", source.source_id, rel_path)
+                    result.errors.append(FileError(rel_path=rel_path, error=f"{type(e).__name__}: {e}"))
+                    self._emit(on_progress, f"  [{processed}/{work_total}] SKIPPED {rel_path} — {e}")
+                    continue
+
+                if not chunks:
+                    result.empty += 1
+                    if was_indexed:
+                        col.delete(ids=ids_by_file[rel_path])
+                    done[rel_path] = file_hash
+                    continue
+
+                verb = "re-embedding" if was_indexed else "embedding"
+                self._emit(on_progress,
+                           f"  [{processed}/{work_total}] {verb} {rel_path}  ({len(chunks)} chunks)")
+
+                if was_indexed:
                     col.delete(ids=ids_by_file[rel_path])
-                continue
 
-            # Print right before embedding (the slow step) so a stall points at this file.
-            verb = "re-embedding" if was_indexed else "embedding"
-            print(f"  [{processed}/{total_str}] {verb} {rel_path}  ({len(chunks)} chunks)", flush=True)
+                new_ids, new_docs, new_metas = [], [], []
+                for chunk in chunks:
+                    new_ids.append(f"{rel_path}::{chunk.id_suffix}")
+                    new_docs.append(chunk.text)
+                    new_metas.append({**chunk.metadata, "rel_path": rel_path,
+                                      "content_hash": file_hash})
+                col.add(documents=new_docs, metadatas=new_metas, ids=new_ids)
+                done[rel_path] = file_hash
+                result.updated += 1 if was_indexed else 0
+                result.added += 0 if was_indexed else 1
 
-            if was_indexed:  # changed file → remove old chunks before re-adding
-                col.delete(ids=ids_by_file[rel_path])
+                if pause_ms > 0 and pause_every > 0:
+                    since_pause += 1
+                    if since_pause >= pause_every:
+                        time.sleep(pause_ms / 1000.0)
+                        since_pause = 0
 
-            new_ids, new_docs, new_metas = [], [], []
-            for chunk in chunks:
-                new_ids.append(f"{rel_path}::{chunk.id_suffix}")
-                new_docs.append(chunk.text)
-                new_metas.append({**chunk.metadata, "rel_path": rel_path, "content_hash": file_hash})
-            col.add(documents=new_docs, metadatas=new_metas, ids=new_ids)
-            updated += 1 if was_indexed else 0
-            added += 0 if was_indexed else 1
+            # Prune files that no longer exist on disk. Full runs only — a --limit run
+            # sees a subset, so absent files there are not actually deleted.
+            if limit is None and deleted_files:
+                stale_ids = [cid for rp in deleted_files if rp in ids_by_file
+                             for cid in ids_by_file[rp]]
+                if stale_ids:
+                    col.delete(ids=stale_ids)
+                result.pruned = len(deleted_files)
+        finally:
+            # Always persist what completed, including on an exception. Without this a
+            # crash at file 400 of 450 throws away 400 files of work.
+            manifest = self._load_manifest()
+            manifest[source.source_id] = done
+            self._save_manifest(manifest)
 
-            # Throttle: brief sleep between batches of embedded files to free the CPU.
-            if pause_ms > 0 and pause_every > 0:
-                since_pause += 1
-                if since_pause >= pause_every:
-                    time.sleep(pause_ms / 1000.0)
-                    since_pause = 0
-
-        # Prune files that no longer exist on disk. Only on a full run — a --limit
-        # run sees a subset, so absent files there are not actually deleted.
-        if limit is None and deleted_files:
-            stale_ids = [cid for rp in deleted_files if rp in ids_by_file for cid in ids_by_file[rp]]
-            if stale_ids:
-                col.delete(ids=stale_ids)
-            pruned = len(deleted_files)
-
-        # Persist the manifest. Full run replaces this source's entry (drops deleted
-        # files); a --limit run merges, since it only saw a subset.
-        manifest = self._load_manifest()
-        if limit is None:
-            manifest[source.source_id] = seen
-        else:
-            manifest[source.source_id] = {**manifest.get(source.source_id, {}), **seen}
-        self._save_manifest(manifest)
-
-        total = col.count()
-        print(
+        result.total_chunks = col.count()
+        self._emit(on_progress, (
             f"\nDone [{source.source_id}].\n"
-            f"  files:  new={added} updated={updated} unchanged={unchanged} "
-            f"empty={empty} pruned={pruned}  ({added + updated} embedded this run)\n"
-            f"  chunks: {total} total in index  (files are split into chunks; one file = many chunks)"
-        )
-        logger.info("index done: source=%s new=%d updated=%d unchanged=%d empty=%d pruned=%d chunks=%d",
-                    source.source_id, added, updated, unchanged, empty, pruned, total)
+            f"  files:  new={result.added} updated={result.updated} "
+            f"unchanged={result.unchanged} empty={result.empty} pruned={result.pruned}"
+            f"  ({result.embedded} embedded this run)\n"
+            f"  chunks: {result.total_chunks} total in index"
+        ))
+        if result.errors:
+            self._emit(on_progress, f"  {len(result.errors)} file(s) failed — see result.errors")
+        logger.info("index done: source=%s new=%d updated=%d unchanged=%d empty=%d "
+                    "pruned=%d chunks=%d errors=%d",
+                    source.source_id, result.added, result.updated, result.unchanged,
+                    result.empty, result.pruned, result.total_chunks, len(result.errors))
+        return result
 
     def stale_paths(self, source: DataSourceBase) -> list[Path]:
         """Files that differ from the manifest (new/changed on disk + deleted).
@@ -415,6 +482,10 @@ class KnowledgeBase:
         deleted files, and updates just those manifest entries. Returns a counts dict.
         Callers must serialize this (one writer) — ChromaDB is not multi-writer safe.
         """
+        with self._write_lock:
+            return self._reindex_paths_locked(source, paths, chunk_size, overlap, min_chunk)
+
+    def _reindex_paths_locked(self, source, paths, chunk_size, overlap, min_chunk) -> dict:
         rels: dict[str, Path] = {}
         for p in paths:
             p = Path(p)
@@ -491,8 +562,9 @@ class KnowledgeBase:
         use search_grouped(). With timing=True, prints per-phase durations.
         """
         if not self.chroma_dir.exists():
-            print("No index found. Run: python -m basic_kb index")
-            return []
+            raise IndexNotFound(
+                f"No index at {self.chroma_dir}. Run: python -m basic_kb index"
+            )
         client = self._client()
         return self._run_query_group(
             client, sources, queries, n, content_type_filter, rerank_candidates,
@@ -518,8 +590,9 @@ class KnowledgeBase:
         for *different* things in one call and you want a full result set for each.
         """
         if not self.chroma_dir.exists():
-            print("No index found. Run: python -m basic_kb index")
-            return []
+            raise IndexNotFound(
+                f"No index at {self.chroma_dir}. Run: python -m basic_kb index"
+            )
         client = self._client()
         out: list[tuple[str, list[SearchResult]]] = []
         for q in queries:
@@ -543,6 +616,8 @@ class KnowledgeBase:
         t0 = time.perf_counter()
         t_embed = t_retrieve = t_rerank = 0.0
         best: dict[str, SearchResult] = {}
+        missing: list[str] = []      # sources with no collection yet
+        resolved = 0                 # sources that actually got queried
 
         if self.reranker and rerank_candidates is None:
             # How many top hits to rerank: clamp(n × multiplier, min, max).
@@ -557,13 +632,13 @@ class KnowledgeBase:
                     name=source.source_id,
                     embedding_function=self.embedder.as_chroma_ef(),
                 )
-            except Exception:
-                print(
-                    f"  Note: no index for '{source.source_id}' — "
-                    f"run: python -m basic_kb index --source {source.source_id}",
-                    file=sys.stderr,
-                )
+            except Exception as e:
+                # One un-indexed source among several is a normal, recoverable state.
+                # Every source missing is not — that is caught after the loop.
+                logger.warning("search: no index for source=%s (%s)", source.source_id, e)
+                missing.append(source.source_id)
                 continue
+            resolved += 1
 
             where: Optional[dict] = None
             if content_type_filter:
@@ -585,8 +660,11 @@ class KnowledgeBase:
                     results = col.query(**kwargs)
                     t_retrieve += time.perf_counter() - _tr
                 except Exception as e:
-                    print(f"  Query error on '{source.source_id}': {e}", file=sys.stderr)
-                    continue
+                    # Swallowing this returned an empty list indistinguishable from
+                    # "nothing matched" — a broken store looked like a healthy one.
+                    raise QueryFailed(
+                        f"Query failed on source {source.source_id!r}: {e}"
+                    ) from e
 
                 for doc_id, doc, meta, dist in zip(
                     results["ids"][0],
@@ -599,6 +677,13 @@ class KnowledgeBase:
                     if full_id not in best or score > best[full_id].score:
                         best[full_id] = SearchResult(doc=doc, metadata=meta, score=score)
 
+        if resolved == 0:
+            raise IndexNotFound(
+                "None of the requested sources are indexed "
+                f"({', '.join(missing) or 'no sources given'}). "
+                "An empty result would be indistinguishable from no matches."
+            )
+
         hits = sorted(best.values(), key=lambda r: r.score, reverse=True)
 
         _trr = time.perf_counter()
@@ -609,7 +694,7 @@ class KnowledgeBase:
             except Exception as e:
                 if strict_rerank:
                     raise
-                print(f"Warning: reranking failed, falling back to cosine scores ({e})", file=sys.stderr)
+                logger.warning("reranking failed, falling back to cosine scores: %s", e)
                 hits = hits[:n]
         else:
             hits = hits[:n]
@@ -617,11 +702,11 @@ class KnowledgeBase:
 
         if timing:
             label = f" [{timing_label}]" if timing_label else ""
-            print(
-                f"timing (ms){label}: embed={t_embed*1000:.0f}  retrieve={t_retrieve*1000:.0f}  "
-                f"rerank={t_rerank*1000:.0f}  total={(time.perf_counter()-t0)*1000:.0f}"
-                "   [cold process — embed & rerank include one-time model load]",
-                file=sys.stderr,
+            logger.info(
+                "timing (ms)%s: embed=%.0f retrieve=%.0f rerank=%.0f total=%.0f "
+                "[cold process — embed & rerank include one-time model load]",
+                label, t_embed * 1000, t_retrieve * 1000, t_rerank * 1000,
+                (time.perf_counter() - t0) * 1000,
             )
 
         logger.info(
@@ -633,86 +718,70 @@ class KnowledgeBase:
         )
         return hits
 
-    def status(self, sources: list[DataSourceBase]) -> None:
-        """Print index stats for one or more sources."""
+    def status(self, sources: list[DataSourceBase]) -> list[SourceStatus]:
+        """Index stats per source, as data. Nothing is printed — the CLI formats it.
+
+        Raises IndexNotFound if the store does not exist at all; a source that is
+        merely un-indexed comes back with `indexed=False` rather than an exception,
+        because that is a normal state in a multi-source instance.
+        """
         if not self.chroma_dir.exists():
-            print("No index found. Run: python -m basic_kb index")
-            return
+            raise IndexNotFound(
+                f"No index at {self.chroma_dir}. Run: python -m basic_kb index"
+            )
 
         client = self._client()
+        out: list[SourceStatus] = []
 
         for source in sources:
-            print(f"\n{'='*55}")
-            print(f"Source  : {source.label}  ({source.source_id})")
-            print(f"ChromaDB: {self.chroma_dir}")
-            print(f"Model   : {self.embedder.model_id}")
-
-            # Warn loudly if the source path itself is gone (moved dir, unmounted drive,
-            # broken symlink). The index can still look healthy while pointing at nothing.
-            if not source.directory.exists():
-                print(f"  ⚠  SOURCE PATH MISSING: {source.directory}")
-                print("     directory does not exist — moved, unmounted, or a broken symlink.")
-                print("     Any indexed chunks are now orphaned; fix the path or re-point the source.")
+            st = SourceStatus(
+                source_id=source.source_id,
+                label=source.label,
+                directory=str(source.directory),
+                store_dir=str(self.chroma_dir),
+                model_id=self.embedder.model_id,
+                directory_exists=source.directory.exists(),
+                indexed=False,
+            )
 
             try:
                 col = client.get_collection(
                     name=source.source_id,
                     embedding_function=self.embedder.as_chroma_ef(),
                 )
-            except Exception:
-                print(f"  No index found. Run: python -m basic_kb index --source {source.source_id}")
+            except Exception as e:
+                logger.info("status: no collection for source=%s (%s)", source.source_id, e)
+                out.append(st)
                 continue
 
-            total_chunks = col.count()
-            if total_chunks == 0:
-                print(f"  Index empty. Run: python -m basic_kb index --source {source.source_id}")
+            st.indexed = True
+            st.chunks = col.count()
+
+            res = self.scan(source)
+            st.files_on_disk = res.files_on_disk
+            st.tracked = res.tracked
+            st.new, st.updated, st.deleted = res.new, res.updated, res.deleted
+
+            if st.chunks == 0:
+                out.append(st)
                 continue
 
             all_metas: list[dict] = col.get(include=["metadatas"])["metadatas"]
-            docs_with_chunks = len({m["file"] for m in all_metas})
-            # Use the manifest (via scan) for staleness — it tracks every processed
-            # file incl. those too short to chunk, so empties aren't false "unindexed".
-            res = self.scan(source)
-
-            print(f"Chunks  : {total_chunks:,}")
-            print(f"Docs    : {docs_with_chunks:,} produced chunks / {res.files_on_disk} files on disk")
-            if res.files_on_disk == 0:
-                # Distinguish "path gone" (warned above) from "path exists but empty".
-                if not source.directory.exists():
-                    print(f"  ⚠  0 files — source path is missing (see warning above); {docs_with_chunks} indexed docs orphaned.")
-                else:
-                    print(f"  ⚠  0 files at {source.directory}")
-                    print(f"     directory exists but holds no matching files — the {docs_with_chunks} indexed docs are now stale.")
-            elif not res.tracked:
-                print(f"           no manifest yet — run `python -m basic_kb index --source {source.source_id}` "
-                      f"once so empty files are tracked (until then {res.new} files show as new).")
-            elif res.stale:
-                parts = [f"{res.new} new", f"{res.updated} changed", f"{res.deleted} deleted"]
-                print(f"           {', '.join(p for p, n in zip(parts, (res.new, res.updated, res.deleted)) if n)}"
-                      f" since last index — run: python -m basic_kb index --source {source.source_id}")
-            else:
-                print("           up to date  (files too short to chunk are tracked, not counted as unindexed)")
+            st.docs_with_chunks = len({m.get("rel_path") or m.get("file") for m in all_metas})
 
             dates = sorted(
                 m.get("date", "unknown") for m in all_metas
                 if m.get("date", "unknown") != "unknown"
             )
             if dates:
-                print(f"Dates   : {dates[0]} → {dates[-1]}")
+                st.date_min, st.date_max = dates[0], dates[-1]
 
-            # Content-type breakdown — shown for any source whose chunks carry a
-            # real content_type (e.g. markdown sources with frontmatter).
-            has_content_type = any(
-                str(m.get("content_type", "unknown")) != "unknown" for m in all_metas
-            )
-            if has_content_type:
-                ct_counts: dict[str, int] = {}
-                for m in all_metas:
-                    ct = str(m.get("content_type", "unknown"))
-                    ct_counts[ct] = ct_counts.get(ct, 0) + 1
-                for ct, count in sorted(ct_counts.items()):
-                    print(f"  {ct}: {count:,} chunks")
+            for m in all_metas:
+                ct = str(m.get("content_type", "unknown"))
+                if ct != "unknown":
+                    st.content_types[ct] = st.content_types.get(ct, 0) + 1
 
-            oversized_count = sum(1 for m in all_metas if m.get("oversized"))
-            if oversized_count:
-                print(f"  ⚠  oversized chunks: {oversized_count}")
+            st.oversized_chunks = sum(1 for m in all_metas if m.get("oversized"))
+            out.append(st)
+
+        return out

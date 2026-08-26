@@ -80,6 +80,113 @@ def _build_kb(args: argparse.Namespace, config: Config, threads: Optional[int] =
     return KnowledgeBase(embedder=embedder, chroma_dir=config.store_dir, reranker=reranker)
 
 
+# --- Rendering ---------------------------------------------------------------
+# The library returns dataclasses. JSON and human text are two renderers over the
+# same object — neither is derived from the other, so no type information is lost
+# round-tripping through a string.
+
+def _json_default(o):
+    if isinstance(o, Path):
+        return str(o)
+    raise TypeError(f"not JSON serialisable: {type(o).__name__}")
+
+
+def emit_json(payload) -> None:
+    """Print one JSON document to stdout.
+
+    Callers must suppress progress output in this mode — a stray progress line on
+    stdout makes the document unparseable.
+    """
+    from dataclasses import asdict, is_dataclass
+
+    def conv(x):
+        if is_dataclass(x) and not isinstance(x, type):
+            d = asdict(x)
+            # dataclass properties are not fields; add the derived ones callers want.
+            for prop in ("stale", "embedded"):
+                if hasattr(x, prop):
+                    d[prop] = getattr(x, prop)
+            return d
+        if isinstance(x, list):
+            return [conv(i) for i in x]
+        if isinstance(x, dict):
+            return {k: conv(v) for k, v in x.items()}
+        return x
+
+    print(json.dumps(conv(payload), indent=2, ensure_ascii=False, default=_json_default))
+
+
+def _confirm_mass_change_on_tty(detail) -> bool:
+    """The interactive half of the mass-change guard.
+
+    This lives in the CLI on purpose: a library that calls input() hangs or crashes
+    in any process without a usable stdin. The engine decides nothing here — it
+    hands us the numbers and we answer.
+    """
+    print(f"\n⚠  {detail}", file=sys.stderr)
+    print("   This often means the source was corrupted, moved, or re-pointed — "
+          "not a normal edit.", file=sys.stderr)
+    if not sys.stdin.isatty():
+        print("   Refusing to re-embed unattended. Re-run with --yes to accept, "
+              "--force to rebuild, or --no-reindex-guard to skip this check.", file=sys.stderr)
+        return False
+    try:
+        return input("   Re-index anyway? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _print_status(st) -> None:
+    """Human rendering of one SourceStatus."""
+    print(f"\n{'='*55}")
+    print(f"Source  : {st.label}  ({st.source_id})")
+    print(f"ChromaDB: {st.store_dir}")
+    print(f"Model   : {st.model_id}")
+
+    if not st.directory_exists:
+        print(f"  ⚠  SOURCE PATH MISSING: {st.directory}")
+        print("     directory does not exist — moved, unmounted, or a broken symlink.")
+        print("     Any indexed chunks are now orphaned; fix the path or re-point the source.")
+
+    if not st.indexed:
+        print(f"  No index found. Run: python -m basic_kb index --source {st.source_id}")
+        return
+    if st.chunks == 0:
+        print(f"  Index empty. Run: python -m basic_kb index --source {st.source_id}")
+        return
+
+    print(f"Chunks  : {st.chunks:,}")
+    print(f"Docs    : {st.docs_with_chunks:,} produced chunks / {st.files_on_disk} files on disk")
+
+    if st.files_on_disk == 0:
+        if not st.directory_exists:
+            print(f"  ⚠  0 files — source path is missing (see warning above); "
+                  f"{st.docs_with_chunks} indexed docs orphaned.")
+        else:
+            print(f"  ⚠  0 files at {st.directory}")
+            print(f"     directory exists but holds no matching files — the "
+                  f"{st.docs_with_chunks} indexed docs are now stale.")
+    elif not st.tracked:
+        print(f"           no manifest yet — run `python -m basic_kb index "
+              f"--source {st.source_id}` once so empty files are tracked "
+              f"(until then {st.new} files show as new).")
+    elif st.stale:
+        parts = [f"{st.new} new", f"{st.updated} changed", f"{st.deleted} deleted"]
+        shown = ", ".join(p for p, n in zip(parts, (st.new, st.updated, st.deleted)) if n)
+        print(f"           {shown} since last index — run: "
+              f"python -m basic_kb index --source {st.source_id}")
+    else:
+        print("           up to date  (files too short to chunk are tracked, "
+              "not counted as unindexed)")
+
+    if st.date_min:
+        print(f"Dates   : {st.date_min} → {st.date_max}")
+    for ct, count in sorted(st.content_types.items()):
+        print(f"  {ct}: {count:,} chunks")
+    if st.oversized_chunks:
+        print(f"  ⚠  oversized chunks: {st.oversized_chunks}")
+
+
 def _print_sources(config: Config) -> None:
     print(f"\nInstance '{config.name}' sources (use with --source):\n")
     for s in config.sources:
@@ -197,13 +304,27 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
     if guard_threshold is None:
         guard_threshold = config.reindex_guard_threshold
 
+    as_json = getattr(args, "json", False)
     kb = _build_kb(args, config, threads=threads)
+    results = []
     for source in sources:
-        kb.index(source=source, chunk_size=chunk_size, overlap=overlap,
-                 min_chunk=min_chunk, force=args.force, limit=getattr(args, "limit", None),
-                 pause_ms=pause_ms, pause_every=pause_every,
-                 guard=guard, guard_threshold=guard_threshold,
-                 assume_yes=getattr(args, "yes", False))
+        results.append(kb.index(
+            source=source, chunk_size=chunk_size, overlap=overlap,
+            min_chunk=min_chunk, force=args.force, limit=getattr(args, "limit", None),
+            pause_ms=pause_ms, pause_every=pause_every,
+            guard=guard, guard_threshold=guard_threshold,
+            assume_yes=getattr(args, "yes", False),
+            # No progress on stdout in --json mode; it would break the document.
+            on_progress=None if as_json else print,
+            on_confirm=_confirm_mass_change_on_tty,
+        ))
+
+    if as_json:
+        emit_json(results)
+
+    # An aborted guard used to be indistinguishable from success. Make it an exit code.
+    if any(r.aborted for r in results):
+        sys.exit(1)
 
 
 def _preview_chunks(sources: list[DataSourceBase], config: Config,
@@ -311,8 +432,14 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
     )
 
     # Batch mode: each query gets its OWN top-n block (no cross-query merging).
+    as_json = getattr(args, "json", False)
+
     if separate:
         groups = kb.search_grouped(**common)
+        if as_json:
+            emit_json({"mode": "separate",
+                       "groups": [{"query": q, "hits": h} for q, h in groups]})
+            return
         for q, hits in groups:
             print("#" * 60)
             print(f"# Query: {q}  ({len(hits)} results)")
@@ -326,6 +453,9 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
 
     # Fused mode (default): all queries merged into one ranked list.
     hits = kb.search(**common)
+    if as_json:
+        emit_json({"mode": "fused", "queries": args.queries, "hits": hits})
+        return
     if not hits:
         print("No results.")
         return
@@ -338,7 +468,12 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
 def cmd_status(args: argparse.Namespace, config: Config) -> None:
     sources = _load_sources(config, getattr(args, "source", "all"))
     kb = _build_kb(args, config)
-    kb.status(sources)
+    statuses = kb.status(sources)
+    if getattr(args, "json", False):
+        emit_json(statuses)
+        return
+    for st in statuses:
+        _print_status(st)
 
 
 def _scan_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
@@ -350,9 +485,12 @@ def _scan_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
 def cmd_scan(args: argparse.Namespace, config: Config) -> None:
     sources = _load_sources(config, getattr(args, "source", "all"))
     kb = _scan_kb(args, config)
+    results = [kb.scan(s) for s in sources]
+    if getattr(args, "json", False):
+        emit_json(results)
+        return
     any_stale = False
-    for source in sources:
-        res = kb.scan(source)
+    for res in results:
         if not res.tracked:
             print(f"Scan [{res.source_id}]: not tracked yet — run "
                   f"`basic_kb index --source {res.source_id}` once to enable change detection.")
@@ -550,6 +688,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Sleep MS milliseconds every --pause-every embedded files (hard CPU duty cap).")
     p_index.add_argument("--pause-every", type=int, default=None, metavar="N",
                          help="Pause cadence in embedded files (used with --pause-ms; default 50).")
+    p_index.add_argument("--json", action="store_true",
+                         help="emit the IndexResult as JSON; suppresses progress output")
     p_index.add_argument("--yes", "-y", action="store_true",
                          help="Auto-accept the mass-change safety prompt (for unattended re-indexing).")
     p_index.add_argument("--no-reindex-guard", action="store_true",
@@ -580,14 +720,18 @@ def build_parser() -> argparse.ArgumentParser:
                                "Default: `search.content_type` in the config, else none.")
     p_search.add_argument("--max-chars", type=int, default=None, metavar="N",
                           help="Truncate each result to N chars (default: `search.max_chars`, else 0 = full)")
+    p_search.add_argument("--json", action="store_true",
+                          help="emit hits as JSON instead of formatted text")
     p_search.add_argument("--timing", action="store_true",
                           help="Print per-phase timings (embed/retrieve/rerank/total) to stderr. "
                                "Also enabled by `search.timing: true` in the config.")
 
     p_status = sub.add_parser("status", help="Show index stats")
+    p_status.add_argument("--json", action="store_true", help="emit per-source status as JSON")
     _shared_args(p_status)
 
     p_scan = sub.add_parser("scan", help="Check staleness: new/changed/deleted files vs the index (no embedding)")
+    p_scan.add_argument("--json", action="store_true", help="emit the scan diff as JSON")
     _shared_args(p_scan)
 
     p_watch = sub.add_parser("watch",

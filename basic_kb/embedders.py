@@ -1,6 +1,7 @@
 """Embedding backends. Local FastEmbed/ONNX by default (no API, no network)."""
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
@@ -63,11 +64,19 @@ class FastEmbedEmbedder(EmbedderBase):
         self._model_id = self.SUPPORTED.get(alias, alias)
         self._threads = threads   # cap ONNX threads (CPU cores) used; None = all
         self._model: Any = None
+        # Guards the lazy load. Without it, concurrent first-calls in a server each
+        # pass the None check and each construct a model — an N-fold memory spike on
+        # a cold process, at exactly the moment traffic arrives.
+        self._load_lock = threading.Lock()
 
     def _load(self):
-        if self._model is None:
-            from fastembed import TextEmbedding
-            self._model = TextEmbedding(self._model_id, show_progress=False, threads=self._threads)
+        if self._model is not None:      # fast path, no lock once loaded
+            return
+        with self._load_lock:
+            if self._model is None:      # re-check: another thread may have won
+                from fastembed import TextEmbedding
+                self._model = TextEmbedding(
+                    self._model_id, show_progress=False, threads=self._threads)
 
     @property
     def model_id(self) -> str:
