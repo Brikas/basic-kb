@@ -139,6 +139,11 @@ class DataSourceBase(ABC):
         return self._description
 
     @property
+    def chunker_name(self) -> str:
+        """Which chunker this source is configured to use. Reported by `info`."""
+        return self._chunker
+
+    @property
     def directory(self) -> Path:
         return self._dir
 

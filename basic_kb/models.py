@@ -102,3 +102,42 @@ class SourceStatus:
     @property
     def stale(self) -> int:
         return self.new + self.updated + self.deleted
+
+
+@dataclass
+class SourceInfo:
+    """What one source *is*, for a reader deciding whether to search it.
+
+    Distinct from SourceStatus, which answers "is the index current". This answers
+    "what is in here and is it worth querying" — so it carries the config's
+    description, which status has no reason to show.
+    """
+    source_id: str
+    label: str
+    description: str
+    type: str                  # source type from config (transcript, markdown, …)
+    chunker: str
+    files: int                 # files on disk
+    chunks: int                # chunks in the index
+    indexed: bool              # a collection exists and holds something
+
+    @property
+    def chunks_per_file(self) -> float:
+        return round(self.chunks / self.files, 1) if self.files else 0.0
+
+
+@dataclass
+class InstanceInfo:
+    """The whole knowledge base at a glance. Returned by `KnowledgeBase.info`."""
+    name: str
+    model_id: str
+    store_dir: str
+    sources: list[SourceInfo] = field(default_factory=list)
+
+    @property
+    def total_files(self) -> int:
+        return sum(s.files for s in self.sources)
+
+    @property
+    def total_chunks(self) -> int:
+        return sum(s.chunks for s in self.sources)

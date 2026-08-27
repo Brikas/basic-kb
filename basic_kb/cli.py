@@ -97,15 +97,19 @@ def emit_json(payload) -> None:
     Callers must suppress progress output in this mode — a stray progress line on
     stdout makes the document unparseable.
     """
-    from dataclasses import asdict, is_dataclass
+    from dataclasses import fields, is_dataclass
 
     def conv(x):
         if is_dataclass(x) and not isinstance(x, type):
-            d = asdict(x)
-            # dataclass properties are not fields; add the derived ones callers want.
-            for prop in ("stale", "embedded"):
-                if hasattr(x, prop):
-                    d[prop] = getattr(x, prop)
+            # Built field-by-field rather than with asdict(), which converts nested
+            # dataclasses to plain dicts before the property loop below can see them.
+            d = {f.name: conv(getattr(x, f.name)) for f in fields(x)}
+            # Derived values live as properties, not fields, and a caller reading
+            # JSON wants them — so include every property the class defines rather
+            # than a hand-maintained list that goes stale.
+            for name, attr in vars(type(x)).items():
+                if isinstance(attr, property):
+                    d[name] = conv(getattr(x, name))
             return d
         if isinstance(x, list):
             return [conv(i) for i in x]
@@ -476,6 +480,39 @@ def cmd_status(args: argparse.Namespace, config: Config) -> None:
         _print_status(st)
 
 
+def _print_info(inf) -> None:
+    """Human rendering of InstanceInfo. Compact on purpose — this is meant to be
+    read at a glance before choosing a source to search."""
+    print(f"\n{inf.name or '(unnamed instance)'}")
+    print(f"  model : {inf.model_id}")
+    print(f"  store : {inf.store_dir}")
+    print(f"  totals: {len(inf.sources)} sources, {inf.total_files:,} files, {inf.total_chunks:,} chunks\n")
+
+    for s in inf.sources:
+        state = "" if s.indexed else "   [NOT INDEXED]"
+        print(f"  {s.source_id}{state}")
+        print(f"    {s.label}  ({s.type}, {s.chunker} chunker)")
+        if s.description:
+            print(f"    {s.description}")
+        print(f"    {s.files:,} files -> {s.chunks:,} chunks  ({s.chunks_per_file} per file)\n")
+
+
+def cmd_info(args: argparse.Namespace, config: Config) -> None:
+    """Describe the instance and its sources — what is in here, and how much.
+
+    Deliberately separate from `status`: status answers "is the index current",
+    info answers "what does this hold and is it worth querying". A caller picking
+    a source reads the descriptions, which status has no reason to show.
+    """
+    sources = _load_sources(config, getattr(args, "source", "all"))
+    kb = _scan_kb(args, config)          # no reranker needed; the model is never loaded
+    inf = kb.info(sources, name=config.name)
+    if getattr(args, "json", False):
+        emit_json(inf)
+        return
+    _print_info(inf)
+
+
 def _scan_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
     """A KnowledgeBase for scan/freshness — no reranker needed (scan only hashes files)."""
     model, *_ = _effective(args, config)
@@ -726,6 +763,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Print per-phase timings (embed/retrieve/rerank/total) to stderr. "
                                "Also enabled by `search.timing: true` in the config.")
 
+    p_info = sub.add_parser("info", help="Describe the sources: what each holds, how big it is")
+    _shared_args(p_info)
+    p_info.add_argument("--json", action="store_true", help="emit the instance description as JSON")
+
     p_status = sub.add_parser("status", help="Show index stats")
     p_status.add_argument("--json", action="store_true", help="emit per-source status as JSON")
     _shared_args(p_status)
@@ -776,7 +817,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                            config.log_max_bytes, config.log_backup_count)
 
     {"index": cmd_index, "search": cmd_search, "status": cmd_status,
-     "scan": cmd_scan, "watch": cmd_watch}[args.cmd](args, config)
+     "scan": cmd_scan, "watch": cmd_watch, "info": cmd_info}[args.cmd](args, config)
 
 
 if __name__ == "__main__":

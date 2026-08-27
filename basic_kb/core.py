@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from .chunkers import DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK, DEFAULT_OVERLAP
 from .embedders import EmbedderBase
 from .errors import IndexNotFound, ManifestCorrupt, MassChangeRefused, QueryFailed
-from .models import FileError, IndexResult, SearchResult, SourceStatus
+from .models import FileError, IndexResult, InstanceInfo, SearchResult, SourceInfo, SourceStatus
 from .rerankers import RerankerBase
 from .sources import DataSourceBase
 
@@ -717,6 +717,51 @@ class KnowledgeBase:
             type(self.reranker).__name__ if self.reranker else None,
         )
         return hits
+
+    def info(self, sources: list[DataSourceBase], name: str = "") -> InstanceInfo:
+        """Describe the knowledge base: what each source holds and how big it is.
+
+        Written for a reader — usually an agent — deciding WHICH source to query.
+        That is a different question from `status`, which answers whether the index
+        is current, so this carries each source's configured description and leaves
+        staleness out.
+
+        A source with no index yet comes back with chunks=0 and indexed=False rather
+        than raising; an un-indexed source among several is a normal state.
+        """
+        client = self._client() if self.chroma_dir.exists() else None
+        out: list[SourceInfo] = []
+
+        for source in sources:
+            chunks, indexed = 0, False
+            if client is not None:
+                try:
+                    col = client.get_collection(
+                        name=source.source_id,
+                        embedding_function=self.embedder.as_chroma_ef(),
+                    )
+                    chunks = col.count()
+                    indexed = chunks > 0
+                except Exception as e:
+                    logger.info("info: no collection for source=%s (%s)", source.source_id, e)
+
+            out.append(SourceInfo(
+                source_id=source.source_id,
+                label=source.label,
+                description=source.description,
+                type=type(source).type_name or type(source).__name__,
+                chunker=source.chunker_name,
+                files=len(source.get_files()),
+                chunks=chunks,
+                indexed=indexed,
+            ))
+
+        return InstanceInfo(
+            name=name,
+            model_id=self.embedder.model_id,
+            store_dir=str(self.chroma_dir),
+            sources=out,
+        )
 
     def status(self, sources: list[DataSourceBase]) -> list[SourceStatus]:
         """Index stats per source, as data. Nothing is printed — the CLI formats it.
