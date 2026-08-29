@@ -168,7 +168,7 @@ def run_watch(kb: KnowledgeBase, watched: list[tuple[DataSourceBase, WatchSettin
     wait_s = 60
     while True:
         try:
-            kb.prepare_model_switch([s for s, _ in watched], force=False)
+            kb.prepare_model_switch([s for s, _ in watched], accept=False)
             break
         except StoreError as e:
             print(f"  ! {e}\n  ! watcher idle; re-checking every {wait_s}s.", file=sys.stderr, flush=True)

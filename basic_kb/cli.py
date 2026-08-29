@@ -327,14 +327,20 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
 
     as_json = getattr(args, "json", False)
     kb = _build_kb(args, config, threads=threads)
-    note = kb.prepare_model_switch(sources, force=args.force)   # raises StoreError with the fix
+    switch = getattr(args, "switch_model", False)
+    force = args.force or switch
+    if switch:
+        # A switch re-embeds everything; `--source` would leave the other sources' vectors
+        # in a different space, so the run always covers every configured source.
+        sources = _load_sources(config, "all")
+    note = kb.prepare_model_switch(sources, accept=switch)   # refuses on a mismatch unless --switch-model
     if note and not as_json:
         print(note)
     results = []
     for source in sources:
         results.append(kb.index(
             source=source, chunk_size=chunk_size, overlap=overlap,
-            min_chunk=min_chunk, force=args.force, limit=getattr(args, "limit", None),
+            min_chunk=min_chunk, force=force, limit=getattr(args, "limit", None),
             pause_ms=pause_ms, pause_every=pause_every,
             guard=guard, guard_threshold=guard_threshold,
             assume_yes=getattr(args, "yes", False),
@@ -744,7 +750,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb search \"topic a\" \"topic b\" --separate         batch: n results per query\n"
             "  basic_kb search --source list                          list configured sources\n"
             "  basic_kb index                                         incremental: new/changed only\n"
-            "  basic_kb index --force                                 rebuild the whole index\n"
+            "  basic_kb index --force                                 re-embed the selected sources (same model)\n"
+            "  basic_kb index --switch-model                          embedding model changed: wipe + rebuild all\n"
             "  basic_kb index --limit 10                              embed only the first N files (test)\n"
             "  basic_kb status                                        chunk/doc counts per source\n"
             "  basic_kb scan                                          new/changed/deleted files vs the index\n"
@@ -752,7 +759,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb vacuum                                        compact the store file now\n\n"
             "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
-            "Index flags:   --force  --limit N  --preview [--file NAME]  --yes  --no-reindex-guard\n"
+            "Index flags:   --force  --switch-model  --limit N  --preview [--file NAME]  --yes  --no-reindex-guard\n"
             "Throttle:      --throttle  --cores-fraction F  --priority low|normal  --pause-ms MS [--pause-every N]\n"
             "Watch:         --debounce SEC (0=immediate; per-source `watch:` config otherwise)\n"
             "Tuning (any):  --model NAME  --chunk-size N  --overlap N  --min-chunk N\n"
@@ -768,7 +775,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_index = sub.add_parser("index", help="Embed and index documents")
     _shared_args(p_index)
     p_index.add_argument("--force", action="store_true",
-                         help="Clear existing index and re-embed from scratch")
+                         help="Clear the selected sources and re-embed them from scratch (same model)")
+    p_index.add_argument("--switch-model", action="store_true",
+                         help="Accept that embedding_model/embedding changed: wipe the whole store and re-embed "
+                              "every source (implies --force and --source all). Without it a model mismatch "
+                              "refuses to index anything.")
     p_index.add_argument("--limit", type=int, default=None, metavar="N",
                          help="Index only the first N files per source (test runs). "
                               "Example: index --limit 10")

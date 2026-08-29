@@ -155,24 +155,28 @@ class KnowledgeBase:
                            self.store_dir, len(found))
         return found
 
-    def prepare_model_switch(self, sources: list[DataSourceBase], force: bool) -> Optional[str]:
+    def prepare_model_switch(self, sources: list[DataSourceBase], accept: bool = False) -> Optional[str]:
         """Call before a (re)index run. If the store was built with a different embedding model
-        than this KnowledgeBase uses, a rebuild must cover every indexed source at once — the
-        vector table has one fixed dimension. With `force` and full coverage the store is
-        emptied here and a note is returned; with partial coverage or without `force` a
-        StoreError explains what to run. Returns None when nothing had to happen."""
+        than this KnowledgeBase uses, refuse to index anything — a model switch is never a
+        side effect of a normal run or of `force`. Only with `accept=True` (CLI:
+        `--switch-model`) and every indexed source in `sources` is the store emptied and the
+        switch logged; the returned note says what was cleared. None when models match."""
         info = self.store.model_info()
         if not info or info[0] == self.embedder.model_id:
             return None
         indexed = set(self.store.sources())
         requested = {s.source_id for s in sources}
         missing = sorted(indexed - requested)
-        if not force or missing:
-            hint = (f" — add {', '.join(missing)} (or use --source all)" if missing else "")
+        if not accept:
             raise StoreError(
-                f"store at {self.store.path} holds vectors from {info[0]!r} (dim {info[1]}); this run "
-                f"embeds with {self.embedder.model_id!r}. Switching models rebuilds everything: "
-                f"`basic_kb index --force --source all`{hint}.")
+                f"Model switch detected: the store at {self.store.path} holds vectors from {info[0]!r} "
+                f"(dim {info[1]}) but this run embeds with {self.embedder.model_id!r}. Nothing was indexed. "
+                f"If this is intended, run `basic_kb index --switch-model` — it wipes the store and "
+                f"re-embeds every source. Otherwise restore the previous embedding_model/embedding block.")
+        if missing:
+            raise StoreError(
+                f"Model switch needs every indexed source in the run; missing: {', '.join(missing)}. "
+                f"Run `basic_kb index --switch-model` without --source (all sources are rebuilt).")
         with self._write_lock:
             n = self.store.clear_all()
         msg = f"Model switch {info[0]!r} -> {self.embedder.model_id!r}: cleared {n} chunks across {sorted(indexed)}."
