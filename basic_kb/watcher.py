@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .core import KnowledgeBase
+from .errors import StoreError
 from .sources import DataSourceBase
 
 logger = logging.getLogger("basic_kb")
@@ -159,8 +160,20 @@ def run_watch(kb: KnowledgeBase, watched: list[tuple[DataSourceBase, WatchSettin
     filtered to enabled sources."""
     engine = _Engine(kb, chunk_size, overlap, min_chunk)
 
-    # A watcher must never be the one to switch models: refuse loudly, point at `index`.
-    kb.prepare_model_switch([s for s, _ in watched], force=False)
+    # A watcher must never be the one to switch models. While a model switch or rebuild
+    # is in progress (or nobody has run `index --force --source all` yet), the store holds
+    # another model's vectors. Exiting here would make a supervisor (systemd Restart=)
+    # crash-loop us; instead wait and re-check, so the watcher picks up on its own once
+    # the rebuild lands. The message says exactly what to run.
+    wait_s = 60
+    while True:
+        try:
+            kb.prepare_model_switch([s for s, _ in watched], force=False)
+            break
+        except StoreError as e:
+            print(f"  ! {e}\n  ! watcher idle; re-checking every {wait_s}s.", file=sys.stderr, flush=True)
+            logger.warning("watch waiting for store/model to match: %s", e)
+            time.sleep(wait_s)
 
     # 1) Startup reconcile: embed anything that changed while the watcher was down.
     for source, _ in watched:
