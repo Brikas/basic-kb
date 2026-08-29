@@ -16,7 +16,8 @@ any specific dataset lives in the code.
 ```
 KnowledgeBase
 ├── EmbedderBase (ABC)
-│   └── FastEmbedEmbedder   — ONNX-backed local embeddings via fastembed (returns list[list[float]])
+│   ├── FastEmbedEmbedder   — ONNX-backed local embeddings via fastembed (returns list[list[float]])
+│   └── OpenAICompatibleEmbedder — any /v1/embeddings HTTP endpoint; batching, retries, prefixes; `build_embedder()` picks by config
 ├── SqliteVecStore          — one SQLite file: vec0 vectors + chunks + per-file manifest; auto-VACUUM
 ├── RerankerBase (ABC)         — pluggable via RERANKER_TYPES; `reranker:` config picks one
 │   ├── FastEmbedReranker   — local ONNX cross-encoder (no API key)

@@ -39,6 +39,10 @@ basic-kb search --source list      # list configured sources
 dry-runs the chunker without embedding. A pre-scan hashes every file first, so
 progress reads `[k/work]` (files actually being embedded), not `[i/all-files]`.
 
+## Embeddings: local or API
+
+Default is local FastEmbed/ONNX (`embedding_model: bge-small-en-v1.5`, nothing leaves the machine). Any OpenAI-compatible `/v1/embeddings` endpoint works too — DeepInfra, Nebius, OpenRouter, OpenAI, a self-hosted vLLM — via an `embedding:` block (`provider: openai-compatible`, `base_url`, `api_key_env`, optional `dimensions`, `batch_size`, `query_prefix`/`passage_prefix`); see [basic-kb.example.yaml](basic-kb.example.yaml). Keys come from the environment or the `env_file`, never the config. The model id stored with the index includes the provider model and requested dimensions, so changing either is refused until `index --force --source all`. Trade-off to make consciously: every chunk of your sources is sent to that provider.
+
 ## Store
 
 Everything an instance indexes lives in one file, `<store_dir>/kb.sqlite3`: vectors (a sqlite-vec `vec0` table), chunk text and metadata, and the per-file manifest. Search is an exact cosine scan — no approximate index, so results are deterministic, a delete is a delete, and nothing has to be held in RAM; at the sizes this engine targets (thousands to low hundreds of thousands of chunks) a scan is milliseconds. Why not HNSW: [docs/adr/0001](docs/adr/0001-sqlite-vec-as-vector-store.md).

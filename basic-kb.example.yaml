@@ -3,7 +3,16 @@
 
 name: my-notes              # label only
 store_dir: .basic-kb        # holds kb.sqlite3 — vectors, chunks, manifest in one file (gitignore it)
-embedding_model: bge-small-en-v1.5
+embedding_model: bge-small-en-v1.5   # local alias/HF id, or the provider's model id when using an API
+# embedding:                          # where embeddings come from. Default: local FastEmbed/ONNX, no network.
+#   provider: openai-compatible       # local | openai-compatible (DeepInfra, Nebius, OpenRouter, OpenAI, vLLM…)
+#   base_url: https://api.deepinfra.com/v1/openai
+#   api_key_env: DEEPINFRA_API_KEY    # key is read from the environment / env_file, never from here
+#   dimensions: 1024                  # optional MRL truncation; refused if the provider ignores it
+#   batch_size: 64                    # texts per request
+#   query_prefix: ""                  # instruction-aware models; Qwen3-Embedding gets its official one by default
+#   passage_prefix: ""
+# Switching provider or model changes the vector space: run `basic-kb index --force --source all`.
 # embed_batch_size: 8    # texts per embedding pass. Peak RAM grows with batch x seq_len^2 and is never
 #                        # returned by onnxruntime; 8 ~0.5 GB, 32 ~1.1 GB, 256 ~4 GB on bge-small. Same speed.
 

@@ -35,7 +35,7 @@ from .config import Config, find_config, load_config, load_env_file
 from .errors import BasicKBError
 from .version import __version__
 from .core import DEFAULT_N, KnowledgeBase, cores_to_threads, lower_process_priority, setup_file_logging
-from .embedders import FastEmbedEmbedder
+from .embedders import FastEmbedEmbedder, build_embedder
 from .models import SearchResult
 from .rerankers import RerankerBase, build_reranker
 from .sources import DataSourceBase, build_source
@@ -55,6 +55,15 @@ def _effective(args: argparse.Namespace, config: Config) -> tuple[str, int, int,
     return model, chunk_size, overlap, min_chunk
 
 
+def _with_model_override(args: argparse.Namespace, config: Config) -> Config:
+    """`--model NAME` overrides the config's embedding_model for this run (same provider)."""
+    override = getattr(args, "model", None)
+    if not override or override == config.embedding_model:
+        return config
+    from dataclasses import replace
+    return replace(config, embedding_model=override)
+
+
 def _vacuum_policy(config: Config) -> VacuumPolicy:
     """The auto-vacuum policy from the `vacuum:` config block. Passed to every
     KnowledgeBase the CLI builds so index, watch and search all honour it."""
@@ -64,8 +73,7 @@ def _vacuum_policy(config: Config) -> VacuumPolicy:
 
 
 def _build_kb(args: argparse.Namespace, config: Config, threads: Optional[int] = None) -> KnowledgeBase:
-    model, *_ = _effective(args, config)
-    embedder = FastEmbedEmbedder(alias=model, threads=threads, batch_size=config.embed_batch_size)
+    embedder = build_embedder(_with_model_override(args, config), threads=threads)
 
     reranker: Optional[RerankerBase] = None
     if not getattr(args, "no_rerank", False):
@@ -524,8 +532,7 @@ def cmd_info(args: argparse.Namespace, config: Config) -> None:
 
 def _scan_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
     """A KnowledgeBase for scan/freshness — no reranker needed (scan only hashes files)."""
-    model, *_ = _effective(args, config)
-    return KnowledgeBase(embedder=FastEmbedEmbedder(alias=model, batch_size=config.embed_batch_size),
+    return KnowledgeBase(embedder=build_embedder(_with_model_override(args, config)),
                          store_dir=config.store_dir, vacuum=_vacuum_policy(config))
 
 
@@ -583,9 +590,7 @@ def cmd_watch(args: argparse.Namespace, config: Config) -> None:
     if priority == "low":
         lower_process_priority()
 
-    model, *_ = _effective(args, config)
-    kb = KnowledgeBase(embedder=FastEmbedEmbedder(alias=model, threads=threads,
-                                                  batch_size=config.embed_batch_size),
+    kb = KnowledgeBase(embedder=build_embedder(_with_model_override(args, config), threads=threads),
                        store_dir=config.store_dir, vacuum=_vacuum_policy(config))  # no reranker needed
     if config.log_file:
         print(f"(logging events to {config.log_file})", file=sys.stderr)

@@ -47,7 +47,7 @@ from .config import Config, load_config, load_env_file
 from .core import KnowledgeBase, ScanResult
 from .store import SqliteVecStore, VacuumPolicy
 from .errors import (
-    BasicKBError, IndexNotFound, MassChangeRefused, QueryFailed, StoreError,
+    BasicKBError, EmbeddingError, IndexNotFound, MassChangeRefused, QueryFailed, StoreError,
 )
 from .embedders import EmbedderBase, FastEmbedEmbedder
 from .models import Chunk, FileError, IndexResult, ParsedDocument, SearchResult, SourceStatus
@@ -59,7 +59,7 @@ from .version import __version__  # noqa: E402
 __all__ = [
     "Config", "load_config", "load_env_file",
     "KnowledgeBase", "ScanResult", "SqliteVecStore", "StoreError", "VacuumPolicy",
-    "BasicKBError", "IndexNotFound", "MassChangeRefused", "QueryFailed", "StoreError",
+    "BasicKBError", "EmbeddingError", "IndexNotFound", "MassChangeRefused", "QueryFailed", "StoreError",
     "EmbedderBase", "FastEmbedEmbedder",
     "RerankerBase", "JinaReranker",
     "Chunk", "ParsedDocument", "SearchResult",

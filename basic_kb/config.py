@@ -10,7 +10,7 @@ or you set the variable in the environment / via --env-file. See README.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -123,6 +123,7 @@ class Config:
     min_chunk: int
     sources: list[dict]  # raw source entries; built via sources.build_source()
     embed_batch_size: int = 8          # texts per embedding forward pass; bounds peak RAM (see embedders.py)
+    embedding: dict = field(default_factory=dict)  # `embedding:` block: provider, base_url, api_key_env, dimensions… (see embedders.build_embedder)
     vacuum_enabled: bool = True        # auto-VACUUM the store when enough rows were deleted (see store.py)
     vacuum_deleted_fraction: float = 0.2  # deleted-since-vacuum / live rows that triggers it (Qdrant's default)
     vacuum_min_deleted: int = 1000     # ...but never for fewer deleted rows than this
@@ -237,6 +238,7 @@ def load_config(config_path: Path) -> Config:
         store_dir=_resolve(base_dir, data.get("store_dir", ".basic-kb")),
         embedding_model=data.get("embedding_model", DEFAULT_MODEL),
         embed_batch_size=int(data.get("embed_batch_size", 8)),
+        embedding=dict(data.get("embedding", {}) or {}),
         vacuum_enabled=vac_enabled,
         vacuum_deleted_fraction=float(vac.get("deleted_fraction", 0.2)),
         vacuum_min_deleted=int(vac.get("min_deleted", 1000)),

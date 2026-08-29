@@ -16,6 +16,12 @@ class StoreError(BasicKBError):
     """The store itself is unusable: extension missing, model/dimension mismatch, ..."""
 
 
+class EmbeddingError(BasicKBError):
+    """The embedding backend could not produce vectors: missing API key, provider error,
+    wrong dimensionality. Raised rather than returning empties — an empty vector would
+    silently poison the index."""
+
+
 class IndexNotFound(BasicKBError):
     """No index exists for the requested source(s), so no query could run."""
 
