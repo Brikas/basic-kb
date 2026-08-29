@@ -265,16 +265,48 @@ class KnowledgeBase:
             ids.append(f"{rel_path}::{h}" + (f"#{n}" if n else ""))
         return ids
 
-    def _write_file(self, source: DataSourceBase, rel_path: str, file_hash: str, chunks) -> tuple[int, int]:
+    # Chunks per embedding wave. A wave collects the *new* chunks of many files and embeds
+    # them in one call, so an API backend's concurrency spans files instead of being
+    # bounded by the 1-9 chunks a typical note has (one request per file = one round-trip
+    # of latency per file). 4096 = 64 requests x 64 texts at the default settings; a crash
+    # mid-wave loses at most this much work, since files are written after the wave.
+    WAVE_CHUNKS = 4096
+
+    def _write_file(self, source: DataSourceBase, rel_path: str, file_hash: str, chunks,
+                    vectors: Optional[dict[str, list[float]]] = None) -> tuple[int, int]:
         """Sync one file's chunks into the store, embedding only chunks whose text is new.
-        Returns (chunks_embedded, chunks_reused). Empty `chunks` drops the file's rows but
-        records its hash, so a file too short to chunk stays tracked."""
+        `vectors` (text -> vector) supplies precomputed embeddings from a wave; anything not
+        in it is embedded on the spot. Returns (chunks_embedded, chunks_reused). Empty
+        `chunks` drops the file's rows but records its hash, so a short file stays tracked."""
         ids = self._chunk_ids(rel_path, chunks)
         docs = [c.text for c in chunks]
         metas = [{**c.metadata, "rel_path": rel_path, "content_hash": file_hash, "position": c.id_suffix}
                  for c in chunks]
+
+        def embed(texts: list[str]) -> list[list[float]]:
+            have = vectors or {}
+            missing = [t for t in texts if t not in have]
+            if missing:
+                have = {**have, **dict(zip(missing, self.embedder.embed(missing)))}
+            return [have[t] for t in texts]
+
         return self.store.sync_file(source.source_id, rel_path, file_hash, ids, docs, metas,
-                                    embed=self.embedder.embed, model_id=self.embedder.model_id)
+                                    embed=embed, model_id=self.embedder.model_id)
+
+    def _embed_wave(self, source: DataSourceBase, prepared: list[tuple[str, list]]) -> dict[str, list[float]]:
+        """Embed, in one call, every chunk text in `prepared` [(rel_path, chunks)] that the
+        store does not already hold. Returns text -> vector for the caller to hand to
+        _write_file. Duplicate texts across files are embedded once."""
+        todo: dict[str, None] = {}
+        for rel_path, chunks in prepared:
+            have = self.store.existing_chunk_ids(source.source_id, rel_path)
+            for cid, ch in zip(self._chunk_ids(rel_path, chunks), chunks):
+                if cid not in have:
+                    todo[ch.text] = None
+        texts = list(todo)
+        if not texts:
+            return {}
+        return dict(zip(texts, self.embedder.embed(texts)))
 
     def index(
         self,
@@ -375,40 +407,55 @@ class KnowledgeBase:
 
         was_indexed_files = set(self.store.chunk_ids_by_file(source.source_id))
         since_pause = 0
-        for processed, (f, rel_path, file_hash) in enumerate(to_process, 1):
-            was_indexed = rel_path in was_indexed_files
-            try:
-                doc = source.parse_file(f)
-                chunks = chunker.chunk(doc) if doc is not None else []
-            except Exception as e:
-                # One unreadable file must not abandon a run that has already
-                # embedded hundreds. Record it and carry on; the manifest simply
-                # does not learn this file, so the next run retries it.
-                logger.exception("index: failed to parse %s/%s", source.source_id, rel_path)
-                result.errors.append(FileError(rel_path=rel_path, error=f"{type(e).__name__}: {e}"))
-                self._emit(on_progress, f"  [{processed}/{work_total}] SKIPPED {rel_path} — {e}")
-                continue
+        processed = 0
+        # Files are parsed and hash-diffed a wave at a time, the wave's new chunks are
+        # embedded in ONE call (concurrent for API backends), then each file is written as
+        # its own committed transaction — a crash keeps every file written so far.
+        i = 0
+        while i < len(to_process):
+            prepared: list[tuple[str, list, str, Path]] = []
+            wave_chunks = 0
+            while i < len(to_process) and (wave_chunks < self.WAVE_CHUNKS or not prepared):
+                f, rel_path, file_hash = to_process[i]
+                i += 1
+                processed += 1
+                try:
+                    doc = source.parse_file(f)
+                    chunks = chunker.chunk(doc) if doc is not None else []
+                except Exception as e:
+                    # One unreadable file must not abandon a run that has already
+                    # embedded hundreds. Record it and carry on; the manifest simply
+                    # does not learn this file, so the next run retries it.
+                    logger.exception("index: failed to parse %s/%s", source.source_id, rel_path)
+                    result.errors.append(FileError(rel_path=rel_path, error=f"{type(e).__name__}: {e}"))
+                    self._emit(on_progress, f"  [{processed}/{work_total}] SKIPPED {rel_path} — {e}")
+                    continue
+                prepared.append((rel_path, chunks, file_hash, f))
+                wave_chunks += len(chunks)
 
-            if not chunks:
-                result.empty += 1
-                self._write_file(source, rel_path, file_hash, [])   # tracked, holds no chunks
-                continue
+            vectors = self._embed_wave(source, [(rp, ch) for rp, ch, _, _ in prepared])
 
-            # Each file is one committed transaction: a crash at file 400 of 450 keeps 400.
-            n_new, n_kept = self._write_file(source, rel_path, file_hash, chunks)
-            result.chunks_embedded += n_new
-            result.chunks_reused += n_kept
-            kept = f", {n_kept} unchanged" if n_kept else ""
-            self._emit(on_progress,
-                       f"  [{processed}/{work_total}] {rel_path}  ({n_new} chunks embedded{kept})")
-            result.updated += 1 if was_indexed else 0
-            result.added += 0 if was_indexed else 1
+            for rel_path, chunks, file_hash, _ in prepared:
+                was_indexed = rel_path in was_indexed_files
+                if not chunks:
+                    result.empty += 1
+                    self._write_file(source, rel_path, file_hash, [])   # tracked, holds no chunks
+                    self._emit(on_progress, f"  {rel_path}  (no chunks — tracked, nothing to embed)")
+                    continue
+                n_new, n_kept = self._write_file(source, rel_path, file_hash, chunks, vectors)
+                result.chunks_embedded += n_new
+                result.chunks_reused += n_kept
+                kept = f", {n_kept} unchanged" if n_kept else ""
+                self._emit(on_progress, f"  {rel_path}  ({n_new} chunks embedded{kept})")
+                result.updated += 1 if was_indexed else 0
+                result.added += 0 if was_indexed else 1
 
-            if pause_ms > 0 and pause_every > 0:
-                since_pause += 1
-                if since_pause >= pause_every:
-                    time.sleep(pause_ms / 1000.0)
-                    since_pause = 0
+                if pause_ms > 0 and pause_every > 0:
+                    since_pause += 1
+                    if since_pause >= pause_every:
+                        time.sleep(pause_ms / 1000.0)
+                        since_pause = 0
+            self._emit(on_progress, f"  [{processed}/{work_total}] files done")
 
         # Prune files that no longer exist on disk. Full runs only — a --limit run
         # sees a subset, so absent files there are not actually deleted.
@@ -479,6 +526,7 @@ class KnowledgeBase:
             for rp in gone:
                 logger.info("reindex_paths: pruned %s/%s", source.source_id, rp)
 
+        prepared: list[tuple[str, list, str]] = []
         for rp, p in rels.items():
             if not p.exists():
                 continue
@@ -490,12 +538,15 @@ class KnowledgeBase:
                 logger.debug("reindex_paths: unchanged %s/%s", source.source_id, rp)
                 continue
             doc = source.parse_file(p)
-            chunks = chunker.chunk(doc) if doc is not None else []
+            prepared.append((rp, chunker.chunk(doc) if doc is not None else [], file_hash))
+
+        vectors = self._embed_wave(source, [(rp, ch) for rp, ch, _ in prepared])
+        for rp, chunks, file_hash in prepared:
             if not chunks:
                 self._write_file(source, rp, file_hash, [])
                 counts["empty"] += 1
                 continue
-            n_new, n_kept = self._write_file(source, rp, file_hash, chunks)
+            n_new, n_kept = self._write_file(source, rp, file_hash, chunks, vectors)
             counts["embedded"] += 1
             counts["chunks_embedded"] += n_new
             counts["chunks_reused"] += n_kept

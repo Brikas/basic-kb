@@ -293,6 +293,15 @@ class SqliteVecStore:
         self._maybe_vacuum()
         return n
 
+    def existing_chunk_ids(self, source: str, rel_path: str) -> set[str]:
+        """Chunk ids the store holds for one file — lets a caller decide what to embed
+        before calling sync_file (so many files' new chunks can be embedded in one go)."""
+        if not self.exists():
+            return set()
+        with self._connect() as con:
+            return {cid for (cid,) in con.execute(
+                "SELECT chunk_id FROM chunks WHERE source = ? AND rel_path = ?", (source, rel_path)).fetchall()}
+
     def sync_file(
         self, source: str, rel_path: str, file_hash: str,
         chunk_ids: list[str], docs: list[str], metadatas: list[dict],
