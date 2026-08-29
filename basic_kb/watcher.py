@@ -159,6 +159,9 @@ def run_watch(kb: KnowledgeBase, watched: list[tuple[DataSourceBase, WatchSettin
     filtered to enabled sources."""
     engine = _Engine(kb, chunk_size, overlap, min_chunk)
 
+    # A watcher must never be the one to switch models: refuse loudly, point at `index`.
+    kb.prepare_model_switch([s for s, _ in watched], force=False)
+
     # 1) Startup reconcile: embed anything that changed while the watcher was down.
     for source, _ in watched:
         stale = kb.stale_paths(source)

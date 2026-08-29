@@ -155,6 +155,30 @@ class KnowledgeBase:
                            self.store_dir, len(found))
         return found
 
+    def prepare_model_switch(self, sources: list[DataSourceBase], force: bool) -> Optional[str]:
+        """Call before a (re)index run. If the store was built with a different embedding model
+        than this KnowledgeBase uses, a rebuild must cover every indexed source at once — the
+        vector table has one fixed dimension. With `force` and full coverage the store is
+        emptied here and a note is returned; with partial coverage or without `force` a
+        StoreError explains what to run. Returns None when nothing had to happen."""
+        info = self.store.model_info()
+        if not info or info[0] == self.embedder.model_id:
+            return None
+        indexed = set(self.store.sources())
+        requested = {s.source_id for s in sources}
+        missing = sorted(indexed - requested)
+        if not force or missing:
+            hint = (f" — add {', '.join(missing)} (or use --source all)" if missing else "")
+            raise StoreError(
+                f"store at {self.store.path} holds vectors from {info[0]!r} (dim {info[1]}); this run "
+                f"embeds with {self.embedder.model_id!r}. Switching models rebuilds everything: "
+                f"`basic_kb index --force --source all`{hint}.")
+        with self._write_lock:
+            n = self.store.clear_all()
+        msg = f"Model switch {info[0]!r} -> {self.embedder.model_id!r}: cleared {n} chunks across {sorted(indexed)}."
+        logger.warning(msg)
+        return msg
+
     @staticmethod
     def _rel_path(source: DataSourceBase, f: Path) -> str:
         try:
@@ -302,8 +326,7 @@ class KnowledgeBase:
             files = files[:limit]
             self._emit(on_progress, f"[limit] indexing only the first {len(files)} file(s).")
 
-        if not force:
-            self.store.check_model(self.embedder.model_id)   # raises StoreError on a model switch
+        self.store.check_model(self.embedder.model_id)   # a model switch must go through prepare_model_switch()
         if force:
             n = self.store.clear_source(source.source_id)
             if n:

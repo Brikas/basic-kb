@@ -211,6 +211,29 @@ class SqliteVecStore:
         with self._connect() as con:
             return con.execute("SELECT 1 FROM files WHERE source = ? LIMIT 1", (source,)).fetchone() is not None
 
+    def sources(self) -> list[str]:
+        """Source ids that have anything indexed (manifest entries)."""
+        if not self.exists():
+            return []
+        with self._connect() as con:
+            return [r[0] for r in con.execute("SELECT DISTINCT source FROM files ORDER BY source").fetchall()]
+
+    def clear_all(self) -> int:
+        """Drop every source, the vector table and the model/dim identity. Returns rows deleted.
+        Used for a model switch: the vector table's dimension is fixed, so the store must be
+        empty before the first vector of a new model is written."""
+        if not self.exists():
+            return 0
+        with self._connect() as con:
+            n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]
+            con.execute("DELETE FROM chunks")
+            con.execute("DELETE FROM files")
+            self._reset_vectors(con)
+            self._meta_set(con, "deleted_since_vacuum", "0")
+            con.commit()
+        self.vacuum(reason="model switch")
+        return n
+
     def count(self, source: str) -> int:
         if not self.exists():
             return 0

@@ -327,6 +327,9 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
 
     as_json = getattr(args, "json", False)
     kb = _build_kb(args, config, threads=threads)
+    note = kb.prepare_model_switch(sources, force=args.force)   # raises StoreError with the fix
+    if note and not as_json:
+        print(note)
     results = []
     for source in sources:
         results.append(kb.index(
