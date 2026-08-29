@@ -41,7 +41,7 @@ progress reads `[k/work]` (files actually being embedded), not `[i/all-files]`.
 
 ## Embeddings: local or API
 
-Default is local FastEmbed/ONNX (`embedding_model: bge-small-en-v1.5`, nothing leaves the machine). Any OpenAI-compatible `/v1/embeddings` endpoint works too — DeepInfra, Nebius, OpenRouter, OpenAI, a self-hosted vLLM — via an `embedding:` block (`provider: openai-compatible`, `base_url`, `api_key_env`, optional `dimensions`, `batch_size`, `query_prefix`/`passage_prefix`); see [basic-kb.example.yaml](basic-kb.example.yaml). Keys come from the environment or the `env_file`, never the config. The model id stored with the index includes the provider model and requested dimensions, so changing either is refused until `index --switch-model`. Trade-off to make consciously: every chunk of your sources is sent to that provider.
+Default is local FastEmbed/ONNX (`embedding_model: bge-small-en-v1.5`, nothing leaves the machine). Any OpenAI-compatible `/v1/embeddings` endpoint works too — DeepInfra, Nebius, OpenRouter, OpenAI, a self-hosted vLLM — via an `embedding:` block (`provider: openai-compatible`, `base_url`, `api_key_env`, optional `dimensions`, `batch_size`, `concurrency` (requests in flight, default 64), `query_prefix`/`passage_prefix`); see [basic-kb.example.yaml](basic-kb.example.yaml). Keys come from the environment or the `env_file`, never the config. The model id stored with the index includes the provider model and requested dimensions, so changing either is refused until `index --switch-model`. Trade-off to make consciously: every chunk of your sources is sent to that provider.
 
 ## Store
 

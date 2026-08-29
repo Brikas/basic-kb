@@ -110,15 +110,23 @@ class OpenAICompatibleEmbedder(EmbedderBase):
     reported to the store includes the requested dimensions so a change forces a rebuild.
     """
 
+    # Requests kept in flight at once. Embedding endpoints are queue-bound: per-request
+    # latency stays ~4-9 s while aggregate throughput scales almost linearly with
+    # concurrency (measured on DeepInfra/Qwen3-8B: 17 chunks/s at 1, 445 chunks/s at 64,
+    # no 429s; account cap was 200). Cost is per token, so parallelism is free.
+    DEFAULT_CONCURRENCY = 64
+
     def __init__(self, model: str, base_url: str, api_key_env: str,
                  dimensions: Optional[int] = None, batch_size: int = 64,
                  query_prefix: str = "", passage_prefix: str = "",
-                 timeout: float = 60.0, max_retries: int = 5) -> None:
+                 timeout: float = 60.0, max_retries: int = 5,
+                 concurrency: int = DEFAULT_CONCURRENCY) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._api_key_env = api_key_env
         self._dimensions = int(dimensions) if dimensions else None
         self._batch_size = max(1, int(batch_size))
+        self._concurrency = max(1, int(concurrency))
         self._query_prefix = query_prefix
         self._passage_prefix = passage_prefix
         self._timeout = timeout
@@ -180,13 +188,19 @@ class OpenAICompatibleEmbedder(EmbedderBase):
         raise EmbeddingError("unreachable")
 
     def _embed_all(self, texts: list[str], prefix: str) -> list[list[float]]:
+        """Split into batches and send up to `concurrency` of them at once; order preserved.
+        One failed batch (after its own retries) fails the whole call — partial results
+        would leave a file half-embedded."""
         if not texts:
             return []
-        out: list[list[float]] = []
-        for i in range(0, len(texts), self._batch_size):
-            batch = [prefix + t for t in texts[i:i + self._batch_size]]
-            out.extend(self._post(batch))
-        return out
+        batches = [[prefix + t for t in texts[i:i + self._batch_size]]
+                   for i in range(0, len(texts), self._batch_size)]
+        if len(batches) == 1 or self._concurrency == 1:
+            return [v for b in batches for v in self._post(b)]
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(self._concurrency, len(batches))) as pool:
+            results = list(pool.map(self._post, batches))   # map keeps batch order
+        return [v for r in results for v in r]
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._embed_all(texts, self._passage_prefix)
@@ -227,5 +241,6 @@ def build_embedder(config, threads: Optional[int] = None) -> EmbedderBase:
             passage_prefix=str(emb.get("passage_prefix", "") or ""),
             timeout=float(emb.get("timeout", 60)),
             max_retries=int(emb.get("max_retries", 5)),
+            concurrency=int(emb.get("concurrency", OpenAICompatibleEmbedder.DEFAULT_CONCURRENCY)),
         )
     raise ValueError(f"unknown embedding.provider {provider!r}; use 'local' or 'openai-compatible'")

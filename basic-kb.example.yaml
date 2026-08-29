@@ -10,6 +10,7 @@ embedding_model: bge-small-en-v1.5   # local alias/HF id, or the provider's mode
 #   api_key_env: DEEPINFRA_API_KEY    # key is read from the environment / env_file, never from here
 #   dimensions: 1024                  # optional MRL truncation; refused if the provider ignores it
 #   batch_size: 64                    # texts per request
+#   concurrency: 64                   # requests in flight at once (throughput scales ~linearly; stay under the provider cap)
 #   query_prefix: ""                  # instruction-aware models; Qwen3-Embedding gets its official one by default
 #   passage_prefix: ""
 
