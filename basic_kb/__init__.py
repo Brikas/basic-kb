@@ -36,7 +36,7 @@ logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 # Scoped to the noisy dependencies, NOT global. A blanket filter here silences
 # every UserWarning in whatever process imports basic_kb — including deprecation
 # and misuse warnings from unrelated libraries in a host application.
-for _noisy in ("fastembed", "huggingface_hub", "onnxruntime", "chromadb", "transformers"):
+for _noisy in ("fastembed", "huggingface_hub", "onnxruntime", "transformers"):
     warnings.filterwarnings("ignore", category=UserWarning, module=rf"{_noisy}.*")
 
 # basic-kb's own event logger. Quiet by default (NullHandler drops records when no
@@ -45,20 +45,21 @@ logging.getLogger("basic_kb").addHandler(logging.NullHandler())
 
 from .config import Config, load_config, load_env_file
 from .core import KnowledgeBase, ScanResult
+from .store import SqliteVecStore, VacuumPolicy
 from .errors import (
-    BasicKBError, IndexNotFound, ManifestCorrupt, MassChangeRefused, QueryFailed,
+    BasicKBError, IndexNotFound, MassChangeRefused, QueryFailed, StoreError,
 )
 from .embedders import EmbedderBase, FastEmbedEmbedder
 from .models import Chunk, FileError, IndexResult, ParsedDocument, SearchResult, SourceStatus
 from .rerankers import JinaReranker, RerankerBase
 from .sources import DataSourceBase, MarkdownSource, TranscriptSource, build_source
 
-__version__ = "0.1.0"
+from .version import __version__  # noqa: E402
 
 __all__ = [
     "Config", "load_config", "load_env_file",
-    "KnowledgeBase", "ScanResult",
-    "BasicKBError", "IndexNotFound", "ManifestCorrupt", "MassChangeRefused", "QueryFailed",
+    "KnowledgeBase", "ScanResult", "SqliteVecStore", "StoreError", "VacuumPolicy",
+    "BasicKBError", "IndexNotFound", "MassChangeRefused", "QueryFailed", "StoreError",
     "EmbedderBase", "FastEmbedEmbedder",
     "RerankerBase", "JinaReranker",
     "Chunk", "ParsedDocument", "SearchResult",

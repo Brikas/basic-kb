@@ -1,8 +1,12 @@
-"""KnowledgeBase — orchestrates indexing and semantic search over DataSources."""
+"""KnowledgeBase — orchestrates indexing and semantic search over DataSources.
+
+Storage is SqliteVecStore (store.py): one SQLite file per instance holding vectors,
+chunk text, metadata and the per-file manifest. Search is exact cosine top-k. Why
+not an HNSW store: docs/adr/0001.
+"""
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import sys
@@ -14,10 +18,11 @@ from typing import Callable, Optional
 
 from .chunkers import DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK, DEFAULT_OVERLAP
 from .embedders import EmbedderBase
-from .errors import IndexNotFound, ManifestCorrupt, MassChangeRefused, QueryFailed
+from .errors import IndexNotFound, MassChangeRefused, QueryFailed, StoreError
 from .models import FileError, IndexResult, InstanceInfo, SearchResult, SourceInfo, SourceStatus
 from .rerankers import RerankerBase
 from .sources import DataSourceBase
+from .store import SqliteVecStore, VacuumPolicy
 
 DEFAULT_N = 15
 
@@ -98,7 +103,7 @@ class ScanResult:
     """Read-only diff of a source's files on disk vs. what was last indexed."""
     source_id: str
     label: str
-    tracked: bool        # False if no manifest yet (never indexed under the new scheme)
+    tracked: bool        # False if nothing indexed yet for this source
     files_on_disk: int
     new: int
     updated: int
@@ -115,61 +120,40 @@ class KnowledgeBase:
     """
     Orchestrates indexing and semantic search across one or more DataSources.
 
-    Each DataSource maps to its own ChromaDB collection (named by source_id).
-    Searching multiple sources merges and re-ranks results across collections.
+    All sources share one SQLite file; `source_id` partitions it. Searching multiple
+    sources merges and re-ranks results across them.
     """
 
     def __init__(
         self,
         embedder: EmbedderBase,
-        chroma_dir: Path,
+        store_dir: Path,
         reranker: Optional[RerankerBase] = None,
+        vacuum: Optional[VacuumPolicy] = None,
     ) -> None:
         self.embedder = embedder
-        self.chroma_dir = chroma_dir
+        self.store_dir = Path(store_dir)
+        self.store = SqliteVecStore(self.store_dir, vacuum=vacuum)
         self.reranker = reranker
-        # Serialises writes within this process. The manifest is a read-modify-write
-        # over a plain file — two concurrent index runs would lose one another's
-        # entries, and SQLite/WAL does not cover it because it is not in the store.
-        # Reentrant: index() holds it while calling helpers that take it too.
+        # Serialises writes within this process: SQLite allows one writer at a time and
+        # index()/reindex_paths() read-then-write. Reentrant: index() holds it while
+        # calling helpers that take it too.
         # NOTE: process-local. Two processes on one store still need external
         # coordination — see README.
         self._write_lock = threading.RLock()
 
-    def _client(self):
-        import chromadb
-        return chromadb.PersistentClient(path=str(self.chroma_dir))
+    # --- TEMPORARY: legacy Chroma store detection --------------------------------------
+    def legacy_chroma_leftovers(self) -> list[Path]:
+        """Pre-ADR-0001 ChromaDB files still present in store_dir (empty list = none).
 
-    # --- Manifest: every file seen at index time -> content hash, per source. -----
-    # Lets `scan` diff disk against the index without re-parsing, and correctly
-    # treats files too short to chunk as "seen" (not perpetually "new").
-    def _manifest_path(self) -> Path:
-        return self.chroma_dir / "manifest.json"
-
-    def _load_manifest(self) -> dict:
-        p = self._manifest_path()
-        if not p.exists():
-            return {}
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            # Absorbing this used to silently re-embed the whole source and leave
-            # scan/status permanently wrong. Fail loudly; deleting the file is a
-            # deliberate act, not something the library should do on your behalf.
-            raise ManifestCorrupt(
-                f"Manifest at {p} is not valid JSON ({e}). The index itself is intact — "
-                f"delete the file to rebuild it from the next full index run."
-            ) from e
-
-    def _save_manifest(self, manifest: dict) -> None:
-        """Write the manifest atomically — temp file in the same directory, then
-        os.replace. A plain write_text truncates first, so a crash mid-write leaves
-        a zero-byte file where a valid one used to be."""
-        self.chroma_dir.mkdir(parents=True, exist_ok=True)
-        target = self._manifest_path()
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, target)          # atomic within one filesystem
+        TEMPORARY (2026-08-29): remove together with SqliteVecStore.legacy_chroma_leftovers
+        once every instance on every machine has been rebuilt on sqlite-vec.
+        """
+        found = self.store.legacy_chroma_leftovers()
+        if found:
+            logger.warning("legacy ChromaDB store found in %s (%d item(s)); rebuild with `basic_kb index --force`",
+                           self.store_dir, len(found))
+        return found
 
     @staticmethod
     def _rel_path(source: DataSourceBase, f: Path) -> str:
@@ -179,8 +163,8 @@ class KnowledgeBase:
             return f.name
 
     def scan(self, source: DataSourceBase) -> ScanResult:
-        """Diff the source's files on disk against the manifest. Read-only; no embedding."""
-        manifest = self._load_manifest().get(source.source_id, {})
+        """Diff the source's files on disk against the stored manifest. Read-only; no embedding."""
+        manifest = self.store.manifest(source.source_id)
         tracked = bool(manifest)
         live = {self._rel_path(source, f): _file_hash(f) for f in source.get_files()}
 
@@ -200,26 +184,6 @@ class KnowledgeBase:
             files_on_disk=len(live), new=new, updated=updated,
             unchanged=unchanged, deleted=deleted,
         )
-
-    def _get_collection(self, client, collection_name: str):
-        """Get or create a named ChromaDB collection, clearing on EF conflict."""
-        ef = self.embedder.as_chroma_ef()
-        try:
-            return client.get_or_create_collection(
-                name=collection_name,
-                embedding_function=ef,
-                metadata={"hnsw:space": "cosine"},
-            )
-        except ValueError as exc:
-            if "embedding function conflict" not in str(exc).lower():
-                raise
-            logger.warning("embedding function changed for %r — clearing old index", collection_name)
-            client.delete_collection(collection_name)
-            return client.create_collection(
-                name=collection_name,
-                embedding_function=ef,
-                metadata={"hnsw:space": "cosine"},
-            )
 
     def _guard_allows(
         self, source: DataSourceBase, changed: int, deleted: int,
@@ -259,6 +223,15 @@ class KnowledgeBase:
         if on_progress is not None:
             on_progress(msg)
 
+    def _write_file(self, source: DataSourceBase, rel_path: str, file_hash: str, chunks) -> None:
+        """Embed one file's chunks and replace whatever the store held for that file."""
+        ids = [f"{rel_path}::{c.id_suffix}" for c in chunks]
+        docs = [c.text for c in chunks]
+        metas = [{**c.metadata, "rel_path": rel_path, "content_hash": file_hash} for c in chunks]
+        embeddings = self.embedder.embed(docs) if docs else []
+        self.store.replace_file(source.source_id, rel_path, file_hash, ids, docs, metas, embeddings,
+                                model_id=self.embedder.model_id)
+
     def index(
         self,
         source: DataSourceBase,
@@ -275,7 +248,7 @@ class KnowledgeBase:
         on_progress: Optional[Callable[[str], None]] = None,
         on_confirm: Optional[Callable[[MassChangeRefused], bool]] = None,
     ) -> IndexResult:
-        """Index a DataSource into its own ChromaDB collection.
+        """Index a DataSource into the store.
 
         Returns an IndexResult describing what happened — including `aborted=True`
         when the mass-change guard stopped the run, and `errors` listing any files
@@ -285,9 +258,8 @@ class KnowledgeBase:
         `limit` caps the number of files (first N, stable order). `pause_ms` and
         `pause_every` throttle CPU duty between embedded files.
 
-        The manifest is written even if the run raises partway, recording only the
-        files that actually completed — so an interrupted run resumes rather than
-        starting over.
+        Each file is committed as it completes, so an interrupted run resumes rather
+        than starting over.
         """
         with self._write_lock:
             return self._index_locked(
@@ -314,27 +286,15 @@ class KnowledgeBase:
             files = files[:limit]
             self._emit(on_progress, f"[limit] indexing only the first {len(files)} file(s).")
 
-        client = self._client()
+        if not force:
+            self.store.check_model(self.embedder.model_id)   # raises StoreError on a model switch
         if force:
-            try:
-                client.delete_collection(source.source_id)
-                self._emit(on_progress, f"Cleared existing index for {source.source_id!r}.")
-            except Exception as e:
-                # Nothing to clear is the normal case on a first run; anything else
-                # is worth a log line rather than a silent pass.
-                logger.debug("force delete_collection(%s): %s", source.source_id, e)
-
-        col = self._get_collection(client, source.source_id)
-
-        # Snapshot what's already indexed, keyed by each file's relative path.
-        snap = col.get(include=["metadatas"])
-        ids_by_file: dict[str, list[str]] = {}
-        for cid, meta in zip(snap["ids"], snap["metadatas"]):
-            rp = meta.get("rel_path") or meta.get("file") or cid.split("::")[0]
-            ids_by_file.setdefault(rp, []).append(cid)
+            n = self.store.clear_source(source.source_id)
+            if n:
+                self._emit(on_progress, f"Cleared existing index for {source.source_id!r} ({n} chunks).")
 
         # Pre-scan: hash every file once and decide the real work up front.
-        prev_manifest: dict = {} if force else self._load_manifest().get(source.source_id, {})
+        prev_manifest: dict = {} if force else self.store.manifest(source.source_id)
         entries = [(f, self._rel_path(source, f), _file_hash(f)) for f in files]
         seen: dict[str, str] = {rp: h for _, rp, h in entries}
         to_process = [(f, rp, h) for f, rp, h in entries if prev_manifest.get(rp) != h]
@@ -370,77 +330,49 @@ class KnowledgeBase:
         if work_total == 0 and not deleted_files:
             self._emit(on_progress, "  Already up to date — nothing to embed.")
 
-        # Manifest entry built as work completes, so an interrupted run records only
-        # what really finished. A full run starts empty (deleted files drop out); a
-        # --limit run starts from the previous entry, since it only sees a subset.
-        done: dict[str, str] = {} if limit is None else dict(prev_manifest)
-        for _, rp, h in entries:
-            if prev_manifest.get(rp) == h:
-                done[rp] = h                      # unchanged: already correct
-
+        was_indexed_files = set(self.store.chunk_ids_by_file(source.source_id))
         since_pause = 0
-        try:
-            for processed, (f, rel_path, file_hash) in enumerate(to_process, 1):
-                was_indexed = rel_path in ids_by_file
-                try:
-                    doc = source.parse_file(f)
-                    chunks = chunker.chunk(doc) if doc is not None else []
-                except Exception as e:
-                    # One unreadable file must not abandon a run that has already
-                    # embedded hundreds. Record it and carry on; the manifest simply
-                    # does not learn this file, so the next run retries it.
-                    logger.exception("index: failed to parse %s/%s", source.source_id, rel_path)
-                    result.errors.append(FileError(rel_path=rel_path, error=f"{type(e).__name__}: {e}"))
-                    self._emit(on_progress, f"  [{processed}/{work_total}] SKIPPED {rel_path} — {e}")
-                    continue
+        for processed, (f, rel_path, file_hash) in enumerate(to_process, 1):
+            was_indexed = rel_path in was_indexed_files
+            try:
+                doc = source.parse_file(f)
+                chunks = chunker.chunk(doc) if doc is not None else []
+            except Exception as e:
+                # One unreadable file must not abandon a run that has already
+                # embedded hundreds. Record it and carry on; the manifest simply
+                # does not learn this file, so the next run retries it.
+                logger.exception("index: failed to parse %s/%s", source.source_id, rel_path)
+                result.errors.append(FileError(rel_path=rel_path, error=f"{type(e).__name__}: {e}"))
+                self._emit(on_progress, f"  [{processed}/{work_total}] SKIPPED {rel_path} — {e}")
+                continue
 
-                if not chunks:
-                    result.empty += 1
-                    if was_indexed:
-                        col.delete(ids=ids_by_file[rel_path])
-                    done[rel_path] = file_hash
-                    continue
+            if not chunks:
+                result.empty += 1
+                # Tracked (hash recorded) but holds no chunks — drops any old ones.
+                self.store.replace_file(source.source_id, rel_path, file_hash, [], [], [], [],
+                                        model_id=self.embedder.model_id)
+                continue
 
-                verb = "re-embedding" if was_indexed else "embedding"
-                self._emit(on_progress,
-                           f"  [{processed}/{work_total}] {verb} {rel_path}  ({len(chunks)} chunks)")
+            verb = "re-embedding" if was_indexed else "embedding"
+            self._emit(on_progress,
+                       f"  [{processed}/{work_total}] {verb} {rel_path}  ({len(chunks)} chunks)")
+            # Each file is one committed transaction: a crash at file 400 of 450 keeps 400.
+            self._write_file(source, rel_path, file_hash, chunks)
+            result.updated += 1 if was_indexed else 0
+            result.added += 0 if was_indexed else 1
 
-                if was_indexed:
-                    col.delete(ids=ids_by_file[rel_path])
+            if pause_ms > 0 and pause_every > 0:
+                since_pause += 1
+                if since_pause >= pause_every:
+                    time.sleep(pause_ms / 1000.0)
+                    since_pause = 0
 
-                new_ids, new_docs, new_metas = [], [], []
-                for chunk in chunks:
-                    new_ids.append(f"{rel_path}::{chunk.id_suffix}")
-                    new_docs.append(chunk.text)
-                    new_metas.append({**chunk.metadata, "rel_path": rel_path,
-                                      "content_hash": file_hash})
-                col.add(documents=new_docs, metadatas=new_metas, ids=new_ids)
-                done[rel_path] = file_hash
-                result.updated += 1 if was_indexed else 0
-                result.added += 0 if was_indexed else 1
+        # Prune files that no longer exist on disk. Full runs only — a --limit run
+        # sees a subset, so absent files there are not actually deleted.
+        if limit is None and deleted_files:
+            result.pruned = self.store.remove_files(source.source_id, deleted_files)
 
-                if pause_ms > 0 and pause_every > 0:
-                    since_pause += 1
-                    if since_pause >= pause_every:
-                        time.sleep(pause_ms / 1000.0)
-                        since_pause = 0
-
-            # Prune files that no longer exist on disk. Full runs only — a --limit run
-            # sees a subset, so absent files there are not actually deleted.
-            if limit is None and deleted_files:
-                stale_ids = [cid for rp in deleted_files if rp in ids_by_file
-                             for cid in ids_by_file[rp]]
-                if stale_ids:
-                    col.delete(ids=stale_ids)
-                result.pruned = len(deleted_files)
-        finally:
-            # Always persist what completed, including on an exception. Without this a
-            # crash at file 400 of 450 throws away 400 files of work.
-            manifest = self._load_manifest()
-            manifest[source.source_id] = done
-            self._save_manifest(manifest)
-
-        result.total_chunks = col.count()
+        result.total_chunks = self.store.count(source.source_id)
         self._emit(on_progress, (
             f"\nDone [{source.source_id}].\n"
             f"  files:  new={result.added} updated={result.updated} "
@@ -462,7 +394,7 @@ class KnowledgeBase:
         Deleted files are returned as their (now non-existent) path so reindex_paths
         can prune them. Used for the watcher's startup reconcile of offline edits.
         """
-        manifest = self._load_manifest().get(source.source_id, {})
+        manifest = self.store.manifest(source.source_id)
         live = {self._rel_path(source, f): f for f in source.get_files()}
         changed = [f for rp, f in live.items() if manifest.get(rp) != _file_hash(f)]
         deleted = [source.directory / rp for rp in manifest if rp not in live]
@@ -480,7 +412,7 @@ class KnowledgeBase:
 
         Embeds created/changed files, drops chunks for files that became empty, prunes
         deleted files, and updates just those manifest entries. Returns a counts dict.
-        Callers must serialize this (one writer) — ChromaDB is not multi-writer safe.
+        Callers must serialize this (one writer).
         """
         with self._write_lock:
             return self._reindex_paths_locked(source, paths, chunk_size, overlap, min_chunk)
@@ -494,59 +426,40 @@ class KnowledgeBase:
         if not rels:
             return counts
 
-        client = self._client()
-        col = self._get_collection(client, source.source_id)
         chunker = source.make_chunker(chunk_size, overlap, min_chunk)
-
-        # Existing chunk ids for just these files. rel_path metadata exists for anything
-        # (re)indexed under the manifest scheme, which the watcher's startup reconcile
-        # guarantees before per-file events are handled.
-        ids_by_file: dict[str, list[str]] = {}
-        got = col.get(where={"rel_path": {"$in": list(rels)}}, include=["metadatas"])
-        for cid, meta in zip(got["ids"], got["metadatas"]):
-            rp = meta.get("rel_path") or cid.split("::")[0]
-            ids_by_file.setdefault(rp, []).append(cid)
-
-        manifest = self._load_manifest()
-        src_manifest = manifest.setdefault(source.source_id, {})
-        for rp, p in rels.items():
-            old_ids = ids_by_file.get(rp, [])
-            if not p.exists():                       # deleted → prune + forget
-                if old_ids:
-                    col.delete(ids=old_ids)
-                src_manifest.pop(rp, None)
-                counts["pruned"] += 1
+        manifest = self.store.manifest(source.source_id)
+        gone = [rp for rp, p in rels.items() if not p.exists()]
+        if gone:
+            counts["pruned"] = self.store.remove_files(source.source_id, gone)
+            for rp in gone:
                 logger.info("reindex_paths: pruned %s/%s", source.source_id, rp)
-                continue
 
+        for rp, p in rels.items():
+            if not p.exists():
+                continue
             file_hash = _file_hash(p)
             # Unchanged content already in the index: nothing to do. Guards against
-            # mtime-only touches and spurious watcher events; a re-embed of identical
-            # text just bloats the HNSW index (deleted vectors are never reclaimed).
-            if old_ids and src_manifest.get(rp) == file_hash:
+            # mtime-only touches and spurious watcher events.
+            if manifest.get(rp) == file_hash:
                 counts["unchanged"] += 1
                 logger.debug("reindex_paths: unchanged %s/%s", source.source_id, rp)
                 continue
             doc = source.parse_file(p)
             chunks = chunker.chunk(doc) if doc is not None else []
-            if old_ids:                              # replace: drop old chunks first
-                col.delete(ids=old_ids)
-            src_manifest[rp] = file_hash             # track even if it yields no chunks
             if not chunks:
+                self.store.replace_file(source.source_id, rp, file_hash, [], [], [], [],
+                                        model_id=self.embedder.model_id)
                 counts["empty"] += 1
                 continue
-
-            new_ids, new_docs, new_metas = [], [], []
-            for chunk in chunks:
-                new_ids.append(f"{rp}::{chunk.id_suffix}")
-                new_docs.append(chunk.text)
-                new_metas.append({**chunk.metadata, "rel_path": rp, "content_hash": file_hash})
-            col.add(documents=new_docs, metadatas=new_metas, ids=new_ids)
+            self._write_file(source, rp, file_hash, chunks)
             counts["embedded"] += 1
             logger.info("reindex_paths: embedded %s/%s (%d chunks)", source.source_id, rp, len(chunks))
-
-        self._save_manifest(manifest)
         return counts
+
+    def vacuum(self) -> bool:
+        """Compact the store file now, regardless of the auto-vacuum policy."""
+        with self._write_lock:
+            return self.store.vacuum(reason="requested")
 
     def search(
         self,
@@ -568,13 +481,9 @@ class KnowledgeBase:
         same information need (they reinforce recall). For n hits *per* query instead,
         use search_grouped(). With timing=True, prints per-phase durations.
         """
-        if not self.chroma_dir.exists():
-            raise IndexNotFound(
-                f"No index at {self.chroma_dir}. Run: python -m basic_kb index"
-            )
-        client = self._client()
+        self._require_store()
         return self._run_query_group(
-            client, sources, queries, n, content_type_filter, rerank_candidates,
+            sources, queries, n, content_type_filter, rerank_candidates,
             cand_multiplier, cand_min, cand_max, strict_rerank, timing,
         )
 
@@ -596,22 +505,24 @@ class KnowledgeBase:
         Returns [(query, hits), ...] — no cross-query merging. Best when the queries ask
         for *different* things in one call and you want a full result set for each.
         """
-        if not self.chroma_dir.exists():
-            raise IndexNotFound(
-                f"No index at {self.chroma_dir}. Run: python -m basic_kb index"
-            )
-        client = self._client()
+        self._require_store()
         out: list[tuple[str, list[SearchResult]]] = []
         for q in queries:
             hits = self._run_query_group(
-                client, sources, [q], n, content_type_filter, rerank_candidates,
+                sources, [q], n, content_type_filter, rerank_candidates,
                 cand_multiplier, cand_min, cand_max, strict_rerank, timing, timing_label=q,
             )
             out.append((q, hits))
         return out
 
+    def _require_store(self) -> None:
+        if not self.store.exists():
+            raise IndexNotFound(
+                f"No index at {self.store.path}. Run: python -m basic_kb index"
+            )
+
     def _run_query_group(
-        self, client, sources: list[DataSourceBase], queries: list[str], n: int,
+        self, sources: list[DataSourceBase], queries: list[str], n: int,
         content_type_filter: Optional[str], rerank_candidates: Optional[int],
         cand_multiplier: int, cand_min: int, cand_max: int,
         strict_rerank: bool, timing: bool, timing_label: str = "",
@@ -623,7 +534,7 @@ class KnowledgeBase:
         t0 = time.perf_counter()
         t_embed = t_retrieve = t_rerank = 0.0
         best: dict[str, SearchResult] = {}
-        missing: list[str] = []      # sources with no collection yet
+        missing: list[str] = []      # sources with nothing indexed yet
         resolved = 0                 # sources that actually got queried
 
         if self.reranker and rerank_candidates is None:
@@ -633,38 +544,25 @@ class KnowledgeBase:
             rerank_candidates = min(max(n * cand_multiplier, cand_min), hi)
         fetch_n = (rerank_candidates or n) if self.reranker else n
 
+        self.store.check_model(self.embedder.model_id)       # wrong model = confident nonsense; refuse
+        # Embed each query once; the same vector serves every source.
+        _te = time.perf_counter()
+        q_embs = [self.embedder.query_embed([q])[0] for q in queries]
+        t_embed += time.perf_counter() - _te
+
         for source in sources:
-            try:
-                col = client.get_collection(
-                    name=source.source_id,
-                    embedding_function=self.embedder.as_chroma_ef(),
-                )
-            except Exception as e:
+            if not self.store.source_indexed(source.source_id):
                 # One un-indexed source among several is a normal, recoverable state.
                 # Every source missing is not — that is caught after the loop.
-                logger.warning("search: no index for source=%s (%s)", source.source_id, e)
+                logger.warning("search: no index for source=%s", source.source_id)
                 missing.append(source.source_id)
                 continue
             resolved += 1
 
-            where: Optional[dict] = None
-            if content_type_filter:
-                where = {"content_type": {"$eq": content_type_filter}}
-
-            for q in queries:
-                _te = time.perf_counter()
-                q_emb = self.embedder.query_embed([q])
-                t_embed += time.perf_counter() - _te
-                kwargs: dict = {
-                    "query_embeddings": q_emb,
-                    "n_results": fetch_n,
-                    "include": ["documents", "metadatas", "distances"],
-                }
-                if where:
-                    kwargs["where"] = where
+            for q_emb in q_embs:
                 try:
                     _tr = time.perf_counter()
-                    results = col.query(**kwargs)
+                    rows = self.store.knn(source.source_id, q_emb, fetch_n, content_type_filter)
                     t_retrieve += time.perf_counter() - _tr
                 except Exception as e:
                     # Swallowing this returned an empty list indistinguishable from
@@ -673,16 +571,11 @@ class KnowledgeBase:
                         f"Query failed on source {source.source_id!r}: {e}"
                     ) from e
 
-                for doc_id, doc, meta, dist in zip(
-                    results["ids"][0],
-                    results["documents"][0],
-                    results["metadatas"][0],
-                    results["distances"][0],
-                ):
-                    full_id = f"{source.source_id}::{doc_id}"
-                    score = 1.0 - dist
+                for row in rows:
+                    full_id = f"{source.source_id}::{row.chunk_id}"
+                    score = 1.0 - row.distance
                     if full_id not in best or score > best[full_id].score:
-                        best[full_id] = SearchResult(doc=doc, metadata=meta, score=score)
+                        best[full_id] = SearchResult(doc=row.doc, metadata=row.metadata, score=score)
 
         if resolved == 0:
             raise IndexNotFound(
@@ -736,22 +629,9 @@ class KnowledgeBase:
         A source with no index yet comes back with chunks=0 and indexed=False rather
         than raising; an un-indexed source among several is a normal state.
         """
-        client = self._client() if self.chroma_dir.exists() else None
         out: list[SourceInfo] = []
-
         for source in sources:
-            chunks, indexed = 0, False
-            if client is not None:
-                try:
-                    col = client.get_collection(
-                        name=source.source_id,
-                        embedding_function=self.embedder.as_chroma_ef(),
-                    )
-                    chunks = col.count()
-                    indexed = chunks > 0
-                except Exception as e:
-                    logger.info("info: no collection for source=%s (%s)", source.source_id, e)
-
+            chunks = self.store.count(source.source_id)
             out.append(SourceInfo(
                 source_id=source.source_id,
                 label=source.label,
@@ -760,13 +640,13 @@ class KnowledgeBase:
                 chunker=source.chunker_name,
                 files=len(source.get_files()),
                 chunks=chunks,
-                indexed=indexed,
+                indexed=chunks > 0,
             ))
 
         return InstanceInfo(
             name=name,
             model_id=self.embedder.model_id,
-            store_dir=str(self.chroma_dir),
+            store_dir=str(self.store_dir),
             sources=out,
         )
 
@@ -777,12 +657,7 @@ class KnowledgeBase:
         merely un-indexed comes back with `indexed=False` rather than an exception,
         because that is a normal state in a multi-source instance.
         """
-        if not self.chroma_dir.exists():
-            raise IndexNotFound(
-                f"No index at {self.chroma_dir}. Run: python -m basic_kb index"
-            )
-
-        client = self._client()
+        self._require_store()
         out: list[SourceStatus] = []
 
         for source in sources:
@@ -790,24 +665,19 @@ class KnowledgeBase:
                 source_id=source.source_id,
                 label=source.label,
                 directory=str(source.directory),
-                store_dir=str(self.chroma_dir),
+                store_dir=str(self.store_dir),
                 model_id=self.embedder.model_id,
                 directory_exists=source.directory.exists(),
                 indexed=False,
             )
 
-            try:
-                col = client.get_collection(
-                    name=source.source_id,
-                    embedding_function=self.embedder.as_chroma_ef(),
-                )
-            except Exception as e:
-                logger.info("status: no collection for source=%s (%s)", source.source_id, e)
+            if not self.store.source_indexed(source.source_id):
+                logger.info("status: nothing indexed for source=%s", source.source_id)
                 out.append(st)
                 continue
 
             st.indexed = True
-            st.chunks = col.count()
+            st.chunks = self.store.count(source.source_id)
 
             res = self.scan(source)
             st.files_on_disk = res.files_on_disk
@@ -818,7 +688,7 @@ class KnowledgeBase:
                 out.append(st)
                 continue
 
-            all_metas: list[dict] = col.get(include=["metadatas"])["metadatas"]
+            all_metas = self.store.all_metadata(source.source_id)
             st.docs_with_chunks = len({m.get("rel_path") or m.get("file") for m in all_metas})
 
             dates = sorted(

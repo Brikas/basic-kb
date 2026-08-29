@@ -1,4 +1,6 @@
-"""Embedding backends. Local FastEmbed/ONNX by default (no API, no network)."""
+"""Embedding backends. Local FastEmbed/ONNX by default (no API, no network).
+
+Embedders return plain lists of floats; the store (store.py) packs them itself."""
 from __future__ import annotations
 
 import threading
@@ -22,21 +24,6 @@ class EmbedderBase(ABC):
     def query_embed(self, texts: list[str]) -> list[list[float]]:
         """Embed query-side text. Override for asymmetric models (e.g. BGE)."""
         return self.embed(texts)
-
-    def as_chroma_ef(self):
-        import chromadb
-        embedder = self
-
-        class _ChromaEF(chromadb.EmbeddingFunction):
-            def __init__(self) -> None:
-                pass
-
-            def __call__(self, input):
-                return embedder.embed(input)
-
-        ef = _ChromaEF()
-        ef.__class__.__name__ = f"FastEmbed_{embedder.model_id.replace('/', '_')}"
-        return ef
 
     @classmethod
     def resolve(cls, alias: str) -> str:

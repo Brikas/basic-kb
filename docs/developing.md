@@ -16,7 +16,8 @@ any specific dataset lives in the code.
 ```
 KnowledgeBase
 ├── EmbedderBase (ABC)
-│   └── FastEmbedEmbedder   — ONNX-backed local embeddings via fastembed
+│   └── FastEmbedEmbedder   — ONNX-backed local embeddings via fastembed (returns list[list[float]])
+├── SqliteVecStore          — one SQLite file: vec0 vectors + chunks + per-file manifest; auto-VACUUM
 ├── RerankerBase (ABC)         — pluggable via RERANKER_TYPES; `reranker:` config picks one
 │   ├── FastEmbedReranker   — local ONNX cross-encoder (no API key)
 │   └── JinaReranker        — Jina AI API (/v1/rerank)
@@ -25,13 +26,13 @@ KnowledgeBase
 
 **Flow — index:**
 1. `build_source()` builds each configured source; `parse_file()` → ParsedDocument
-2. The source's chunker splits the body into Chunks
-3. `FastEmbedEmbedder.embed()` → ChromaDB collection via custom `_ChromaEF` wrapper
-4. Store chunk IDs, docs, metadata; skip already-indexed IDs
+2. Hash every file; only files whose hash differs from the store's `files` table are processed
+3. The source's chunker splits the body into Chunks; `FastEmbedEmbedder.embed()` (batched, `embed_batch_size`)
+4. `SqliteVecStore.replace_file()` swaps that file's rows atomically (chunks + vectors + hash); one commit per file
 
 **Flow — search:**
-1. Embed each query via the same `FastEmbedEmbedder`
-2. `col.query()` per query, merge results by chunk ID (keep highest cosine score)
+1. Embed each query once via the same `FastEmbedEmbedder`
+2. `SqliteVecStore.knn()` per source (exact cosine, `k`, optional `content_type`), merge by chunk id (keep highest score)
 3. Optional: send top-N candidates to `JinaReranker.rerank()` → reorder by cross-attention score
 4. Print results with both cosine score and rerank score (when reranking)
 
@@ -42,30 +43,29 @@ KnowledgeBase
 | File | Purpose |
 |---|---|
 | `basic_kb/models.py` | Dataclasses: SearchResult, ParsedDocument, Chunk |
-| `basic_kb/embedders.py` | EmbedderBase, FastEmbedEmbedder, ChromaDB EF wrapper |
+| `basic_kb/embedders.py` | EmbedderBase, FastEmbedEmbedder (batch size bounds peak RAM) |
 | `basic_kb/rerankers.py` | RerankerBase, FastEmbedReranker, JinaReranker, `build_reranker` |
 | `basic_kb/textsplit.py` | Recursive character splitter (`split_text`) |
 | `basic_kb/chunkers.py` | ChunkerBase, RecursiveChunker, BreadcrumbHeadingChunker, `build_chunker` |
 | `basic_kb/sources.py` | DataSourceBase, MarkdownSource, TranscriptSource, `build_source` |
-| `basic_kb/core.py` | KnowledgeBase — index / search / status / scan; ScanResult + manifest |
-| `<instance>/.chroma/manifest.json` | per-source `{rel_path: hash}` of every file seen at index time; powers `scan` |
-| `<instance>/.chroma/freshness_state.json` | per-source last freshness-check timestamp |
+| `basic_kb/store.py` | SqliteVecStore — vec0 + chunks + files tables, KNN, auto-VACUUM policy, model guard |
+| `basic_kb/core.py` | KnowledgeBase — index / reindex_paths / search / status / scan / info over the store |
+| `<store_dir>/kb.sqlite3` | the whole index: vectors, chunk text, metadata, per-file hashes (`files` table powers `scan`) |
+| `<store_dir>/freshness_state.json` | per-source last freshness-check timestamp |
 | `basic_kb/config.py` | Instance config + dotenv (`env_file`) loading |
 | `basic_kb/cli.py` | argparse, commands, result printing |
-| `<instance>/.chroma/` | Persistent ChromaDB index, lives next to the config (gitignored) |
+| `docs/adr/` | architecture decision records; 0001 = why sqlite-vec + exact search |
 
 ---
 
-## ChromaDB integration details
+## sqlite-vec store details
 
-ChromaDB (v1.5.9+) uses a `Protocol`-based `EmbeddingFunction` with `__init_subclass__` that wraps `__call__` with validation. The inner `_ChromaEF` class in `as_chroma_ef()` must:
-- Define `__init__` (even as a no-op) — the base class `__init__` is a sentinel that always warns
-- Define `__call__` returning native Python `list[list[float]]` (not numpy types)
-- Have a stable `__class__.__name__` so ChromaDB can detect EF conflicts on collection re-open
-
-Changing the embedding model requires `index --force` — ChromaDB detects mismatches via the class name and raises `ValueError: embedding function conflict`.
-
----
+- One `vec0` virtual table for all sources: `source` is a **partition key** (pre-filters the scan), `content_type` a **metadata column** (filterable in the KNN `WHERE`), `embedding FLOAT[d] distance_metric=cosine`. `rowid` equals `chunks.id`. Metadata columns are strictly typed and **reject NULL** — the store writes `''` for a missing content_type.
+- The vector table is created on the first write and its dimension is fixed. `model_id`/`dim` live in `meta`; `check_model()` refuses index/search with a different model, and `clear_source()` drops the table once no chunks remain so `index --force --source all` can switch models.
+- Every store method opens its own connection (`PRAGMA journal_mode=WAL`), loads the extension, and closes — thread-safe reads; writers are serialised by `KnowledgeBase._write_lock` (process-local).
+- Auto-vacuum: `meta.deleted_since_vacuum` counts deleted rows; `_maybe_vacuum()` runs after every write and VACUUMs when the policy (`VacuumPolicy`, from the `vacuum:` block) says so. A `database is locked` during VACUUM is logged and retried on the next write, never raised.
+- Extension loading needs `sqlite3.Connection.enable_load_extension`; some Python builds lack it (historically python.org macOS) and get a `StoreError` naming the fix.
+- TEMPORARY (2026-08-29): `legacy_chroma_leftovers()` + the CLI notice detect a pre-sqlite-vec `.chroma` store and tell the user to `index --force`. Delete both once all instances are migrated.
 
 ## Model support
 
@@ -78,35 +78,17 @@ Adding a new reranker: subclass `RerankerBase`, implement `rerank()`, and regist
 
 ## Gotchas
 
-### 2026-05-11 — FastEmbed returns `np.float32`, ChromaDB rejects it
 
-`list(numpy_array)` produces `[np.float32(...), ...]` which ChromaDB's `normalize_embeddings` rejects with:
-```
-ValueError: Expected embeddings to be a list of floats or ints...
-```
-**Fix:** use `.tolist()` instead — it recursively converts numpy scalars to native Python types.
 
-```python
-# Wrong
-return [list(v) for v in self._model.embed(texts)]
+### 2026-08-29 — a watcher that reacts to inotify read events loops on itself
 
-# Correct
-return [v.tolist() for v in self._model.embed(texts)]
-```
+watchdog ≥ 4 on Linux emits `opened`/`closed_no_write` for plain reads. The watcher's own reindex reads the file, so an unfiltered handler re-queued every file it had just processed and looped at the debounce period; Chroma's HNSW then grew 145× from the delete+add churn and the process was OOM-killed. `_Handler.dispatch` ignores those event types and `reindex_paths` skips unchanged hashes. Do not remove either.
 
 ---
 
-### 2026-05-11 — `super().__init__()` in ChromaDB EF subclass always warns
+### 2026-08-29 — fastembed's default `batch_size=256` peaks at ~4 GB on one 241-chunk file
 
-`chromadb.EmbeddingFunction.__init__` is a sentinel: it unconditionally emits a `DeprecationWarning` saying the subclass doesn't implement `__init__`. Calling `super().__init__()` from your subclass triggers that warning every time.
-
-**Fix:** define `__init__` as a plain `pass` — do NOT call super.
-
-```python
-class _ChromaEF(chromadb.EmbeddingFunction):
-    def __init__(self) -> None:
-        pass  # do not call super().__init__()
-```
+Attention memory ∝ batch × seq_len² and onnxruntime's arena never returns the peak. `embed_batch_size` (default 8) bounds it at ~0.5 GB with identical throughput. Measured on bge-small, 2 threads.
 
 ---
 

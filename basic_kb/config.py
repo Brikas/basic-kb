@@ -116,13 +116,16 @@ class Config:
     path: Path           # the config file itself
     base_dir: Path       # directory containing the config (anchor for rel paths)
     name: str
-    store_dir: Path      # ChromaDB persistent store for this instance
+    store_dir: Path      # directory holding kb.sqlite3 (sqlite-vec store) for this instance
     embedding_model: str
     chunk_size: int
     overlap: int
     min_chunk: int
     sources: list[dict]  # raw source entries; built via sources.build_source()
     embed_batch_size: int = 8          # texts per embedding forward pass; bounds peak RAM (see embedders.py)
+    vacuum_enabled: bool = True        # auto-VACUUM the store when enough rows were deleted (see store.py)
+    vacuum_deleted_fraction: float = 0.2  # deleted-since-vacuum / live rows that triggers it (Qdrant's default)
+    vacuum_min_deleted: int = 1000     # ...but never for fewer deleted rows than this
     reranker_type: str = "none"        # none | local | jina
     reranker_model: Optional[str] = None
     cand_multiplier: int = 3           # candidates to rerank = clamp(n*mult, min, max)
@@ -206,6 +209,14 @@ def load_config(config_path: Path) -> Config:
 
     fresh = data.get("freshness", {}) or {}
 
+    # `vacuum:` may be a bare bool (vacuum: false) or a mapping ({enabled, deleted_fraction, min_deleted}).
+    vac_raw = data.get("vacuum", {})
+    if isinstance(vac_raw, bool):
+        vac, vac_enabled = {}, vac_raw
+    else:
+        vac = vac_raw or {}
+        vac_enabled = bool(vac.get("enabled", True))
+
     thr = data.get("throttle", {}) or {}
     thr_cores = thr.get("cores_fraction")
 
@@ -223,9 +234,12 @@ def load_config(config_path: Path) -> Config:
         path=config_path,
         base_dir=base_dir,
         name=data.get("name", config_path.stem),
-        store_dir=_resolve(base_dir, data.get("store_dir", ".chroma")),
+        store_dir=_resolve(base_dir, data.get("store_dir", ".basic-kb")),
         embedding_model=data.get("embedding_model", DEFAULT_MODEL),
         embed_batch_size=int(data.get("embed_batch_size", 8)),
+        vacuum_enabled=vac_enabled,
+        vacuum_deleted_fraction=float(vac.get("deleted_fraction", 0.2)),
+        vacuum_min_deleted=int(vac.get("min_deleted", 1000)),
         chunk_size=int(chunker_cfg.get("max_chunk_size", DEFAULT_CHUNK_SIZE)),
         overlap=int(chunker_cfg.get("overlap", DEFAULT_OVERLAP)),
         min_chunk=int(chunker_cfg.get("min_chunk_size", DEFAULT_MIN_CHUNK)),

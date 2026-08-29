@@ -2,7 +2,7 @@
 
 One run watches every enabled source directory recursively. File events feed a single
 per-file debounce scheduler; when a file has been quiet for `debounce_seconds` it is
-handed to a single reindex worker, so ChromaDB only ever has one writer. Cross-platform
+handed to a single reindex worker, so the store only ever has one writer. Cross-platform
 via watchdog: FSEvents (macOS), ReadDirectoryChangesW (Windows), inotify (Linux), plus
 a polling backend for filesystems that don't emit native events.
 
@@ -63,7 +63,7 @@ class _Pending:
 class _Engine:
     """Owns the pending map and the single reindex worker thread.
 
-    Observer threads only ever call notify() (cheap, under lock); all ChromaDB writes
+    Observer threads only ever call notify() (cheap, under lock); all store writes
     happen on this one worker thread, so there is never concurrent access.
     """
     kb: KnowledgeBase
@@ -164,7 +164,7 @@ def run_watch(kb: KnowledgeBase, watched: list[tuple[DataSourceBase, WatchSettin
         stale = kb.stale_paths(source)
         if not stale:
             continue
-        base = len(kb._load_manifest().get(source.source_id, {}))
+        base = len(kb.store.manifest(source.source_id))
         # Reuse the corruption guard: a huge offline delta is likely a moved/broken
         # source, not real edits — don't silently re-embed it unattended.
         if (config.reindex_guard and base and

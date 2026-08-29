@@ -4,7 +4,7 @@ Built-in source types (selected via `type:` in an instance config):
   transcript — speaker-tagged .md transcripts (tl;dv style)
   markdown   — .md files with optional YAML frontmatter (web copy, notes, docs)
 
-Each source maps to its own ChromaDB collection named by its `id`.
+Each source is a partition of the store, keyed by its `id`.
 Add a new type by subclassing DataSourceBase and registering it in SOURCE_TYPES.
 """
 from __future__ import annotations
@@ -126,7 +126,7 @@ class DataSourceBase(ABC):
 
     @property
     def source_id(self) -> str:
-        """Short identifier used as the ChromaDB collection name and --source value."""
+        """Short identifier used as the store partition key and --source value."""
         return self._id
 
     @property

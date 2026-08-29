@@ -32,11 +32,14 @@ from pathlib import Path
 from typing import Optional
 
 from .config import Config, find_config, load_config, load_env_file
+from .errors import BasicKBError
+from .version import __version__
 from .core import DEFAULT_N, KnowledgeBase, cores_to_threads, lower_process_priority, setup_file_logging
 from .embedders import FastEmbedEmbedder
 from .models import SearchResult
 from .rerankers import RerankerBase, build_reranker
 from .sources import DataSourceBase, build_source
+from .store import VacuumPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +53,14 @@ def _effective(args: argparse.Namespace, config: Config) -> tuple[str, int, int,
     overlap = getattr(args, "overlap", None) if getattr(args, "overlap", None) is not None else config.overlap
     min_chunk = getattr(args, "min_chunk", None) or config.min_chunk
     return model, chunk_size, overlap, min_chunk
+
+
+def _vacuum_policy(config: Config) -> VacuumPolicy:
+    """The auto-vacuum policy from the `vacuum:` config block. Passed to every
+    KnowledgeBase the CLI builds so index, watch and search all honour it."""
+    return VacuumPolicy(enabled=config.vacuum_enabled,
+                        deleted_fraction=config.vacuum_deleted_fraction,
+                        min_deleted=config.vacuum_min_deleted)
 
 
 def _build_kb(args: argparse.Namespace, config: Config, threads: Optional[int] = None) -> KnowledgeBase:
@@ -77,7 +88,8 @@ def _build_kb(args: argparse.Namespace, config: Config, threads: Optional[int] =
                   "or set `reranker:` in the config.", file=sys.stderr)
             sys.exit(1)
 
-    return KnowledgeBase(embedder=embedder, chroma_dir=config.store_dir, reranker=reranker)
+    return KnowledgeBase(embedder=embedder, store_dir=config.store_dir, reranker=reranker,
+                         vacuum=_vacuum_policy(config))
 
 
 # --- Rendering ---------------------------------------------------------------
@@ -141,47 +153,37 @@ def _confirm_mass_change_on_tty(detail) -> bool:
 
 
 def _print_status(st) -> None:
-    """Human rendering of one SourceStatus."""
+    """Human rendering of one SourceStatus: a fixed set of rows, one line each."""
     print(f"\n{'='*55}")
     print(f"Source  : {st.label}  ({st.source_id})")
-    print(f"ChromaDB: {st.store_dir}")
+    print(f"Store   : {st.store_dir}")
     print(f"Model   : {st.model_id}")
 
     if not st.directory_exists:
         print(f"  ⚠  SOURCE PATH MISSING: {st.directory}")
         print("     directory does not exist — moved, unmounted, or a broken symlink.")
-        print("     Any indexed chunks are now orphaned; fix the path or re-point the source.")
 
-    if not st.indexed:
-        print(f"  No index found. Run: python -m basic_kb index --source {st.source_id}")
-        return
-    if st.chunks == 0:
-        print(f"  Index empty. Run: python -m basic_kb index --source {st.source_id}")
+    if not st.indexed or st.chunks == 0:
+        print(f"Chunks  : 0")
+        print(f"State   : {'not indexed' if not st.indexed else 'index empty'}")
         return
 
     print(f"Chunks  : {st.chunks:,}")
-    print(f"Docs    : {st.docs_with_chunks:,} produced chunks / {st.files_on_disk} files on disk")
+    print(f"Docs    : {st.docs_with_chunks:,} with chunks / {st.files_on_disk:,} files on disk")
 
+    # One `State` row. Files too short to chunk are tracked (hashed) but hold no chunks,
+    # so they never count as missing — that is why Docs can be below files on disk.
     if st.files_on_disk == 0:
-        if not st.directory_exists:
-            print(f"  ⚠  0 files — source path is missing (see warning above); "
-                  f"{st.docs_with_chunks} indexed docs orphaned.")
-        else:
-            print(f"  ⚠  0 files at {st.directory}")
-            print(f"     directory exists but holds no matching files — the "
-                  f"{st.docs_with_chunks} indexed docs are now stale.")
+        why = "source path missing" if not st.directory_exists else "directory holds no matching files"
+        state = f"⚠  0 files on disk ({why}); {st.docs_with_chunks:,} indexed docs orphaned"
     elif not st.tracked:
-        print(f"           no manifest yet — run `python -m basic_kb index "
-              f"--source {st.source_id}` once so empty files are tracked "
-              f"(until then {st.new} files show as new).")
+        state = "untracked — index once to enable change detection"
     elif st.stale:
-        parts = [f"{st.new} new", f"{st.updated} changed", f"{st.deleted} deleted"]
-        shown = ", ".join(p for p, n in zip(parts, (st.new, st.updated, st.deleted)) if n)
-        print(f"           {shown} since last index — run: "
-              f"python -m basic_kb index --source {st.source_id}")
+        parts = [f"{n} {w}" for n, w in ((st.new, "new"), (st.updated, "changed"), (st.deleted, "deleted")) if n]
+        state = f"stale — {', '.join(parts)} since last index"
     else:
-        print("           up to date  (files too short to chunk are tracked, "
-              "not counted as unindexed)")
+        state = "up to date"
+    print(f"State   : {state}")
 
     if st.date_min:
         print(f"Dates   : {st.date_min} → {st.date_max}")
@@ -228,6 +230,12 @@ def _load_sources(config: Config, source_arg: str,
 
 
 def _print_results(hits: list[SearchResult], max_chars: int) -> None:
+    """Human rendering of hits.
+
+    Header: rank, title, `[source · content_type]`, scores. Second line: where the chunk
+    came from — the url for web content, else the path inside the source — omitted when
+    it would only repeat the title (LogSeq pages: title == filename stem).
+    """
     reranked = any(r.rerank_score is not None for r in hits)
     print(f"Top {len(hits)} results{'  [reranked]' if reranked else ''}\n")
 
@@ -237,23 +245,23 @@ def _print_results(hits: list[SearchResult], max_chars: int) -> None:
         if r.rerank_score is not None:
             score_str += f"  rerank={round(r.rerank_score, 4)}"
 
-        # Web-style metadata (url/content_type) gets a richer header; else date.
-        if meta.get("url") or meta.get("content_type", "unknown") != "unknown":
-            header = (
-                f"[{rank}] {meta.get('title', '?')}  "
-                f"[{meta.get('content_type', '?')}]  {score_str}"
-            )
-            ref = meta.get("url") or meta.get("file", "?")
-        else:
-            # Show the date only when there is one (transcripts have it; notes usually don't).
-            date = meta.get("date")
-            date_str = f"  ({date})" if date and date != "unknown" else ""
-            header = f"[{rank}] {meta.get('title', '?')}{date_str}  {score_str}"
-            ref = meta.get("file", "?")
+        title = meta.get("title", "?")
+        tags = [meta.get("source", "?")]
+        if meta.get("content_type", "unknown") != "unknown":
+            tags.append(meta["content_type"])
+        # Show the date only when there is one (transcripts have it; notes usually don't).
+        date = meta.get("date")
+        date_str = f"  ({date})" if date and date != "unknown" else ""
+        header = f"[{rank}] {title}{date_str}  [{' · '.join(tags)}]  {score_str}"
+
+        ref = meta.get("url") or meta.get("rel_path") or meta.get("file", "")
+        stem = ref.rsplit("/", 1)[-1].rsplit(".", 1)[0] if ref else ""
+        show_ref = bool(ref) and stem != title
 
         print("=" * 60)
         print(header)
-        print(f"    {ref}")
+        if show_ref:
+            print(f"    {ref}")
         print("─" * 60)
         output = r.doc if not max_chars else r.doc[:max_chars]
         print(output)
@@ -517,7 +525,7 @@ def _scan_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
     """A KnowledgeBase for scan/freshness — no reranker needed (scan only hashes files)."""
     model, *_ = _effective(args, config)
     return KnowledgeBase(embedder=FastEmbedEmbedder(alias=model, batch_size=config.embed_batch_size),
-                         chroma_dir=config.store_dir)
+                         store_dir=config.store_dir, vacuum=_vacuum_policy(config))
 
 
 def cmd_scan(args: argparse.Namespace, config: Config) -> None:
@@ -577,10 +585,43 @@ def cmd_watch(args: argparse.Namespace, config: Config) -> None:
     model, *_ = _effective(args, config)
     kb = KnowledgeBase(embedder=FastEmbedEmbedder(alias=model, threads=threads,
                                                   batch_size=config.embed_batch_size),
-                       chroma_dir=config.store_dir)  # embedder only; reindex needs no reranker
+                       store_dir=config.store_dir, vacuum=_vacuum_policy(config))  # no reranker needed
     if config.log_file:
         print(f"(logging events to {config.log_file})", file=sys.stderr)
     run_watch(kb, watched, config, chunk_size, overlap, min_chunk)
+
+
+def cmd_vacuum(args: argparse.Namespace, config: Config) -> None:
+    """Compact the store file now. Auto-vacuum (config `vacuum:`) normally does this
+    after writes; this is for a one-off after a big manual clean-up."""
+    kb = _scan_kb(args, config)
+    before = kb.store.vacuum_stats()
+    ok = kb.vacuum()
+    after = kb.store.vacuum_stats()
+    if getattr(args, "json", False):
+        emit_json({"vacuumed": ok, "before": before, "after": after, "path": str(kb.store.path)})
+        return
+    size = kb.store.path.stat().st_size if kb.store.exists() else 0
+    print(f"{'Vacuumed' if ok else 'Vacuum skipped (busy or no store)'}: {kb.store.path}  "
+          f"({size:,} bytes; live chunks={after['live']}, deleted since={after['deleted_since_vacuum']})")
+
+
+# TEMPORARY (2026-08-29): migration notice for stores built on the old ChromaDB backend.
+# Remove this function, its call in main(), and the legacy_chroma_leftovers() helpers once
+# every instance on every machine has been re-indexed on sqlite-vec (see docs/adr/0001).
+def _legacy_chroma_notice(config: Config) -> None:
+    from .store import SqliteVecStore
+    leftovers = SqliteVecStore(config.store_dir).legacy_chroma_leftovers()
+    if not leftovers:
+        return
+    where = sorted({str(p.parent) for p in leftovers})
+    print(
+        f"⚠  Legacy ChromaDB index found ({len(leftovers)} item(s) in {', '.join(where)}).\n"
+        f"   basic-kb {__version__} stores vectors in sqlite-vec ({config.store_dir / 'kb.sqlite3'}); the old\n"
+        f"   index is not read. Rebuild once:  python -m basic_kb index --force --source all\n"
+        f"   then delete the leftovers to silence this notice:\n"
+        + "".join(f"     {p}\n" for p in leftovers),
+        file=sys.stderr, end="")
 
 
 def _format_freshness(template: str, res, days: int) -> str:
@@ -698,7 +739,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb index --limit 10                              embed only the first N files (test)\n"
             "  basic_kb status                                        chunk/doc counts per source\n"
             "  basic_kb scan                                          new/changed/deleted files vs the index\n"
-            "  basic_kb watch                                         auto-reindex edited files (foreground)\n\n"
+            "  basic_kb watch                                         auto-reindex edited files (foreground)\n"
+            "  basic_kb vacuum                                        compact the store file now\n\n"
             "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --limit N  --preview [--file NAME]  --yes  --no-reindex-guard\n"
@@ -790,6 +832,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--json", action="store_true", help="emit the scan diff as JSON")
     _shared_args(p_scan)
 
+    p_vacuum = sub.add_parser("vacuum", help="Compact the store file now (auto-vacuum normally handles this)")
+    p_vacuum.add_argument("--json", action="store_true", help="emit before/after stats as JSON")
+    _shared_args(p_vacuum)
+
     p_watch = sub.add_parser("watch",
                              help="Watch sources and auto-reindex edited files (foreground; Ctrl-C to stop)")
     _shared_args(p_watch)
@@ -837,8 +883,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         setup_file_logging(config.log_file, config.log_level,
                            config.log_max_bytes, config.log_backup_count)
 
-    {"index": cmd_index, "search": cmd_search, "status": cmd_status,
-     "scan": cmd_scan, "watch": cmd_watch, "info": cmd_info}[args.cmd](args, config)
+    _legacy_chroma_notice(config)   # TEMPORARY — see the function's comment
+
+    try:
+        {"index": cmd_index, "search": cmd_search, "status": cmd_status,
+         "scan": cmd_scan, "watch": cmd_watch, "info": cmd_info, "vacuum": cmd_vacuum}[args.cmd](args, config)
+    except BasicKBError as e:
+        # Library errors are deliberate and already say what to do; a traceback adds nothing.
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

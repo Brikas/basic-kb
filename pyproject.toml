@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "basic-kb"
-version = "0.1.0"
-description = "A small, config-driven semantic search engine over markdown/text sources (local embeddings + ChromaDB)."
+dynamic = ["version"]
+description = "A small, config-driven semantic search engine over markdown/text sources (local embeddings + sqlite-vec)."
 readme = "README.md"
 # No 3.14: pinned deps (py-rust-stemmers) have no 3.14 wheel and fall back to Rust source builds.
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "chromadb>=1.5.9",
+    "sqlite-vec>=0.1.9",  # exact vector search inside SQLite; see docs/adr/0001
     "fastembed>=0.8.0",
     "pyyaml>=6.0",
     "requests>=2.31",   # used by the optional Jina reranker
@@ -22,3 +22,6 @@ basic-kb = "basic_kb.cli:main"
 
 [tool.setuptools]
 packages = ["basic_kb"]
+
+[tool.setuptools.dynamic]
+version = {attr = "basic_kb.version.__version__"}

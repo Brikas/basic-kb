@@ -1,7 +1,7 @@
 # basic-kb
 
 A small, config-driven semantic search engine over markdown/text. Local embeddings
-(FastEmbed/ONNX, no API) into ChromaDB, with optional Jina reranking.
+(FastEmbed/ONNX, no API) into a single SQLite file via sqlite-vec, exact cosine search, optional Jina reranking.
 
 One engine, many **instances**. An instance is just a config file pointing at a
 store dir and a list of sources — so a work KB and a personal KB stay fully
@@ -39,6 +39,16 @@ basic-kb search --source list      # list configured sources
 dry-runs the chunker without embedding. A pre-scan hashes every file first, so
 progress reads `[k/work]` (files actually being embedded), not `[i/all-files]`.
 
+## Store
+
+Everything an instance indexes lives in one file, `<store_dir>/kb.sqlite3`: vectors (a sqlite-vec `vec0` table), chunk text and metadata, and the per-file manifest. Search is an exact cosine scan — no approximate index, so results are deterministic, a delete is a delete, and nothing has to be held in RAM; at the sizes this engine targets (thousands to low hundreds of thousands of chunks) a scan is milliseconds. Why not HNSW: [docs/adr/0001](docs/adr/0001-sqlite-vec-as-vector-store.md).
+
+SQLite frees pages on delete but never shrinks the file by itself, so the store auto-`VACUUM`s after a write once the rows deleted since the last vacuum reach `vacuum.deleted_fraction` of live rows (default 0.2) and at least `vacuum.min_deleted` (default 1000). This runs inside the store, so `index`, `watch` and library callers all get it; `basic-kb vacuum` forces one. Switching embedding models requires `index --force --source all` — the vector table's dimension is fixed and mixing models is refused.
+
+## Decisions
+
+Load-bearing architectural choices and the alternatives they rejected are recorded in [docs/adr/](docs/adr/README.md).
+
 ## Auto-reindex (`watch`)
 
 `basic-kb watch` is a foreground process that watches every enabled source and
@@ -54,7 +64,7 @@ Watch is configured **per source**: add a `watch:` block. It reacts only to cont
 
 ## Freshness nudges
 
-`scan` diffs the files on disk against the index (using a manifest written at index
+`scan` diffs the files on disk against the index (using the per-file hashes recorded at index
 time) and reports new/changed/deleted counts without embedding anything. After a
 search, basic-kb nudges you about a source only once it has stayed stale for
 `stale_after_days` (default 3), then at most once per `remind_every_days` (default 1)
@@ -126,7 +136,7 @@ repo-root `.env` shared by several instances. Set it to 0 to disable the walk-up
 ## Develop
 
 Architecture and gotchas: [docs/developing.md](docs/developing.md). Modules:
-`models`, `embedders`, `rerankers`, `textsplit`, `chunkers`, `sources`, `core`,
+`models`, `embedders`, `rerankers`, `textsplit`, `chunkers`, `sources`, `store`, `core`,
 `watcher`, `cli`.
 
 Planned capabilities (chunk filter/transform hook, reference expansion, LogSeq-aware

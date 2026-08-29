@@ -12,12 +12,8 @@ class BasicKBError(Exception):
     """Base class for everything this library raises deliberately."""
 
 
-class ManifestCorrupt(BasicKBError):
-    """manifest.json exists but is not readable JSON.
-
-    Treating this as an empty manifest silently re-embeds the entire source and
-    leaves scan/status permanently wrong, so it is raised rather than absorbed.
-    """
+class StoreError(BasicKBError):
+    """The store itself is unusable: extension missing, model/dimension mismatch, ..."""
 
 
 class IndexNotFound(BasicKBError):
