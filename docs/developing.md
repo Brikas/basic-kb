@@ -28,7 +28,7 @@ KnowledgeBase
 1. `build_source()` builds each configured source; `parse_file()` → ParsedDocument
 2. Hash every file; only files whose hash differs from the store's `files` table are processed
 3. The source's chunker splits the body into Chunks; `FastEmbedEmbedder.embed()` (batched, `embed_batch_size`)
-4. `SqliteVecStore.replace_file()` swaps that file's rows atomically (chunks + vectors + hash); one commit per file
+4. Chunk ids are `rel_path::sha1(text)[:16]` (`#n` for repeated text). `SqliteVecStore.sync_file()` diffs them against the stored rows: unchanged chunks keep their vector (metadata refreshed), vanished ones are deleted, only new ones are embedded; one commit per file
 
 **Flow — search:**
 1. Embed each query once via the same `FastEmbedEmbedder`
@@ -60,6 +60,7 @@ KnowledgeBase
 
 ## sqlite-vec store details
 
+- Two-level incrementality: file hash (`files` table) decides whether a file is looked at; chunk hash (`chunks.chunk_id`) decides what gets embedded. Positional index of a chunk lives in metadata (`position`), not in its id, so reordering never forces a re-embed.
 - One `vec0` virtual table for all sources: `source` is a **partition key** (pre-filters the scan), `content_type` a **metadata column** (filterable in the KNN `WHERE`), `embedding FLOAT[d] distance_metric=cosine`. `rowid` equals `chunks.id`. Metadata columns are strictly typed and **reject NULL** — the store writes `''` for a missing content_type.
 - The vector table is created on the first write and its dimension is fixed. `model_id`/`dim` live in `meta`; `check_model()` refuses index/search with a different model, and `clear_source()` drops the table once no chunks remain so `index --force --source all` can switch models.
 - Every store method opens its own connection (`PRAGMA journal_mode=WAL`), loads the extension, and closes — thread-safe reads; writers are serialised by `KnowledgeBase._write_lock` (process-local).

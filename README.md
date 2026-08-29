@@ -60,7 +60,7 @@ basic-kb watch                 # all sources, config debounce (default 30s)
 basic-kb watch --debounce 300  # reindex 5 min after a file goes quiet (0 = immediately)
 ```
 
-Watch is configured **per source**: add a `watch:` block. It reacts only to content changes (reads are ignored), skips a file whose content hash is unchanged, and honours the same `throttle:` config and `--throttle/--cores-fraction/--priority` flags as `index`. Peak RAM is bounded by `embed_batch_size` (default 8 texts per ONNX pass — onnxruntime never returns a batch's peak, so a long-lived watcher keeps whatever its biggest batch needed; 256 cost ~4 GB on a single 241-chunk file).
+Indexing is incremental at two levels: a file whose hash is unchanged is skipped outright, and a changed file re-embeds only the chunks whose text changed — chunk ids are content hashes, so appending to a transcript costs one or two embeddings, not the whole file. Watch is configured **per source**: add a `watch:` block. It reacts only to content changes (reads are ignored) and honours the same `throttle:` config and `--throttle/--cores-fraction/--priority` flags as `index`. Peak RAM is bounded by `embed_batch_size` (default 8 texts per ONNX pass — onnxruntime never returns a batch's peak, so a long-lived watcher keeps whatever its biggest batch needed; 256 cost ~4 GB on a single 241-chunk file).
 
 ## Freshness nudges
 

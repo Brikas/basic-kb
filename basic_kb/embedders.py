@@ -44,6 +44,11 @@ class FastEmbedEmbedder(EmbedderBase):
         "bge-small-en-v1.5": "BAAI/bge-small-en-v1.5",
         "bge-base-en-v1.5": "BAAI/bge-base-en-v1.5",
         "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
+        # ~50 languages (incl. Lithuanian, Danish), 384-dim, 118M params, symmetric (no prefix).
+        # CAUTION: its tokenizer caps input at 128 tokens (~500 chars); fastembed honours that,
+        # so anything past ~500 chars of a chunk is silently dropped. Only usable with chunks
+        # sized to it (chunk_size <= ~450), not with the 1200-char default.
+        "multilingual-MiniLM-L12-v2": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     }
 
     # Texts per ONNX forward pass. Transformer attention memory scales with

@@ -169,6 +169,7 @@ def _print_status(st) -> None:
         return
 
     print(f"Chunks  : {st.chunks:,}")
+    print(f"Tokens  : ~{st.approx_tokens:,}  ({st.chars:,} chars, 4 chars/token)")
     print(f"Docs    : {st.docs_with_chunks:,} with chunks / {st.files_on_disk:,} files on disk")
 
     # One `State` row. Files too short to chunk are tracked (hashed) but hold no chunks,

@@ -62,7 +62,9 @@ class IndexResult:
     unchanged: int = 0        # skipped — hash matched the manifest
     empty: int = 0            # parsed to no chunks (tracked, not indexed)
     pruned: int = 0           # removed because they vanished from disk
-    total_chunks: int = 0     # chunks in the collection after the run
+    total_chunks: int = 0     # chunks in the store after the run
+    chunks_embedded: int = 0  # chunks actually sent to the embedder this run
+    chunks_reused: int = 0    # chunks whose text was unchanged — kept their vector
     limited_to: Optional[int] = None   # the `limit` in force, if any
     aborted: bool = False
     abort_reason: Optional[str] = None
@@ -88,6 +90,7 @@ class SourceStatus:
     directory_exists: bool
     indexed: bool                      # a collection exists for this source
     chunks: int = 0
+    chars: int = 0                     # characters of embedded chunk text
     docs_with_chunks: int = 0
     files_on_disk: int = 0
     tracked: bool = False              # a manifest entry exists
@@ -102,6 +105,11 @@ class SourceStatus:
     @property
     def stale(self) -> int:
         return self.new + self.updated + self.deleted
+
+    @property
+    def approx_tokens(self) -> int:
+        """Rough token count of the embedded text: 4 chars per token."""
+        return self.chars // 4
 
 
 @dataclass

@@ -217,6 +217,13 @@ class SqliteVecStore:
         with self._connect() as con:
             return con.execute("SELECT count(*) FROM chunks WHERE source = ?", (source,)).fetchone()[0]
 
+    def chars(self, source: str) -> int:
+        """Total characters of chunk text stored for a source (≈ tokens × 4)."""
+        if not self.exists():
+            return 0
+        with self._connect() as con:
+            return con.execute("SELECT coalesce(sum(length(doc)), 0) FROM chunks WHERE source = ?", (source,)).fetchone()[0]
+
     def chunk_ids_by_file(self, source: str, rel_paths: Optional[Iterable[str]] = None) -> dict[str, list[int]]:
         """{rel_path: [chunk row ids]} for a source, optionally only for some files."""
         if not self.exists():
@@ -263,33 +270,62 @@ class SqliteVecStore:
         self._maybe_vacuum()
         return n
 
-    def replace_file(
+    def sync_file(
         self, source: str, rel_path: str, file_hash: str,
-        chunk_ids: list[str], docs: list[str], metadatas: list[dict], embeddings: list[list[float]],
-        model_id: str,
-    ) -> None:
-        """Atomically replace one file's chunks (possibly with none) and record its hash."""
+        chunk_ids: list[str], docs: list[str], metadatas: list[dict],
+        embed, model_id: str,
+    ) -> tuple[int, int]:
+        """Bring one file's rows in line with its current chunks, embedding only what is new.
+
+        Chunk ids are content-derived (see KnowledgeBase._chunk_ids), so a chunk whose text
+        is unchanged keeps its row and vector; only ids absent from the store are embedded
+        (`embed(texts) -> vectors` is called once, for those). Rows whose id disappeared are
+        deleted; kept rows get their metadata refreshed (position, file hash). Appending to a
+        file therefore costs one or two embeddings, not the whole file. Returns
+        (chunks_embedded, chunks_reused). An empty chunk list drops every row for the file.
+        """
         with self._connect(create=True) as con:
+            have = {cid: (rid, ct) for rid, cid, ct in con.execute(
+                "SELECT id, chunk_id, content_type FROM chunks WHERE source = ? AND rel_path = ?",
+                (source, rel_path)).fetchall()}
+            wanted = set(chunk_ids)
+            gone = [rid for cid, (rid, _) in have.items() if cid not in wanted]
+            if gone:
+                self._delete_rows(con, gone)
+
+            new_idx = [i for i, cid in enumerate(chunk_ids) if cid not in have]
+            embeddings = embed([docs[i] for i in new_idx]) if new_idx else []
             if embeddings:
                 self._ensure_vec_table(con, len(embeddings[0]), model_id)
-            old = [cid for (cid,) in con.execute(
-                "SELECT id FROM chunks WHERE source = ? AND rel_path = ?", (source, rel_path)).fetchall()]
-            if old:
-                self._delete_rows(con, old)
-            for chunk_id, doc, meta, emb in zip(chunk_ids, docs, metadatas, embeddings):
+
+            for i, cid in enumerate(chunk_ids):
+                meta = metadatas[i]
+                ct = str(meta.get("content_type") or "")
+                if cid in have:
+                    rid, old_ct = have[cid]
+                    con.execute("UPDATE chunks SET meta_json = ?, content_type = ?, date = ? WHERE id = ?",
+                                (json.dumps(meta, ensure_ascii=False), ct, str(meta.get("date") or ""), rid))
+                    if old_ct != ct:
+                        # vec0 metadata columns are filterable at query time, so they must be
+                        # right; re-insert the row with its existing vector instead of re-embedding.
+                        (blob,) = con.execute("SELECT embedding FROM vec WHERE rowid = ?", (rid,)).fetchone()
+                        con.execute("DELETE FROM vec WHERE rowid = ?", (rid,))
+                        con.execute("INSERT INTO vec (rowid, source, content_type, embedding) VALUES (?, ?, ?, ?)",
+                                    (rid, source, ct, blob))
+                    continue
                 cur = con.execute(
                     "INSERT INTO chunks (source, rel_path, chunk_id, doc, meta_json, content_type, date) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (source, rel_path, chunk_id, doc, json.dumps(meta, ensure_ascii=False),
-                     str(meta.get("content_type") or ""), str(meta.get("date") or "")))
-                con.execute(
-                    "INSERT INTO vec (rowid, source, content_type, embedding) VALUES (?, ?, ?, ?)",
-                    (cur.lastrowid, source, str(meta.get("content_type") or ""), _pack(emb)))
+                    (source, rel_path, cid, docs[i], json.dumps(meta, ensure_ascii=False), ct,
+                     str(meta.get("date") or "")))
+                con.execute("INSERT INTO vec (rowid, source, content_type, embedding) VALUES (?, ?, ?, ?)",
+                            (cur.lastrowid, source, ct, _pack(embeddings[new_idx.index(i)])))
             con.execute(
                 "INSERT INTO files VALUES (?, ?, ?) ON CONFLICT(source, rel_path) DO UPDATE SET hash = excluded.hash",
                 (source, rel_path, file_hash))
             con.commit()
         self._maybe_vacuum()
+        return len(new_idx), len(chunk_ids) - len(new_idx)
 
     def remove_files(self, source: str, rel_paths: Iterable[str]) -> int:
         """Prune files that vanished from disk: chunks, vectors and manifest entry. Returns files removed."""

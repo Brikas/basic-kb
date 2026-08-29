@@ -223,14 +223,30 @@ class KnowledgeBase:
         if on_progress is not None:
             on_progress(msg)
 
-    def _write_file(self, source: DataSourceBase, rel_path: str, file_hash: str, chunks) -> None:
-        """Embed one file's chunks and replace whatever the store held for that file."""
-        ids = [f"{rel_path}::{c.id_suffix}" for c in chunks]
+    @staticmethod
+    def _chunk_ids(rel_path: str, chunks) -> list[str]:
+        """Content-derived chunk ids: `<rel_path>::<sha1(text)[:16]>`, with `#n` appended for
+        repeated identical text within one file. Unchanged text keeps its id (and vector) across
+        re-indexes, so appending to a file re-embeds only the new chunk(s). The positional index
+        stays available as `chunk.id_suffix` in the metadata for ordering."""
+        ids, seen = [], {}
+        for c in chunks:
+            h = hashlib.sha1(c.text.encode("utf-8")).hexdigest()[:16]
+            n = seen.get(h, 0)
+            seen[h] = n + 1
+            ids.append(f"{rel_path}::{h}" + (f"#{n}" if n else ""))
+        return ids
+
+    def _write_file(self, source: DataSourceBase, rel_path: str, file_hash: str, chunks) -> tuple[int, int]:
+        """Sync one file's chunks into the store, embedding only chunks whose text is new.
+        Returns (chunks_embedded, chunks_reused). Empty `chunks` drops the file's rows but
+        records its hash, so a file too short to chunk stays tracked."""
+        ids = self._chunk_ids(rel_path, chunks)
         docs = [c.text for c in chunks]
-        metas = [{**c.metadata, "rel_path": rel_path, "content_hash": file_hash} for c in chunks]
-        embeddings = self.embedder.embed(docs) if docs else []
-        self.store.replace_file(source.source_id, rel_path, file_hash, ids, docs, metas, embeddings,
-                                model_id=self.embedder.model_id)
+        metas = [{**c.metadata, "rel_path": rel_path, "content_hash": file_hash, "position": c.id_suffix}
+                 for c in chunks]
+        return self.store.sync_file(source.source_id, rel_path, file_hash, ids, docs, metas,
+                                    embed=self.embedder.embed, model_id=self.embedder.model_id)
 
     def index(
         self,
@@ -348,16 +364,16 @@ class KnowledgeBase:
 
             if not chunks:
                 result.empty += 1
-                # Tracked (hash recorded) but holds no chunks — drops any old ones.
-                self.store.replace_file(source.source_id, rel_path, file_hash, [], [], [], [],
-                                        model_id=self.embedder.model_id)
+                self._write_file(source, rel_path, file_hash, [])   # tracked, holds no chunks
                 continue
 
-            verb = "re-embedding" if was_indexed else "embedding"
-            self._emit(on_progress,
-                       f"  [{processed}/{work_total}] {verb} {rel_path}  ({len(chunks)} chunks)")
             # Each file is one committed transaction: a crash at file 400 of 450 keeps 400.
-            self._write_file(source, rel_path, file_hash, chunks)
+            n_new, n_kept = self._write_file(source, rel_path, file_hash, chunks)
+            result.chunks_embedded += n_new
+            result.chunks_reused += n_kept
+            kept = f", {n_kept} unchanged" if n_kept else ""
+            self._emit(on_progress,
+                       f"  [{processed}/{work_total}] {rel_path}  ({n_new} chunks embedded{kept})")
             result.updated += 1 if was_indexed else 0
             result.added += 0 if was_indexed else 1
 
@@ -377,8 +393,9 @@ class KnowledgeBase:
             f"\nDone [{source.source_id}].\n"
             f"  files:  new={result.added} updated={result.updated} "
             f"unchanged={result.unchanged} empty={result.empty} pruned={result.pruned}"
-            f"  ({result.embedded} embedded this run)\n"
-            f"  chunks: {result.total_chunks} total in index"
+            f"  ({result.embedded} files touched this run)\n"
+            f"  chunks: {result.chunks_embedded} embedded, {result.chunks_reused} reused, "
+            f"{result.total_chunks} total in index"
         ))
         if result.errors:
             self._emit(on_progress, f"  {len(result.errors)} file(s) failed — see result.errors")
@@ -422,7 +439,8 @@ class KnowledgeBase:
         for p in paths:
             p = Path(p)
             rels[self._rel_path(source, p)] = p
-        counts = {"embedded": 0, "empty": 0, "pruned": 0, "unchanged": 0}
+        counts = {"embedded": 0, "empty": 0, "pruned": 0, "unchanged": 0,
+                  "chunks_embedded": 0, "chunks_reused": 0}
         if not rels:
             return counts
 
@@ -447,13 +465,15 @@ class KnowledgeBase:
             doc = source.parse_file(p)
             chunks = chunker.chunk(doc) if doc is not None else []
             if not chunks:
-                self.store.replace_file(source.source_id, rp, file_hash, [], [], [], [],
-                                        model_id=self.embedder.model_id)
+                self._write_file(source, rp, file_hash, [])
                 counts["empty"] += 1
                 continue
-            self._write_file(source, rp, file_hash, chunks)
+            n_new, n_kept = self._write_file(source, rp, file_hash, chunks)
             counts["embedded"] += 1
-            logger.info("reindex_paths: embedded %s/%s (%d chunks)", source.source_id, rp, len(chunks))
+            counts["chunks_embedded"] += n_new
+            counts["chunks_reused"] += n_kept
+            logger.info("reindex_paths: %s/%s — %d chunks embedded, %d reused",
+                        source.source_id, rp, n_new, n_kept)
         return counts
 
     def vacuum(self) -> bool:
@@ -678,6 +698,7 @@ class KnowledgeBase:
 
             st.indexed = True
             st.chunks = self.store.count(source.source_id)
+            st.chars = self.store.chars(source.source_id)
 
             res = self.scan(source)
             st.files_on_disk = res.files_on_disk
