@@ -407,7 +407,8 @@ class KnowledgeBase:
 
         was_indexed_files = set(self.store.chunk_ids_by_file(source.source_id))
         since_pause = 0
-        processed = 0
+        processed = 0     # files parsed so far (drives the wave), written = files committed
+        written = 0
         # Files are parsed and hash-diffed a wave at a time, the wave's new chunks are
         # embedded in ONE call (concurrent for API backends), then each file is written as
         # its own committed transaction — a crash keeps every file written so far.
@@ -428,25 +429,31 @@ class KnowledgeBase:
                     # does not learn this file, so the next run retries it.
                     logger.exception("index: failed to parse %s/%s", source.source_id, rel_path)
                     result.errors.append(FileError(rel_path=rel_path, error=f"{type(e).__name__}: {e}"))
-                    self._emit(on_progress, f"  [{processed}/{work_total}] SKIPPED {rel_path} — {e}")
+                    written += 1
+                    self._emit(on_progress, f"  [{written}/{work_total}] SKIPPED {rel_path} — {e}")
                     continue
                 prepared.append((rel_path, chunks, file_hash, f))
                 wave_chunks += len(chunks)
 
+            if wave_chunks:
+                self._emit(on_progress,
+                           f"  … embedding wave: {len(prepared)} files, up to {wave_chunks} chunks "
+                           f"(files {written + 1}-{processed} of {work_total})")
             vectors = self._embed_wave(source, [(rp, ch) for rp, ch, _, _ in prepared])
 
             for rel_path, chunks, file_hash, _ in prepared:
                 was_indexed = rel_path in was_indexed_files
+                written += 1
                 if not chunks:
                     result.empty += 1
                     self._write_file(source, rel_path, file_hash, [])   # tracked, holds no chunks
-                    self._emit(on_progress, f"  {rel_path}  (no chunks — tracked, nothing to embed)")
+                    self._emit(on_progress, f"  [{written}/{work_total}] {rel_path}  (no chunks — tracked)")
                     continue
                 n_new, n_kept = self._write_file(source, rel_path, file_hash, chunks, vectors)
                 result.chunks_embedded += n_new
                 result.chunks_reused += n_kept
                 kept = f", {n_kept} unchanged" if n_kept else ""
-                self._emit(on_progress, f"  {rel_path}  ({n_new} chunks embedded{kept})")
+                self._emit(on_progress, f"  [{written}/{work_total}] {rel_path}  ({n_new} chunks embedded{kept})")
                 result.updated += 1 if was_indexed else 0
                 result.added += 0 if was_indexed else 1
 
@@ -455,7 +462,6 @@ class KnowledgeBase:
                     if since_pause >= pause_every:
                         time.sleep(pause_ms / 1000.0)
                         since_pause = 0
-            self._emit(on_progress, f"  [{processed}/{work_total}] files done")
 
         # Prune files that no longer exist on disk. Full runs only — a --limit run
         # sees a subset, so absent files there are not actually deleted.
