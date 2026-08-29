@@ -24,6 +24,9 @@ from .sources import DataSourceBase
 
 logger = logging.getLogger("basic_kb")
 
+# watchdog event types that mean "somebody read the file", not "the file changed".
+_READ_ONLY_EVENTS = frozenset({"opened", "closed_no_write"})
+
 # Ignore editor scratch/temp files so a save's temp artifacts don't cause churn.
 # The real file (its .md) fires its own event and is what we reindex.
 def _relevant(path: str) -> bool:
@@ -125,6 +128,11 @@ class _Handler:
 
     def dispatch(self, event) -> None:
         if getattr(event, "is_directory", False):
+            return
+        # Only content changes count. Linux inotify also reports plain reads (opened /
+        # closed_no_write); reacting to those makes the watcher re-trigger itself — its own
+        # reindex reads the file — and loop forever at the debounce period.
+        if getattr(event, "event_type", None) in _READ_ONLY_EVENTS:
             return
         # Moves report both src (gone) and dest (the new file); handle whichever is a note.
         for attr in ("src_path", "dest_path"):

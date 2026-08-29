@@ -122,6 +122,7 @@ class Config:
     overlap: int
     min_chunk: int
     sources: list[dict]  # raw source entries; built via sources.build_source()
+    embed_batch_size: int = 8          # texts per embedding forward pass; bounds peak RAM (see embedders.py)
     reranker_type: str = "none"        # none | local | jina
     reranker_model: Optional[str] = None
     cand_multiplier: int = 3           # candidates to rerank = clamp(n*mult, min, max)
@@ -224,6 +225,7 @@ def load_config(config_path: Path) -> Config:
         name=data.get("name", config_path.stem),
         store_dir=_resolve(base_dir, data.get("store_dir", ".chroma")),
         embedding_model=data.get("embedding_model", DEFAULT_MODEL),
+        embed_batch_size=int(data.get("embed_batch_size", 8)),
         chunk_size=int(chunker_cfg.get("max_chunk_size", DEFAULT_CHUNK_SIZE)),
         overlap=int(chunker_cfg.get("overlap", DEFAULT_OVERLAP)),
         min_chunk=int(chunker_cfg.get("min_chunk_size", DEFAULT_MIN_CHUNK)),

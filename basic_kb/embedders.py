@@ -59,10 +59,19 @@ class FastEmbedEmbedder(EmbedderBase):
         "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
     }
 
-    def __init__(self, alias: str = DEFAULT_MODEL, threads: Optional[int] = None) -> None:
+    # Texts per ONNX forward pass. Transformer attention memory scales with
+    # batch x seq_len^2, and onnxruntime's arena never returns the peak to the OS, so a
+    # long-lived process keeps whatever the biggest batch needed. Measured on bge-small,
+    # 241 x 1200-char chunks, 2 threads: batch 256 (fastembed default) peaked at 4.2 GB,
+    # batch 32 at 1.1 GB, batch 8 at 0.48 GB — all at the same throughput (CPU-bound).
+    DEFAULT_BATCH_SIZE = 8
+
+    def __init__(self, alias: str = DEFAULT_MODEL, threads: Optional[int] = None,
+                 batch_size: int = DEFAULT_BATCH_SIZE) -> None:
         self._alias = alias
         self._model_id = self.SUPPORTED.get(alias, alias)
         self._threads = threads   # cap ONNX threads (CPU cores) used; None = all
+        self._batch_size = max(1, int(batch_size))
         self._model: Any = None
         # Guards the lazy load. Without it, concurrent first-calls in a server each
         # pass the None check and each construct a model — an N-fold memory spike on
@@ -84,8 +93,8 @@ class FastEmbedEmbedder(EmbedderBase):
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         self._load()
-        return [v.tolist() for v in self._model.embed(texts)]
+        return [v.tolist() for v in self._model.embed(texts, batch_size=self._batch_size)]
 
     def query_embed(self, texts: list[str]) -> list[list[float]]:
         self._load()
-        return [v.tolist() for v in self._model.query_embed(texts)]
+        return [v.tolist() for v in self._model.query_embed(texts, batch_size=self._batch_size)]

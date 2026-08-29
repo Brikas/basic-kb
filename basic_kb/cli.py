@@ -54,7 +54,7 @@ def _effective(args: argparse.Namespace, config: Config) -> tuple[str, int, int,
 
 def _build_kb(args: argparse.Namespace, config: Config, threads: Optional[int] = None) -> KnowledgeBase:
     model, *_ = _effective(args, config)
-    embedder = FastEmbedEmbedder(alias=model, threads=threads)
+    embedder = FastEmbedEmbedder(alias=model, threads=threads, batch_size=config.embed_batch_size)
 
     reranker: Optional[RerankerBase] = None
     if not getattr(args, "no_rerank", False):
@@ -516,7 +516,8 @@ def cmd_info(args: argparse.Namespace, config: Config) -> None:
 def _scan_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
     """A KnowledgeBase for scan/freshness — no reranker needed (scan only hashes files)."""
     model, *_ = _effective(args, config)
-    return KnowledgeBase(embedder=FastEmbedEmbedder(alias=model), chroma_dir=config.store_dir)
+    return KnowledgeBase(embedder=FastEmbedEmbedder(alias=model, batch_size=config.embed_batch_size),
+                         chroma_dir=config.store_dir)
 
 
 def cmd_scan(args: argparse.Namespace, config: Config) -> None:
@@ -562,7 +563,21 @@ def cmd_watch(args: argparse.Namespace, config: Config) -> None:
         sys.exit(1)
 
     _, chunk_size, overlap, min_chunk = _effective(args, config)
-    kb = _scan_kb(args, config)  # embedder only; reindex needs no reranker
+
+    # Same throttle as `index`: the watcher is a long-lived background embedder, so the
+    # config's cores_fraction / priority must bind here too or it will take every core.
+    cores, priority, pause_ms, pause_every = _resolve_throttle(args, config)
+    threads = cores_to_threads(cores)
+    if threads or priority == "low":
+        print(f"[throttle] cores={cores if cores else 'all'} (threads={threads or 'default'})  "
+              f"priority={priority}", file=sys.stderr)
+    if priority == "low":
+        lower_process_priority()
+
+    model, *_ = _effective(args, config)
+    kb = KnowledgeBase(embedder=FastEmbedEmbedder(alias=model, threads=threads,
+                                                  batch_size=config.embed_batch_size),
+                       chroma_dir=config.store_dir)  # embedder only; reindex needs no reranker
     if config.log_file:
         print(f"(logging events to {config.log_file})", file=sys.stderr)
     run_watch(kb, watched, config, chunk_size, overlap, min_chunk)
@@ -781,6 +796,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--debounce", type=int, default=None, metavar="SEC",
                          help="Reindex a file after it's been quiet this long, overriding each source's "
                               "config for this run (default 30s; 0 = reindex immediately). Example: --debounce 300")
+    p_watch.add_argument("--throttle", action="store_true",
+                         help="Ease CPU load while reindexing: ~half the cores + low OS priority.")
+    p_watch.add_argument("--cores-fraction", type=float, default=None, metavar="F",
+                         help="Fraction of CPU cores the embedder may use, e.g. 0.5 (overrides --throttle/config).")
+    p_watch.add_argument("--priority", choices=["low", "normal"], default=None,
+                         help="OS process priority while reindexing (default: config, else normal).")
 
     return parser
 

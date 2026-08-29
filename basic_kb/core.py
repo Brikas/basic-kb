@@ -490,7 +490,7 @@ class KnowledgeBase:
         for p in paths:
             p = Path(p)
             rels[self._rel_path(source, p)] = p
-        counts = {"embedded": 0, "empty": 0, "pruned": 0}
+        counts = {"embedded": 0, "empty": 0, "pruned": 0, "unchanged": 0}
         if not rels:
             return counts
 
@@ -520,6 +520,13 @@ class KnowledgeBase:
                 continue
 
             file_hash = _file_hash(p)
+            # Unchanged content already in the index: nothing to do. Guards against
+            # mtime-only touches and spurious watcher events; a re-embed of identical
+            # text just bloats the HNSW index (deleted vectors are never reclaimed).
+            if old_ids and src_manifest.get(rp) == file_hash:
+                counts["unchanged"] += 1
+                logger.debug("reindex_paths: unchanged %s/%s", source.source_id, rp)
+                continue
             doc = source.parse_file(p)
             chunks = chunker.chunk(doc) if doc is not None else []
             if old_ids:                              # replace: drop old chunks first
