@@ -336,18 +336,37 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
     note = kb.prepare_model_switch(sources, accept=switch)   # refuses on a mismatch unless --switch-model
     if note and not as_json:
         print(note)
+    # --limit is a budget for the whole run, spent source by source in order, so
+    # `--limit 3` across three sources embeds 3 files total, not 9. The old
+    # per-source behaviour stays reachable with --limit-per-source.
+    limit = getattr(args, "limit", None)
+    per_source = getattr(args, "limit_per_source", False)
+    remaining = limit
     results = []
-    for source in sources:
-        results.append(kb.index(
+    for i, source in enumerate(sources):
+        source_limit = limit
+        if limit is not None and not per_source:
+            if remaining <= 0:
+                skipped = ", ".join(s.source_id for s in sources[i:])
+                if not as_json:
+                    print(f"[limit] budget of {limit} file(s) spent — skipping: {skipped}", flush=True)
+                break
+            source_limit = remaining
+        result = kb.index(
             source=source, chunk_size=chunk_size, overlap=overlap,
-            min_chunk=min_chunk, force=force, limit=getattr(args, "limit", None),
+            min_chunk=min_chunk, force=force, limit=source_limit,
             pause_ms=pause_ms, pause_every=pause_every,
             guard=guard, guard_threshold=guard_threshold,
             assume_yes=getattr(args, "yes", False),
             # No progress on stdout in --json mode; it would break the document.
             on_progress=None if as_json else print,
             on_confirm=_confirm_mass_change_on_tty,
-        ))
+        )
+        results.append(result)
+        if limit is not None and not per_source:
+            # files_on_disk is the pre-limit count, so the source spent whichever of
+            # the two is smaller.
+            remaining -= min(result.files_on_disk, source_limit)
 
     if as_json:
         emit_json(results)
@@ -375,6 +394,10 @@ def _preview_chunks(sources: list[DataSourceBase], config: Config,
         out_path = tmp_dir / f"kb-preview-{source_ids}-{ts}.txt"
 
     total_files = total_chunks = 0
+    # Same budget semantics as a real index run: --limit caps the whole preview.
+    limit = getattr(args, "limit", None)
+    per_source = getattr(args, "limit_per_source", False)
+    remaining = limit
 
     with out_path.open("w", encoding="utf-8") as fh:
         def p(*a, **kw):
@@ -382,6 +405,8 @@ def _preview_chunks(sources: list[DataSourceBase], config: Config,
             print(*a, **kw)
 
         for source in sources:
+            if limit is not None and not per_source and remaining <= 0:
+                break
             chunker = source.make_chunker(chunk_size, overlap, min_chunk)
             files = source.get_files()
             if file_filter:
@@ -389,9 +414,10 @@ def _preview_chunks(sources: list[DataSourceBase], config: Config,
                 if not files:
                     print(f"[{source.source_id}] No file named '{file_filter}' found.", file=sys.stderr)
                     continue
-            limit = getattr(args, "limit", None)
             if limit is not None:
-                files = files[:limit]
+                files = files[:limit if per_source else remaining]
+                if not per_source:
+                    remaining -= len(files)
 
             p(f"\n{'='*60}")
             p(f"Source: {source.source_id}  |  {len(files)} file(s)  |  chunk_size={chunk_size}")
@@ -752,14 +778,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb index                                         incremental: new/changed only\n"
             "  basic_kb index --force                                 re-embed the selected sources (same model)\n"
             "  basic_kb index --switch-model                          embedding model changed: wipe + rebuild all\n"
-            "  basic_kb index --limit 10                              embed only the first N files (test)\n"
+            "  basic_kb index --limit 10                              embed only the first N files total (test)\n"
             "  basic_kb status                                        chunk/doc counts per source\n"
             "  basic_kb scan                                          new/changed/deleted files vs the index\n"
             "  basic_kb watch                                         auto-reindex edited files (foreground)\n"
             "  basic_kb vacuum                                        compact the store file now\n\n"
             "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
-            "Index flags:   --force  --switch-model  --limit N  --preview [--file NAME]  --yes  --no-reindex-guard\n"
+            "Index flags:   --force  --switch-model  --limit N [--limit-per-source]  --preview [--file NAME]  --yes  --no-reindex-guard\n"
             "Throttle:      --throttle  --cores-fraction F  --priority low|normal  --pause-ms MS [--pause-every N]\n"
             "Watch:         --debounce SEC (0=immediate; per-source `watch:` config otherwise)\n"
             "Tuning (any):  --model NAME  --chunk-size N  --overlap N  --min-chunk N\n"
@@ -781,8 +807,13 @@ def build_parser() -> argparse.ArgumentParser:
                               "every source (implies --force and --source all). Without it a model mismatch "
                               "refuses to index anything.")
     p_index.add_argument("--limit", type=int, default=None, metavar="N",
-                         help="Index only the first N files per source (test runs). "
-                              "Example: index --limit 10")
+                         help="Index only the first N files in total across the selected sources, in "
+                              "source order (test runs). Sources left over once the budget is spent are "
+                              "skipped. Example: index --limit 10")
+    p_index.add_argument("--limit-per-source", action="store_true",
+                         help="Make --limit apply per source instead of to the run as a whole, so every "
+                              "selected source gets its own N files. "
+                              "Example: index --limit 5 --limit-per-source")
     p_index.add_argument("--preview", action="store_true",
                          help="Preview chunks without embedding (dry-run). "
                               "Example: index --source notes --preview --file some.md")
