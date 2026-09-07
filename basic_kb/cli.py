@@ -250,7 +250,8 @@ def _print_status(st, nudges: Optional[int] = None) -> None:
     """Human rendering of one SourceStatus: a fixed set of rows, one line each.
 
     `nudges` is how many freshness reminders this source has produced since its last
-    index; None when the reminder is switched off, which keeps it out of the output.
+    index, 0 included; None only when the reminder is switched off, which is the one
+    case that keeps it out of the output.
     """
     print(f"\n{'='*55}")
     print(f"Source  : {st.label}  ({st.source_id})")
@@ -280,8 +281,8 @@ def _print_status(st, nudges: Optional[int] = None) -> None:
         state = "untracked — index once to enable change detection"
     elif st.stale:
         parts = [f"{n} {w}" for n, w in ((st.pending, "new"), (st.deleted, "deleted")) if n]
-        if nudges:
-            parts.append(f"nudges {nudges}")
+        if nudges is not None:
+            parts.append(f"nudges {nudges}")   # 0 included: "not nagged yet" is information
         state = f"stale ({', '.join(parts)})"
     else:
         state = "up to date"
