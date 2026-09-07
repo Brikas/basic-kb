@@ -127,8 +127,9 @@ class Config:
     vacuum_enabled: bool = True        # auto-VACUUM the store when enough rows were deleted (see store.py)
     vacuum_deleted_fraction: float = 0.2  # deleted-since-vacuum / live rows that triggers it (Qdrant's default)
     vacuum_min_deleted: int = 1000     # ...but never for fewer deleted rows than this
-    reranker_type: str = "none"        # none | local | jina
+    reranker_type: str = "none"        # none, or a RERANKER_TYPES protocol key (see rerankers.py)
     reranker_model: Optional[str] = None
+    reranker_options: dict = field(default_factory=dict)  # rest of the `reranker:` block: base_url, api_key_env, top_k_param…
     cand_multiplier: int = 3           # candidates to rerank = clamp(n*mult, min, max)
     cand_min: int = 50
     cand_max: int = 200
@@ -193,11 +194,16 @@ def load_config(config_path: Path) -> Config:
     # `reranker:` may be a string ("local") or a mapping ({type, model, candidates}).
     rr = data.get("reranker")
     cand: dict = {}
+    reranker_options: dict = {}
     if isinstance(rr, str):
         reranker_type, reranker_model = rr.strip(), None
     elif isinstance(rr, dict):
         reranker_type, reranker_model = str(rr.get("type", "none")), rr.get("model")
         cand = rr.get("candidates", {}) or {}
+        # Everything else in the block is a backend constructor argument, so a new
+        # provider knob needs no change here.
+        reranker_options = {k: v for k, v in rr.items()
+                            if k not in ("type", "model", "candidates")}
     else:
         reranker_type, reranker_model = "none", None
 
@@ -248,6 +254,7 @@ def load_config(config_path: Path) -> Config:
         sources=sources,
         reranker_type=reranker_type,
         reranker_model=reranker_model,
+        reranker_options=reranker_options,
         cand_multiplier=int(cand.get("multiplier", 3)),
         cand_min=int(cand.get("min", 50)),
         cand_max=int(cand.get("max", 200)),

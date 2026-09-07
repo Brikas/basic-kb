@@ -29,8 +29,16 @@ chunker:                    # defaults; override per-run with CLI flags
   min_chunk_size: 50
 
 reranker:
-  type: local                   # local | jina (needs JINA_API_KEY) | none
-  model: jina-v2-multilingual   # optional; per-type default otherwise. Such as jina-reranker-v3 (API) or jina-v2-multilingual (local)
+  # `type` names the wire protocol, not the vendor — one protocol serves every
+  # vendor that speaks it. Pick the vendor with base_url / api_key_env / model.
+  type: local                   # local | deepinfra-compatible | jina-compatible | none
+  model: jina-v2-multilingual   # optional; per-type default otherwise
+  # Cloud examples — set `type` to match, and the key named by api_key_env must be reachable:
+  #   deepinfra-compatible  model Qwen/Qwen3-Reranker-0.6B   api_key_env DEEPINFRA_API_KEY
+  #   jina-compatible       model jina-reranker-v3           api_key_env JINA_API_KEY
+  #   jina-compatible       model rerank-3                   api_key_env VOYAGE_API_KEY
+  #                         base_url https://api.voyageai.com/v1/rerank   top_k_param top_k
+  # Local models (type: local): jina-v2-multilingual, ms-marco-MiniLM, bge-base, jina-v1-turbo
   # candidates:                   # how many top hits to rerank: clamp(n*multiplier, min, max)
   #   multiplier: 3               # fetch this × the requested result count (--n). DEF=3
   #   min: 50                     # ...but always at least this many. DEF=50

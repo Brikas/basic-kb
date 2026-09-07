@@ -1,7 +1,7 @@
 # basic-kb
 
 A small, config-driven semantic search engine over markdown/text. Local embeddings
-(FastEmbed/ONNX, no API) into a single SQLite file via sqlite-vec, exact cosine search, optional Jina reranking.
+(FastEmbed/ONNX, no API) into a single SQLite file via sqlite-vec, exact cosine search, optional cloud or on-device reranking.
 
 One engine, many **instances**. An instance is just a config file pointing at a
 store dir and a list of sources — so a work KB and a personal KB stay fully
@@ -126,10 +126,10 @@ without touching the committed config. Add `**/basic-kb.local.yaml` to your
 
 ## Secrets
 
-The engine reads `JINA_API_KEY` from the environment (reranking is skipped if
-absent). Provide it three ways, in precedence order: shell env > `--env-file PATH`
-> `env_file:` in the config. Secrets never go in the config — only a path to a
-dotenv file.
+A cloud reranker reads the API key named by its `api_key_env:` (see
+`rerankers.py`); reranking is skipped if the variable is absent. Provide it three
+ways, in precedence order: shell env > `--env-file PATH` > `env_file:` in the
+config. Secrets never go in the config — only a path to a dotenv file.
 
 `env_file:` is anchored to the config's directory. `env_file_search_up: N`
 (default 5) climbs up to N parent directories, nearest first, for the closest

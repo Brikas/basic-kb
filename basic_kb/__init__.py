@@ -51,7 +51,7 @@ from .errors import (
 )
 from .embedders import EmbedderBase, FastEmbedEmbedder
 from .models import Chunk, FileError, IndexResult, ParsedDocument, SearchResult, SourceStatus
-from .rerankers import JinaReranker, RerankerBase
+from .rerankers import DeepInfraCompatibleReranker, JinaCompatibleReranker, RerankerBase
 from .sources import DataSourceBase, MarkdownSource, TranscriptSource, build_source
 
 from .version import __version__  # noqa: E402
@@ -61,7 +61,7 @@ __all__ = [
     "KnowledgeBase", "ScanResult", "SqliteVecStore", "StoreError", "VacuumPolicy",
     "BasicKBError", "EmbeddingError", "IndexNotFound", "MassChangeRefused", "QueryFailed", "StoreError",
     "EmbedderBase", "FastEmbedEmbedder",
-    "RerankerBase", "JinaReranker",
+    "RerankerBase", "JinaCompatibleReranker", "DeepInfraCompatibleReranker",
     "Chunk", "ParsedDocument", "SearchResult",
     "FileError", "IndexResult", "SourceStatus",
     "DataSourceBase", "MarkdownSource", "TranscriptSource", "build_source",

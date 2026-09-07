@@ -15,11 +15,12 @@ Batch mode — each query returns its own top-n block (different needs in one ca
 Embedding / chunking overrides (override config defaults for one run):
   --model NAME  --chunk-size N  --overlap N  --min-chunk N
 
-Reranking (search only; on by default when JINA_API_KEY is set):
-  --no-rerank | --rerank (strict)  --reranker-model M  --rerank-candidates N
+Reranking (search only; on when the config's `reranker:` block selects a backend):
+  --no-rerank | --rerank (strict)  --reranker BACKEND  --reranker-model M  --rerank-candidates N
 
-Secrets: set JINA_API_KEY in the environment, pass --env-file PATH, or set
-`env_file:` in the config (CLI/shell win over the config file).
+Secrets: a cloud reranker reads the API key named by its `api_key_env:` (see
+rerankers.py). Set it in the environment, pass --env-file PATH, or set `env_file:`
+in the config (CLI/shell win over the config file).
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ from .version import __version__
 from .core import DEFAULT_N, KnowledgeBase, cores_to_threads, lower_process_priority, setup_file_logging
 from .embedders import FastEmbedEmbedder, build_embedder
 from .models import SearchResult
-from .rerankers import RerankerBase, build_reranker
+from .rerankers import RERANKER_TYPES, RerankerBase, build_reranker
 from .sources import DataSourceBase, build_source
 from .store import VacuumPolicy
 
@@ -81,19 +82,23 @@ def _build_kb(args: argparse.Namespace, config: Config, threads: Optional[int] =
         rtype = (getattr(args, "reranker", None) or config.reranker_type or "none").lower()
         rmodel = getattr(args, "reranker_model", None) or config.reranker_model
         strict = getattr(args, "rerank", False)
+        # A --reranker flag picks a different protocol, so the config's vendor
+        # options (base_url, api_key_env…) no longer apply — fall back to defaults.
+        ropts = config.reranker_options if rtype == (config.reranker_type or "").lower() else {}
         if rtype != "none":
             try:
-                reranker = build_reranker(rtype, rmodel)
+                reranker = build_reranker(rtype, rmodel, **ropts)
             except Exception as e:
-                # e.g. jina selected but no API key. Strict → fail; else cosine-only.
+                # e.g. a cloud backend with no API key. Strict → fail; else cosine-only.
                 if strict:
                     print(f"Error: reranker '{rtype}' unavailable: {e}", file=sys.stderr)
                     sys.exit(1)
                 print(f"Warning: reranker '{rtype}' unavailable, using cosine scores only ({e})",
                       file=sys.stderr)
         elif strict:
-            print("Error: --rerank set but no reranker chosen. Use --reranker local|jina "
-                  "or set `reranker:` in the config.", file=sys.stderr)
+            print(f"Error: --rerank set but no reranker chosen. Use --reranker "
+                  f"{'|'.join(sorted(RERANKER_TYPES))} or set `reranker:` in the config.",
+                  file=sys.stderr)
             sys.exit(1)
 
     return KnowledgeBase(embedder=embedder, store_dir=config.store_dir, reranker=reranker,
@@ -756,8 +761,10 @@ def _rerank_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--no-rerank", action="store_true", help="Disable reranking entirely")
     group.add_argument("--rerank", action="store_true",
                        help="Strict mode: error instead of falling back if the reranker fails")
-    parser.add_argument("--reranker", choices=["local", "jina", "none"], default=None,
-                        help="Reranker backend, overriding the config (local=on-device, jina=cloud)")
+    # Choices track the registry, so registering a backend needs no CLI edit.
+    parser.add_argument("--reranker", choices=sorted(RERANKER_TYPES) + ["none"], default=None,
+                        help="Reranker backend, overriding the config "
+                             "(local=on-device, everything else=cloud)")
     parser.add_argument("--reranker-model", default=None, metavar="MODEL",
                         help="Reranker model/alias for the chosen backend (default: per-backend)")
     parser.add_argument("--rerank-candidates", type=int, default=None, metavar="N",
@@ -784,7 +791,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb watch                                         auto-reindex edited files (foreground)\n"
             "  basic_kb vacuum                                        compact the store file now\n\n"
             "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
-            "Reranking:     --reranker local|jina|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
+            "Reranking:     --reranker local|jina-compatible|deepinfra-compatible|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --switch-model  --limit N [--limit-per-source]  --preview [--file NAME]  --yes  --no-reindex-guard\n"
             "Throttle:      --throttle  --cores-fraction F  --priority low|normal  --pause-ms MS [--pause-every N]\n"
             "Watch:         --debounce SEC (0=immediate; per-source `watch:` config otherwise)\n"

@@ -352,11 +352,27 @@ class KnowledgeBase:
             source_id=source.source_id, label=source.label,
             files_on_disk=len(files), limited_to=limit,
         )
+
+        # Read up here, not at the pre-scan below, because the empty-source case needs
+        # it. An emptied source is not a no-op: the manifest still names files whose
+        # vectors are now orphans, and orphans stay searchable until something prunes
+        # them. Returning early on `not files` left exactly that behind.
+        stored_manifest: dict = self.store.manifest(source.source_id)
+
         if not files:
-            result.abort_reason = f"No files found for source {source.label!r}."
-            logger.warning("index: no files for source=%s", source.source_id)
-            self._emit(on_progress, result.abort_reason)
-            return result
+            # A --limit run only ever sees a subset of the source, so absent files
+            # there are not deletions and must never be pruned. Otherwise there is
+            # only nothing to do when nothing is recorded and no rebuild was asked for.
+            if limit is not None or not (stored_manifest or force):
+                result.abort_reason = f"No files found for source {source.label!r}."
+                logger.warning("index: no files for source=%s", source.source_id)
+                self._emit(on_progress, result.abort_reason)
+                return result
+            if stored_manifest:
+                self._emit(on_progress, (
+                    f"No files on disk for {source.label!r} but {len(stored_manifest)} "
+                    f"indexed — reconciling, every file prunes."
+                ))
 
         if limit is not None:
             files = files[:limit]
@@ -369,7 +385,7 @@ class KnowledgeBase:
                 self._emit(on_progress, f"Cleared existing index for {source.source_id!r} ({n} chunks).")
 
         # Pre-scan: hash every file once and decide the real work up front.
-        prev_manifest: dict = {} if force else self.store.manifest(source.source_id)
+        prev_manifest: dict = {} if force else stored_manifest
         entries = [(f, self._rel_path(source, f), _file_hash(f)) for f in files]
         seen: dict[str, str] = {rp: h for _, rp, h in entries}
         to_process = [(f, rp, h) for f, rp, h in entries if prev_manifest.get(rp) != h]

@@ -21,7 +21,9 @@ KnowledgeBase
 ├── SqliteVecStore          — one SQLite file: vec0 vectors + chunks + per-file manifest; auto-VACUUM
 ├── RerankerBase (ABC)         — pluggable via RERANKER_TYPES; `reranker:` config picks one
 │   ├── FastEmbedReranker   — local ONNX cross-encoder (no API key)
-│   └── JinaReranker        — Jina AI API (/v1/rerank)
+│   └── RerankAPIBase       — bearer-auth HTTP: Session, retries, error handling
+│       ├── JinaCompatibleReranker      — /v1/rerank (Jina, Voyage, SiliconFlow)
+│       └── DeepInfraCompatibleReranker — DeepInfra /v1/inference/<model>
 └── SearchResult (dataclass) — carries doc, metadata, cosine score, rerank_score
 ```
 
@@ -34,7 +36,7 @@ KnowledgeBase
 **Flow — search:**
 1. Embed each query once via the same `FastEmbedEmbedder`
 2. `SqliteVecStore.knn()` per source (exact cosine, `k`, optional `content_type`), merge by chunk id (keep highest score)
-3. Optional: send top-N candidates to `JinaReranker.rerank()` → reorder by cross-attention score
+3. Optional: send top-N candidates to the configured `RerankerBase.rerank()` → reorder by cross-attention score
 4. Print results with both cosine score and rerank score (when reranking)
 
 ---
@@ -45,7 +47,7 @@ KnowledgeBase
 |---|---|
 | `basic_kb/models.py` | Dataclasses: SearchResult, ParsedDocument, Chunk |
 | `basic_kb/embedders.py` | EmbedderBase, FastEmbedEmbedder (batch size bounds peak RAM) |
-| `basic_kb/rerankers.py` | RerankerBase, FastEmbedReranker, JinaReranker, `build_reranker` |
+| `basic_kb/rerankers.py` | RerankerBase, FastEmbedReranker, RerankAPIBase + protocol subclasses, `build_reranker` |
 | `basic_kb/textsplit.py` | Recursive character splitter (`split_text`) |
 | `basic_kb/chunkers.py` | ChunkerBase, RecursiveChunker, BreadcrumbHeadingChunker, `build_chunker` |
 | `basic_kb/sources.py` | DataSourceBase, MarkdownSource, TranscriptSource, `build_source` |
@@ -91,6 +93,19 @@ watchdog ≥ 4 on Linux emits `opened`/`closed_no_write` for plain reads. The wa
 ### 2026-08-29 — fastembed's default `batch_size=256` peaks at ~4 GB on one 241-chunk file
 
 Attention memory ∝ batch × seq_len² and onnxruntime's arena never returns the peak. `embed_batch_size` (default 8) bounds it at ~0.5 GB with identical throughput. Measured on bge-small, 2 threads.
+
+---
+
+### 2026-08-27 — an emptied source must still reconcile, or its vectors are orphaned
+
+`index()` used to return early on `if not files`. That path runs before `deleted_files` is computed and before the prune, so emptying a source left every one of its vectors in Chroma, still searchable, with nothing in the output to say so. Chunk count staying flat was the only signal.
+
+**Fix:** the manifest is read before the empty check, and an empty source is a no-op only when nothing is recorded for it. Otherwise the run proceeds with zero files on disk and prunes the whole source. Two conditions stay exempt:
+
+- `--limit N` — a capped run only ever sees a subset, so absent files there are not deletions.
+- Nothing recorded and no `--force` — a source that was never indexed has nothing to reconcile.
+
+The mass-change guard now covers this too: emptying a source of 5+ indexed files is 100% churn, so an unattended run refuses and leaves the index intact. A vanished mount no longer wipes an index; `--yes` accepts. Any prune path that skips the manifest read is the same bug again.
 
 ---
 
