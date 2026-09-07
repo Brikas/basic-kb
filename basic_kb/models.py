@@ -97,6 +97,7 @@ class SourceStatus:
     new: int = 0
     updated: int = 0
     deleted: int = 0
+    indexed_at: Optional[float] = None  # epoch seconds of the last index run; None if unstamped
     date_min: Optional[str] = None
     date_max: Optional[str] = None
     content_types: dict[str, int] = field(default_factory=dict)
@@ -105,6 +106,12 @@ class SourceStatus:
     @property
     def stale(self) -> int:
         return self.new + self.updated + self.deleted
+
+    @property
+    def pending(self) -> int:
+        """Files the next index run has to embed — created and edited alike. Splitting
+        those two tells a reader nothing: both mean "not in the index yet"."""
+        return self.new + self.updated
 
     @property
     def approx_tokens(self) -> int:

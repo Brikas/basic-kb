@@ -165,8 +165,93 @@ def _confirm_mass_change_on_tty(detail) -> bool:
         return False
 
 
-def _print_status(st) -> None:
-    """Human rendering of one SourceStatus: a fixed set of rows, one line each."""
+def _freshness_state(config: Config) -> dict:
+    """Per-source nudge state from the store dir: `{source: {first_stale, last_eval, nudges}}`.
+
+    Written by the post-search reminder, read here so `status` can report how many
+    nudges a stale source has already produced. A corrupt file reads as "never
+    checked" — the reminder rewrites it on its next pass.
+    """
+    path = config.store_dir / "freshness_state.json"
+    if not path.exists():
+        return {}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print(f"⚠  freshness state at {path} is not valid JSON; nudge counts start over.",
+              file=sys.stderr)
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _clear_nudges(config: Config, source_ids: list[str]) -> None:
+    """Drop the nudge state for sources that just finished indexing.
+
+    An index run is the thing a nudge asks for, so the count and the stale clock both
+    start over here rather than waiting for the next search to notice.
+    """
+    path = config.store_dir / "freshness_state.json"
+    if not path.exists():
+        return
+    state = _freshness_state(config)
+    # A list, not any(): any() short-circuits and would leave later sources in place.
+    removed = [sid for sid in source_ids if state.pop(sid, None) is not None]
+    if removed:
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _nudges_for(state: dict, source_id: str) -> int:
+    """Nudges emitted for this source since its last index. Legacy state files hold
+    no counter, which reads as 0 until the next reminder writes one."""
+    entry = state.get(source_id)
+    return int(entry.get("nudges", 0)) if isinstance(entry, dict) else 0
+
+
+def _ago(ts: Optional[float]) -> str:
+    """Coarse age of a timestamp for a status row: minutes, hours or days.
+
+    One unit, no calendar date — reading a status you want to know whether the index
+    is an hour or a week behind, not which day the run happened.
+    """
+    if not ts:
+        return "unknown"
+    secs = max(0.0, time.time() - ts)
+    if secs < 90:
+        return "just now"
+    if secs < 90 * 60:
+        return f"{round(secs / 60)}m ago"
+    if secs < 36 * 3600:
+        return f"{round(secs / 3600)}h ago"
+    return f"{round(secs / 86400)}d ago"
+
+
+def _print_inspect(config: Config) -> None:
+    """Resolved runtime detail that reading the config file does not give you.
+
+    One section for now: the freshness nudge exactly as it will be rendered, so you
+    can see the built-in template when the config overrides nothing.
+    """
+    from .config import DEFAULT_FRESHNESS_MESSAGE
+
+    print(f"\nInstance '{config.name or '(unnamed)'}'  ({config.path})")
+    origin = "default" if config.freshness_message == DEFAULT_FRESHNESS_MESSAGE else "config override"
+    print("\nFreshness nudge")
+    print(f"  enabled           : {config.freshness_enabled}")
+    print(f"  stale_after_days  : {config.freshness_stale_after_days:g}")
+    print(f"  remind_every_days : {config.freshness_remind_every_days:g}")
+    print(f"  template ({origin}):")
+    print(f"    {config.freshness_message}")
+    print("\n  placeholders: {source} {new} {updated} {deleted} {unchanged} {stale} "
+          "{total} {days} {nudges}")
+    print(f"  nudge state: {config.store_dir / 'freshness_state.json'}")
+
+
+def _print_status(st, nudges: Optional[int] = None) -> None:
+    """Human rendering of one SourceStatus: a fixed set of rows, one line each.
+
+    `nudges` is how many freshness reminders this source has produced since its last
+    index; None when the reminder is switched off, which keeps it out of the output.
+    """
     print(f"\n{'='*55}")
     print(f"Source  : {st.label}  ({st.source_id})")
     print(f"Store   : {st.store_dir}")
@@ -182,22 +267,25 @@ def _print_status(st) -> None:
         return
 
     print(f"Chunks  : {st.chunks:,}")
-    print(f"Tokens  : ~{st.approx_tokens:,}  ({st.chars:,} chars, 4 chars/token)")
+    print(f"Tokens  : ~{st.approx_tokens:,}  ({st.chars:,} chars)")
     print(f"Docs    : {st.docs_with_chunks:,} with chunks / {st.files_on_disk:,} files on disk")
 
-    # One `State` row. Files too short to chunk are tracked (hashed) but hold no chunks,
-    # so they never count as missing — that is why Docs can be below files on disk.
+    # One `State` row: the state, how much work is waiting, and how old the index is.
+    # Files too short to chunk are tracked (hashed) but hold no chunks, so they never
+    # count as missing — that is why Docs can be below files on disk.
     if st.files_on_disk == 0:
         why = "source path missing" if not st.directory_exists else "directory holds no matching files"
         state = f"⚠  0 files on disk ({why}); {st.docs_with_chunks:,} indexed docs orphaned"
     elif not st.tracked:
         state = "untracked — index once to enable change detection"
     elif st.stale:
-        parts = [f"{n} {w}" for n, w in ((st.new, "new"), (st.updated, "changed"), (st.deleted, "deleted")) if n]
-        state = f"stale — {', '.join(parts)} since last index"
+        parts = [f"{n} {w}" for n, w in ((st.pending, "new"), (st.deleted, "deleted")) if n]
+        if nudges:
+            parts.append(f"nudges {nudges}")
+        state = f"stale ({', '.join(parts)})"
     else:
         state = "up to date"
-    print(f"State   : {state}")
+    print(f"State   : {state}. Last index: {_ago(st.indexed_at)}")
 
     if st.date_min:
         print(f"Dates   : {st.date_min} → {st.date_max}")
@@ -373,6 +461,8 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
             # the two is smaller.
             remaining -= min(result.files_on_disk, source_limit)
 
+    _clear_nudges(config, [r.source_id for r in results if not r.aborted])
+
     if as_json:
         emit_json(results)
 
@@ -533,8 +623,9 @@ def cmd_status(args: argparse.Namespace, config: Config) -> None:
     if getattr(args, "json", False):
         emit_json(statuses)
         return
+    state = _freshness_state(config) if config.freshness_enabled else {}
     for st in statuses:
-        _print_status(st)
+        _print_status(st, _nudges_for(state, st.source_id) if config.freshness_enabled else None)
 
 
 def _print_info(inf) -> None:
@@ -670,10 +761,10 @@ def _legacy_chroma_notice(config: Config) -> None:
         file=sys.stderr, end="")
 
 
-def _format_freshness(template: str, res, days: int) -> str:
+def _format_freshness(template: str, res, days: int, nudges: int) -> str:
     fields = dict(source=res.source_id, new=res.new, updated=res.updated,
                   deleted=res.deleted, unchanged=res.unchanged, stale=res.stale,
-                  total=res.files_on_disk, days=days)
+                  total=res.files_on_disk, days=days, nudges=nudges)
     try:
         return template.format(**fields)
     except (KeyError, IndexError) as e:
@@ -690,19 +781,16 @@ def _freshness_reminder(kb: KnowledgeBase, sources: list[DataSourceBase], config
     for as long as it stays un-indexed. Re-indexing (source goes clean) clears the
     per-source state, so it must age past the threshold again before it can nag.
 
-    Per-source state is `{first_stale, last_eval}`. The `last_eval` gate means we
-    re-scan a source at most once per remind window, which both bounds the hashing
-    cost to once/day and gives the once/day nag cadence.
+    Per-source state is `{first_stale, last_eval, nudges}`. The `last_eval` gate means
+    we re-scan a source at most once per remind window, which both bounds the hashing
+    cost to once/day and gives the once/day nag cadence. `nudges` counts the reminders
+    already emitted since the last index; `status` reports it and the reset on a clean
+    source zeroes it, so a rising count is how a caller sees a nudge being ignored.
     """
     if not config.freshness_enabled:
         return
     state_path = config.store_dir / "freshness_state.json"
-    state: dict = {}
-    if state_path.exists():
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            state = {}   # treat corrupt state as "never checked"; it gets rewritten below
+    state = _freshness_state(config)
 
     now = time.time()
     stale_after = max(0.0, config.freshness_stale_after_days) * 86400
@@ -721,10 +809,12 @@ def _freshness_reminder(kb: KnowledgeBase, sources: list[DataSourceBase], config
             state.pop(s.source_id, None)   # clean or freshly re-indexed → reset the clock
             continue
         first_stale = float(st.get("first_stale") or now)   # start counting on first sighting
-        state[s.source_id] = {"first_stale": first_stale, "last_eval": now}
+        nudges = _nudges_for(state, s.source_id)
         if now - first_stale >= stale_after:
+            nudges += 1                                     # this pass is about to nag
             messages.append(_format_freshness(config.freshness_message, res,
-                                              int(config.freshness_stale_after_days)))
+                                              int(config.freshness_stale_after_days), nudges))
+        state[s.source_id] = {"first_stale": first_stale, "last_eval": now, "nudges": nudges}
 
     if dirty:
         state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -789,7 +879,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb status                                        chunk/doc counts per source\n"
             "  basic_kb scan                                          new/changed/deleted files vs the index\n"
             "  basic_kb watch                                         auto-reindex edited files (foreground)\n"
-            "  basic_kb vacuum                                        compact the store file now\n\n"
+            "  basic_kb vacuum                                        compact the store file now\n"
+            "  basic_kb --inspect                                     resolved settings (freshness template)\n\n"
             "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina-compatible|deepinfra-compatible|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --switch-model  --limit N [--limit-per-source]  --preview [--file NAME]  --yes  --no-reindex-guard\n"
@@ -800,6 +891,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # A subparser's defaults overwrite the parent's on the namespace, so `--config`
+    # stays per-command; --inspect resolves it from $BASIC_KB_CONFIG or the walk-up.
+    parser.add_argument("--inspect", action="store_true",
+                        help="Print resolved runtime settings for this instance (currently the "
+                             "freshness nudge template in force) and exit. Takes no command: "
+                             "basic_kb --inspect")
     # Not required: a bare `basic_kb` (or `basic_kb help`) prints help instead of erroring.
     sub = parser.add_subparsers(dest="cmd")
 
@@ -915,12 +1012,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     # Bare invocation or `help` → print top-level help and exit (no config needed).
-    if args.cmd in (None, "help"):
+    if args.cmd in (None, "help") and not args.inspect:
         parser.print_help()
         return
 
     # Resolve the config: explicit flag > $BASIC_KB_CONFIG > basic-kb.yaml up the tree.
-    config_path = Path(args.config).expanduser() if args.config else find_config()
+    config_path = Path(getattr(args, "config", None)).expanduser() if getattr(args, "config", None) else find_config()
     if config_path is None:
         print(
             "No config found. Do one of:\n"
@@ -940,6 +1037,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     if config.log_file:
         setup_file_logging(config.log_file, config.log_level,
                            config.log_max_bytes, config.log_backup_count)
+
+    if args.inspect:
+        _print_inspect(config)
+        return
 
     _legacy_chroma_notice(config)   # TEMPORARY — see the function's comment
 

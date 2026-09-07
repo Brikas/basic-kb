@@ -43,10 +43,10 @@ CONFIG_FILENAMES = ("basic-kb.yaml", "basic-kb.yml")
 _LOCAL_SUFFIXES = (".local.yaml", ".local.yml")
 # Shown after a search when a source hasn't been re-indexed in a while and has
 # drifted. Placeholders: {source} {new} {updated} {deleted} {unchanged} {stale}
-# {total} {days}. Override via `freshness.message` in the config.
+# {total} {days} {nudges}. Override via `freshness.message` in the config.
 DEFAULT_FRESHNESS_MESSAGE = (
     "[basic-kb] Source '{source}' looks stale since the last index: "
-    "{new} new, {updated} changed, {deleted} deleted file(s). "
+    "{stale} file(s) waiting; reminder {nudges} since then. "
     "Consider prompting the user if they want to re-index (basic-kb index --source {source})."
 )
 

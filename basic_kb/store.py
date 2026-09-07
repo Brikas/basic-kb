@@ -8,7 +8,8 @@ delete is a real delete, and nothing has to live in RAM.
 Layout (one database per instance, `<store_dir>/kb.sqlite3`):
 
     meta   (key, value)                       model id, vector dimension, schema version,
-                                               rows deleted since the last VACUUM
+                                               rows deleted since the last VACUUM, and
+                                               `indexed_at:<source>` per-source run times
     files  (source, rel_path, hash)           every file seen at index time -> content hash
                                                (the old manifest.json); powers scan/stale
     chunks (id, source, rel_path, chunk_id, doc, meta_json, content_type, date)
@@ -211,6 +212,31 @@ class SqliteVecStore:
         with self._connect() as con:
             return con.execute("SELECT 1 FROM files WHERE source = ? LIMIT 1", (source,)).fetchone() is not None
 
+    def set_indexed_at(self, source: str, ts: Optional[float] = None) -> None:
+        """Stamp when this source finished an index run (epoch seconds, in `meta`).
+
+        Called by the writer after the manifest is up to date, so a reader can say how
+        old the index is without inspecting file mtimes.
+        """
+        with self._connect() as con:
+            self._meta_set(con, f"indexed_at:{source}", repr(ts if ts is not None else time.time()))
+            con.commit()
+
+    def indexed_at(self, source: str) -> Optional[float]:
+        """Epoch seconds of this source's last index run, or None if never stamped
+        (a store written before stamping existed — it re-stamps on the next index)."""
+        if not self.exists():
+            return None
+        with self._connect() as con:
+            raw = self._meta_get(con, f"indexed_at:{source}")
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning("store: unparseable indexed_at for source=%s: %r", source, raw)
+            return None
+
     def sources(self) -> list[str]:
         """Source ids that have anything indexed (manifest entries)."""
         if not self.exists():
@@ -228,6 +254,7 @@ class SqliteVecStore:
             n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]
             con.execute("DELETE FROM chunks")
             con.execute("DELETE FROM files")
+            con.execute("DELETE FROM meta WHERE key LIKE 'indexed_at:%'")
             self._reset_vectors(con)
             self._meta_set(con, "deleted_since_vacuum", "0")
             con.commit()

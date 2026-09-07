@@ -485,6 +485,7 @@ class KnowledgeBase:
             result.pruned = self.store.remove_files(source.source_id, deleted_files)
 
         result.total_chunks = self.store.count(source.source_id)
+        self.store.set_indexed_at(source.source_id)
         self._emit(on_progress, (
             f"\nDone [{source.source_id}].\n"
             f"  files:  new={result.added} updated={result.updated} "
@@ -574,6 +575,10 @@ class KnowledgeBase:
             counts["chunks_reused"] += n_kept
             logger.info("reindex_paths: %s/%s — %d chunks embedded, %d reused",
                         source.source_id, rp, n_new, n_kept)
+        # The watcher's writes keep the index current too, so they move the clock.
+        # An all-unchanged pass wrote nothing and leaves the stamp alone.
+        if counts["embedded"] or counts["empty"] or counts["pruned"]:
+            self.store.set_indexed_at(source.source_id)
         return counts
 
     def vacuum(self) -> bool:
@@ -799,6 +804,7 @@ class KnowledgeBase:
             st.indexed = True
             st.chunks = self.store.count(source.source_id)
             st.chars = self.store.chars(source.source_id)
+            st.indexed_at = self.store.indexed_at(source.source_id)
 
             res = self.scan(source)
             st.files_on_disk = res.files_on_disk

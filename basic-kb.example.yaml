@@ -60,9 +60,10 @@ log_level: INFO               # DEBUG | INFO | WARNING
 # After a search, basic-kb diffs the queried source(s) against the index and, if
 # they've stayed stale, prints a one-line nudge. A source must be stale for
 # `stale_after_days` before the FIRST nudge; then it re-nags at most once per
-# `remind_every_days` until you re-index (re-indexing resets the clock). 
+# `remind_every_days` until you re-index (re-indexing resets the clock and the count).
 # (hashes files at most once per remind window, no embedding). enabled: false turns it off.
-# message placeholders: {source} {new} {updated} {deleted} {unchanged} {stale} {total} {days}
+# `status` reports the running count as `nudges N` while a source stays stale.
+# message placeholders: {source} {new} {updated} {deleted} {unchanged} {stale} {total} {days} {nudges}
 freshness:
   enabled: true
   stale_after_days: 3     # don't nag until a source has been stale this long

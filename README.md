@@ -22,9 +22,10 @@ inside it — the config is found automatically (like `git` finds `.git`):
 cd my-instance/            # the folder holding basic-kb.yaml
 basic-kb index             # build/refresh the index
 basic-kb search "the thing I'm looking for"
-basic-kb status            # chunk/doc counts
+basic-kb status            # chunk/doc counts, files waiting, index age
 basic-kb scan              # what's new/changed/deleted vs the index (no embedding)
 basic-kb search --source list      # list configured sources
+basic-kb --inspect         # resolved settings (the freshness nudge template in force)
 ```
 
 (`basic-kb …` and `python -m basic_kb …` are equivalent.)
@@ -72,8 +73,10 @@ Indexing is incremental at two levels: a file whose hash is unchanged is skipped
 time) and reports new/changed/deleted counts without embedding anything. After a
 search, basic-kb nudges you about a source only once it has stayed stale for
 `stale_after_days` (default 3), then at most once per `remind_every_days` (default 1)
-until you re-index — re-indexing resets the clock. Tune or disable it under
-`freshness:` in the config.
+until you re-index — re-indexing resets both the clock and the nudge count. Each nudge
+carries the running count (`{nudges}`), and `status` shows it alongside the pending
+files, so an ignored source is visible as a rising number. Tune or disable it under
+`freshness:` in the config; `basic-kb --inspect` prints the template in force.
 
 ## Query writing
 
