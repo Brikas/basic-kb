@@ -12,19 +12,28 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from .chunkers import DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK, DEFAULT_OVERLAP
-from .embedders import EmbedderBase
+from .config import Config
+from .embedders import EmbedderBase, build_embedder
 from .errors import IndexNotFound, MassChangeRefused, QueryFailed, StoreError
-from .models import FileError, IndexResult, InstanceInfo, SearchResult, SourceInfo, SourceStatus
-from .rerankers import RerankerBase
+from .freshness import FreshnessSettings, FreshnessTracker
+from .lock import WriterLock
+from .models import (
+    FileError, IndexResult, InstanceInfo, PreviewChunk, PreviewFile, ReindexResult, ScanResult, SearchResult,
+    SourceInfo, SourceStatus, VacuumResult,
+)
+from .rerankers import RerankerBase, build_reranker
 from .sources import DataSourceBase
 from .store import SqliteVecStore, VacuumPolicy
 
 DEFAULT_N = 15
+
+# The public operations every surface exposes: KnowledgeBase methods, RemoteKnowledgeBase
+# methods, API routes and CLI commands. tests/test_parity.py checks all four stay in step.
+OPERATIONS = ("search", "search_grouped", "index", "index_many", "preview", "status", "scan", "info", "vacuum")
 
 # Absolute floor for the mass-change guard: below this many changed/deleted files a
 # high churn fraction is just a small source being edited, not corruption — don't nag.
@@ -98,24 +107,6 @@ def cores_to_threads(fraction: Optional[float]) -> Optional[int]:
     return max(1, round(fraction * cpu))
 
 
-@dataclass
-class ScanResult:
-    """Read-only diff of a source's files on disk vs. what was last indexed."""
-    source_id: str
-    label: str
-    tracked: bool        # False if nothing indexed yet for this source
-    files_on_disk: int
-    new: int
-    updated: int
-    unchanged: int
-    deleted: int
-
-    @property
-    def stale(self) -> int:
-        """Files that differ from the index (would change it on re-index)."""
-        return self.new + self.updated + self.deleted
-
-
 class KnowledgeBase:
     """
     Orchestrates indexing and semantic search across one or more DataSources.
@@ -130,30 +121,69 @@ class KnowledgeBase:
         store_dir: Path,
         reranker: Optional[RerankerBase] = None,
         vacuum: Optional[VacuumPolicy] = None,
+        writer_lock_timeout: float = 5.0,
     ) -> None:
         self.embedder = embedder
         self.store_dir = Path(store_dir)
         self.store = SqliteVecStore(self.store_dir, vacuum=vacuum)
         self.reranker = reranker
-        # Serialises writes within this process: SQLite allows one writer at a time and
-        # index()/reindex_paths() read-then-write. Reentrant: index() holds it while
-        # calling helpers that take it too.
-        # NOTE: process-local. Two processes on one store still need external
-        # coordination — see README.
+        # Two locks, taken in this order by every write. The RLock serialises writers
+        # within this process (SQLite allows one writer; index()/reindex_paths() read
+        # then write). The WriterLock is the OS-level one that keeps a second *process*
+        # out: a server or watcher holds it for its lifetime (see lock.py), and a write
+        # from another process fails with StoreBusy instead of racing.
         self._write_lock = threading.RLock()
+        self.writer_lock = WriterLock(self.store_dir, timeout=writer_lock_timeout)
 
-    # --- TEMPORARY: legacy Chroma store detection --------------------------------------
-    def legacy_chroma_leftovers(self) -> list[Path]:
-        """Pre-ADR-0001 ChromaDB files still present in store_dir (empty list = none).
+    @classmethod
+    def from_config(
+        cls,
+        config: Config,
+        *,
+        model: Optional[str] = None,
+        threads: Optional[int] = None,
+        reranker: Optional[str] = "config",
+        reranker_model: Optional[str] = None,
+        strict_reranker: bool = False,
+        on_warning: Optional[Callable[[str], None]] = None,
+    ) -> "KnowledgeBase":
+        """Build a KnowledgeBase the way an instance config describes it.
 
-        TEMPORARY (2026-08-29): remove together with SqliteVecStore.legacy_chroma_leftovers
-        once every instance on every machine has been rebuilt on sqlite-vec.
+        This is the composition root shared by the CLI, the server and module users:
+        embedder from the `embedding:` block (via EMBEDDER_PROVIDERS), reranker from the
+        `reranker:` block (via RERANKER_TYPES), vacuum policy from `vacuum:`.
+
+        `model` overrides `embedding_model` for this instance (same provider). `threads`
+        caps the local embedder's CPU threads. `reranker` is "config" (use the config's
+        block), "none" (search on cosine only) or a RERANKER_TYPES key that replaces the
+        configured protocol, in which case the block's vendor options no longer apply.
+        A reranker that cannot be built (a cloud backend without its API key, an unknown
+        key) is reported through `on_warning` and left out, unless `strict_reranker`, which
+        re-raises. The library prints nothing; the CLI passes a printer.
         """
-        found = self.store.legacy_chroma_leftovers()
-        if found:
-            logger.warning("legacy ChromaDB store found in %s (%d item(s)); rebuild with `basic_kb index --force`",
-                           self.store_dir, len(found))
-        return found
+        if model and model != config.embedding_model:
+            from dataclasses import replace
+            config = replace(config, embedding_model=model)
+        embedder = build_embedder(config, threads=threads)
+
+        rr: Optional[RerankerBase] = None
+        rtype = (reranker if reranker not in (None, "config") else config.reranker_type or "none").lower()
+        if rtype != "none":
+            options = config.reranker_options if rtype == (config.reranker_type or "").lower() else {}
+            rmodel = reranker_model or (config.reranker_model if options is config.reranker_options else None)
+            try:
+                rr = build_reranker(rtype, rmodel, **options)
+            except Exception as e:
+                if strict_reranker:
+                    raise
+                logger.warning("reranker %r unavailable, using cosine scores only: %s", rtype, e)
+                if on_warning is not None:
+                    on_warning(f"reranker '{rtype}' unavailable, using cosine scores only ({e})")
+
+        vacuum = VacuumPolicy(enabled=config.vacuum_enabled,
+                              deleted_fraction=config.vacuum_deleted_fraction,
+                              min_deleted=config.vacuum_min_deleted)
+        return cls(embedder=embedder, store_dir=config.store_dir, reranker=rr, vacuum=vacuum)
 
     def prepare_model_switch(self, sources: list[DataSourceBase], accept: bool = False) -> Optional[str]:
         """Call before a (re)index run. If the store was built with a different embedding model
@@ -177,7 +207,7 @@ class KnowledgeBase:
             raise StoreError(
                 f"Model switch needs every indexed source in the run; missing: {', '.join(missing)}. "
                 f"Run `basic_kb index --switch-model` without --source (all sources are rebuilt).")
-        with self._write_lock:
+        with self._write_lock, self.writer_lock:
             n = self.store.clear_all()
         msg = f"Model switch {info[0]!r} -> {self.embedder.model_id!r}: cleared {n} chunks across {sorted(indexed)}."
         logger.warning(msg)
@@ -337,7 +367,7 @@ class KnowledgeBase:
         Each file is committed as it completes, so an interrupted run resumes rather
         than starting over.
         """
-        with self._write_lock:
+        with self._write_lock, self.writer_lock:
             return self._index_locked(
                 source, chunk_size, overlap, min_chunk, force, limit, pause_ms,
                 pause_every, guard, guard_threshold, assume_yes, on_progress, on_confirm,
@@ -502,6 +532,97 @@ class KnowledgeBase:
                     result.empty, result.pruned, result.total_chunks, len(result.errors))
         return result
 
+    def index_many(
+        self,
+        sources: list[DataSourceBase],
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        overlap: int = DEFAULT_OVERLAP,
+        min_chunk: int = DEFAULT_MIN_CHUNK,
+        force: bool = False,
+        limit: Optional[int] = None,
+        limit_per_source: bool = False,
+        switch_model: bool = False,
+        pause_ms: int = 0,
+        pause_every: int = 50,
+        guard: bool = True,
+        guard_threshold: float = 0.9,
+        assume_yes: bool = False,
+        on_progress: Optional[Callable[[str], None]] = None,
+        on_confirm: Optional[Callable[[MassChangeRefused], bool]] = None,
+    ) -> list[IndexResult]:
+        """One index run over several sources, the way the CLI and the server do it.
+
+        `limit` is a budget for the whole run, spent source by source in order, so
+        `limit=3` across three sources embeds 3 files total; `limit_per_source` gives
+        every source its own N. `switch_model` accepts an embedding-model change: the
+        store is wiped and every source re-embedded (implies `force`); without it a
+        model mismatch raises StoreError before anything is touched. Sources that
+        finished without aborting have their freshness nudges cleared. Returns one
+        IndexResult per source that ran; sources skipped once the budget was spent are
+        absent from the list.
+        """
+        force = force or switch_model
+        note = self.prepare_model_switch(sources, accept=switch_model)
+        if note:
+            self._emit(on_progress, note)
+        remaining = limit
+        results: list[IndexResult] = []
+        for i, source in enumerate(sources):
+            source_limit = limit
+            if limit is not None and not limit_per_source:
+                if remaining <= 0:
+                    skipped = ", ".join(s.source_id for s in sources[i:])
+                    self._emit(on_progress, f"[limit] budget of {limit} file(s) spent — skipping: {skipped}")
+                    break
+                source_limit = remaining
+            result = self.index(
+                source, chunk_size=chunk_size, overlap=overlap, min_chunk=min_chunk, force=force,
+                limit=source_limit, pause_ms=pause_ms, pause_every=pause_every, guard=guard,
+                guard_threshold=guard_threshold, assume_yes=assume_yes,
+                on_progress=on_progress, on_confirm=on_confirm,
+            )
+            results.append(result)
+            if limit is not None and not limit_per_source:
+                # files_on_disk is the pre-limit count, so the source spent whichever of
+                # the two is smaller.
+                remaining -= min(result.files_on_disk, source_limit)
+        # An index run is what a nudge asks for; the clock and count start over here.
+        FreshnessTracker(self.store_dir, FreshnessSettings()).clear(
+            [r.source_id for r in results if not r.aborted])
+        return results
+
+    def preview(
+        self,
+        source: DataSourceBase,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        overlap: int = DEFAULT_OVERLAP,
+        min_chunk: int = DEFAULT_MIN_CHUNK,
+        limit: Optional[int] = None,
+        file_name: Optional[str] = None,
+    ) -> list[PreviewFile]:
+        """Dry-run the chunker over a source: what would be embedded, without embedding.
+
+        Touches neither the store nor the embedder. `limit` caps the files (first N, stable
+        order); `file_name` restricts to files with that exact name. A file that parses to
+        nothing comes back with `body_chars == 0` and no chunks.
+        """
+        chunker = source.make_chunker(chunk_size, overlap, min_chunk)
+        files = source.get_files()
+        if file_name:
+            files = [f for f in files if f.name == file_name]
+        if limit is not None:
+            files = files[:limit]
+        out: list[PreviewFile] = []
+        for f in files:
+            rel = self._rel_path(source, f)
+            doc = source.parse_file(f)
+            if doc is None:
+                out.append(PreviewFile(rel_path=rel, body_chars=0))
+                continue
+            chunks = [PreviewChunk(text=c.text, breadcrumb=c.metadata.get("breadcrumb")) for c in chunker.chunk(doc)]
+            out.append(PreviewFile(rel_path=rel, body_chars=len(doc.body), chunks=chunks))
+        return out
+
     def stale_paths(self, source: DataSourceBase) -> list[Path]:
         """Files that differ from the manifest (new/changed on disk + deleted).
 
@@ -521,31 +642,30 @@ class KnowledgeBase:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         overlap: int = DEFAULT_OVERLAP,
         min_chunk: int = DEFAULT_MIN_CHUNK,
-    ) -> dict:
+    ) -> ReindexResult:
         """Reindex a specific set of files, not the whole source (the watcher's write path).
 
         Embeds created/changed files, drops chunks for files that became empty, prunes
-        deleted files, and updates just those manifest entries. Returns a counts dict.
-        Callers must serialize this (one writer).
+        deleted files, and updates just those manifest entries. Callers must serialize
+        this (one writer).
         """
-        with self._write_lock:
+        with self._write_lock, self.writer_lock:
             return self._reindex_paths_locked(source, paths, chunk_size, overlap, min_chunk)
 
-    def _reindex_paths_locked(self, source, paths, chunk_size, overlap, min_chunk) -> dict:
+    def _reindex_paths_locked(self, source, paths, chunk_size, overlap, min_chunk) -> ReindexResult:
         rels: dict[str, Path] = {}
         for p in paths:
             p = Path(p)
             rels[self._rel_path(source, p)] = p
-        counts = {"embedded": 0, "empty": 0, "pruned": 0, "unchanged": 0,
-                  "chunks_embedded": 0, "chunks_reused": 0}
+        res = ReindexResult(source_id=source.source_id)
         if not rels:
-            return counts
+            return res
 
         chunker = source.make_chunker(chunk_size, overlap, min_chunk)
         manifest = self.store.manifest(source.source_id)
         gone = [rp for rp, p in rels.items() if not p.exists()]
         if gone:
-            counts["pruned"] = self.store.remove_files(source.source_id, gone)
+            res.pruned = self.store.remove_files(source.source_id, gone)
             for rp in gone:
                 logger.info("reindex_paths: pruned %s/%s", source.source_id, rp)
 
@@ -557,7 +677,7 @@ class KnowledgeBase:
             # Unchanged content already in the index: nothing to do. Guards against
             # mtime-only touches and spurious watcher events.
             if manifest.get(rp) == file_hash:
-                counts["unchanged"] += 1
+                res.unchanged += 1
                 logger.debug("reindex_paths: unchanged %s/%s", source.source_id, rp)
                 continue
             doc = source.parse_file(p)
@@ -567,24 +687,28 @@ class KnowledgeBase:
         for rp, chunks, file_hash in prepared:
             if not chunks:
                 self._write_file(source, rp, file_hash, [])
-                counts["empty"] += 1
+                res.empty += 1
                 continue
             n_new, n_kept = self._write_file(source, rp, file_hash, chunks, vectors)
-            counts["embedded"] += 1
-            counts["chunks_embedded"] += n_new
-            counts["chunks_reused"] += n_kept
+            res.embedded += 1
+            res.chunks_embedded += n_new
+            res.chunks_reused += n_kept
             logger.info("reindex_paths: %s/%s — %d chunks embedded, %d reused",
                         source.source_id, rp, n_new, n_kept)
         # The watcher's writes keep the index current too, so they move the clock.
         # An all-unchanged pass wrote nothing and leaves the stamp alone.
-        if counts["embedded"] or counts["empty"] or counts["pruned"]:
+        if res.changed:
             self.store.set_indexed_at(source.source_id)
-        return counts
+        return res
 
-    def vacuum(self) -> bool:
+    def vacuum(self) -> VacuumResult:
         """Compact the store file now, regardless of the auto-vacuum policy."""
-        with self._write_lock:
-            return self.store.vacuum(reason="requested")
+        with self._write_lock, self.writer_lock:
+            ok = self.store.vacuum(reason="requested")
+        stats = self.store.vacuum_stats()
+        size = self.store.path.stat().st_size if self.store.exists() else 0
+        return VacuumResult(vacuumed=ok, path=str(self.store.path), size_bytes=size,
+                            live=stats["live"], deleted_since_vacuum=stats["deleted_since_vacuum"])
 
     def search(
         self,

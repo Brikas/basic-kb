@@ -13,8 +13,20 @@ dependencies = [
     "sqlite-vec>=0.1.9",  # exact vector search inside SQLite; see docs/adr/0001
     "fastembed>=0.8.0",
     "pyyaml>=6.0",
-    "requests>=2.31",   # used by the optional Jina reranker
+    "requests>=2.31",   # cloud embedders/rerankers and the attach client
     "watchdog>=4.0",    # cross-platform file events for `basic-kb watch`
+    "filelock>=3.12",   # cross-platform writer lock on the store (one writer per store)
+]
+
+[project.optional-dependencies]
+serve = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",      # FastAPI's TestClient
+    "basic-kb[serve]",
 ]
 
 [project.scripts]
@@ -25,3 +37,11 @@ packages = ["basic_kb"]
 
 [tool.setuptools.dynamic]
 version = {attr = "basic_kb.version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not model and not network'"
+markers = [
+    "model: loads a real embedding/reranker model (downloads on first run); opt in with -m model",
+    "network: talks to a real network service; opt in with -m network",
+]

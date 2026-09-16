@@ -41,11 +41,6 @@ logger = logging.getLogger("basic_kb")
 SCHEMA_VERSION = 1
 DB_FILENAME = "kb.sqlite3"
 
-# TEMPORARY (added 2026-08-29, remove once every instance has been re-indexed on
-# sqlite-vec): files that identify a pre-ADR-0001 ChromaDB store in the same directory.
-LEGACY_CHROMA_MARKERS = ("chroma.sqlite3", "manifest.json")
-
-
 from .errors import StoreError  # noqa: E402  (re-exported for callers that import it from here)
 
 
@@ -480,25 +475,3 @@ class SqliteVecStore:
             rows = con.execute(sql, params).fetchall()
         return [ChunkRow(chunk_id=cid, doc=doc, metadata=json.loads(mj), distance=float(dist))
                 for _, dist, cid, doc, mj in rows]
-
-    # --- TEMPORARY: legacy Chroma detection ----------------------------------------------
-    def legacy_chroma_leftovers(self) -> list[Path]:
-        """Files/dirs from the pre-ADR-0001 ChromaDB store still sitting in store_dir.
-
-        TEMPORARY (2026-08-29): exists only so every machine/instance gets told to rebuild
-        once. Delete this method, LEGACY_CHROMA_MARKERS and the CLI notice once all
-        instances have been migrated.
-        """
-        # `.chroma` was the historical default store_dir; an instance that renamed its
-        # store_dir to `.basic-kb` still has the old directory sitting beside it.
-        candidates = {self.store_dir, self.store_dir.parent / ".chroma"}
-        found: list[Path] = []
-        for d in candidates:
-            if not d.exists():
-                continue
-            found += [d / m for m in LEGACY_CHROMA_MARKERS if (d / m).exists()]
-            if (d / "chroma.sqlite3").exists():
-                # Chroma keeps one UUID-named directory per collection segment.
-                found += [p for p in d.iterdir()
-                          if p.is_dir() and len(p.name) == 36 and p.name.count("-") == 4]
-        return sorted(set(found))

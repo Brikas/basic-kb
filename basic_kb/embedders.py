@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .errors import EmbeddingError
 
@@ -217,30 +217,52 @@ QWEN3_QUERY_PREFIX = ("Instruct: Given a web search query, retrieve relevant pas
                       "Query:")
 
 
-def build_embedder(config, threads: Optional[int] = None) -> EmbedderBase:
-    """Backend from the `embedding:` config block. `provider: local` (default) → FastEmbed;
-    `provider: openai-compatible` → HTTP endpoint. Thread cap applies to local only."""
+def _build_local(config, threads: Optional[int] = None) -> EmbedderBase:
+    """FastEmbed/ONNX on this machine. The thread cap applies here only."""
+    return FastEmbedEmbedder(alias=config.embedding_model, threads=threads, batch_size=config.embed_batch_size)
+
+
+def _build_openai_compatible(config, threads: Optional[int] = None) -> EmbedderBase:
+    """Any `/v1/embeddings` endpoint; every knob comes from the `embedding:` block."""
     emb = config.embedding
-    provider = str(emb.get("provider", "local")).lower()
     model = config.embedding_model
-    if provider in ("local", "fastembed"):
-        return FastEmbedEmbedder(alias=model, threads=threads, batch_size=config.embed_batch_size)
-    if provider in ("openai-compatible", "openai", "api"):
-        base_url = emb.get("base_url")
-        if not base_url:
-            raise ValueError("embedding.provider is openai-compatible but embedding.base_url is not set")
-        query_prefix = emb.get("query_prefix")
-        if query_prefix is None and "qwen3-embedding" in model.lower():
-            query_prefix = QWEN3_QUERY_PREFIX
-        return OpenAICompatibleEmbedder(
-            model=model, base_url=str(base_url),
-            api_key_env=str(emb.get("api_key_env", "EMBEDDING_API_KEY")),
-            dimensions=emb.get("dimensions"),
-            batch_size=int(emb.get("batch_size", 64)),
-            query_prefix=query_prefix or "",
-            passage_prefix=str(emb.get("passage_prefix", "") or ""),
-            timeout=float(emb.get("timeout", 60)),
-            max_retries=int(emb.get("max_retries", 5)),
-            concurrency=int(emb.get("concurrency", OpenAICompatibleEmbedder.DEFAULT_CONCURRENCY)),
-        )
-    raise ValueError(f"unknown embedding.provider {provider!r}; use 'local' or 'openai-compatible'")
+    base_url = emb.get("base_url")
+    if not base_url:
+        raise ValueError("embedding.provider is openai-compatible but embedding.base_url is not set")
+    query_prefix = emb.get("query_prefix")
+    if query_prefix is None and "qwen3-embedding" in model.lower():
+        query_prefix = QWEN3_QUERY_PREFIX
+    return OpenAICompatibleEmbedder(
+        model=model, base_url=str(base_url),
+        api_key_env=str(emb.get("api_key_env", "EMBEDDING_API_KEY")),
+        dimensions=emb.get("dimensions"),
+        batch_size=int(emb.get("batch_size", 64)),
+        query_prefix=query_prefix or "",
+        passage_prefix=str(emb.get("passage_prefix", "") or ""),
+        timeout=float(emb.get("timeout", 60)),
+        max_retries=int(emb.get("max_retries", 5)),
+        concurrency=int(emb.get("concurrency", OpenAICompatibleEmbedder.DEFAULT_CONCURRENCY)),
+    )
+
+
+# Pluggable backends: `embedding.provider` in a config selects one by key, the same way
+# `reranker.type` selects a reranker. A factory takes the Config and an optional thread
+# cap and returns an EmbedderBase. Several keys may share one factory (aliases). Register
+# a new backend here and it is selectable from any config without touching the CLI.
+EMBEDDER_PROVIDERS: dict[str, Callable[..., EmbedderBase]] = {
+    "local": _build_local,
+    "fastembed": _build_local,
+    "openai-compatible": _build_openai_compatible,
+    "openai": _build_openai_compatible,
+    "api": _build_openai_compatible,
+}
+
+
+def build_embedder(config, threads: Optional[int] = None) -> EmbedderBase:
+    """Backend from the `embedding:` config block, via EMBEDDER_PROVIDERS. Default: local."""
+    provider = str(config.embedding.get("provider", "local")).lower()
+    factory = EMBEDDER_PROVIDERS.get(provider)
+    if factory is None:
+        raise ValueError(
+            f"unknown embedding.provider {provider!r}; options: {', '.join(sorted(EMBEDDER_PROVIDERS))}")
+    return factory(config, threads=threads)

@@ -1,26 +1,29 @@
-"""File-watching auto-reindex — the foreground `basic-kb watch` command.
+"""File-watching auto-reindex, as an object a process can start and stop.
 
-One run watches every enabled source directory recursively. File events feed a single
-per-file debounce scheduler; when a file has been quiet for `debounce_seconds` it is
-handed to a single reindex worker, so the store only ever has one writer. Cross-platform
-via watchdog: FSEvents (macOS), ReadDirectoryChangesW (Windows), inotify (Linux), plus
-a polling backend for filesystems that don't emit native events.
+One `Watcher` watches every enabled source directory recursively. File events feed a
+single per-file debounce scheduler; when a file has been quiet for `debounce_seconds`
+it is handed to one reindex worker, so the store only ever has one writer here.
+Cross-platform via watchdog: FSEvents (macOS), ReadDirectoryChangesW (Windows), inotify
+(Linux).
 
-Lifecycle: startup reconcile (catch edits made while the watcher was off) → watch until
-Ctrl-C → on shutdown, flush any pending debounced files so nothing is lost.
+Lifecycle: `start()` reconciles offline edits and schedules the observers; `stop()`
+flushes pending files and joins the worker; `run_forever()` does both around a sleep
+loop for a foreground command. Everything the watcher does or notices is reported as a
+`WatchEvent` to the `on_event` callback. Nothing here prints: the CLI renders events,
+a server logs them.
 """
 from __future__ import annotations
 
 import logging
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .core import KnowledgeBase
 from .errors import StoreError
+from .models import ReindexResult
 from .sources import DataSourceBase
 
 logger = logging.getLogger("basic_kb")
@@ -28,9 +31,10 @@ logger = logging.getLogger("basic_kb")
 # watchdog event types that mean "somebody read the file", not "the file changed".
 _READ_ONLY_EVENTS = frozenset({"opened", "closed_no_write"})
 
-# Ignore editor scratch/temp files so a save's temp artifacts don't cause churn.
-# The real file (its .md) fires its own event and is what we reindex.
+
 def _relevant(path: str) -> bool:
+    """Only markdown counts, and never editor scratch/temp files: a save's temp artifacts
+    would otherwise cause churn. The real .md fires its own event."""
     name = Path(path).name
     if not name.lower().endswith(".md"):
         return False
@@ -43,14 +47,40 @@ def _relevant(path: str) -> bool:
 
 @dataclass
 class WatchSettings:
-    """Resolved per-source watch options (config defaults < per-source < CLI flags)."""
+    """Resolved per-source watch options (engine defaults < per-source config < CLI flags)."""
     enabled: bool = True
     debounce_seconds: int = 30    # seconds of quiet before reindex; 0 = immediately
 
-# Note: a polling backend (watchdog's PollingObserver, which diffs the filesystem on a
-# timer) was considered for filesystems that don't emit native events. Dropped as
-# unnecessary — native events proved reliable on the target filesystems, including
-# Google Drive. Re-add via a per-source `mode` if a source ever needs it.
+
+def resolve_settings(raw_source: dict, debounce_override: Optional[int]) -> WatchSettings:
+    """Watch options are PER-SOURCE: read this source's `watch:` block, falling back to
+    the engine defaults (WatchSettings). A CLI --debounce overrides all sources for the run."""
+    sw = raw_source.get("watch", {}) or {}
+    default = WatchSettings()
+    enabled = bool(sw.get("enabled", default.enabled))
+    debounce = int(sw.get("debounce_seconds", default.debounce_seconds))
+    if debounce_override is not None:
+        debounce = debounce_override
+    return WatchSettings(enabled=enabled, debounce_seconds=debounce)
+
+
+@dataclass
+class WatchEvent:
+    """One thing the watcher did or noticed.
+
+    `kind` is one of: waiting (store holds another model; idling), reconcile,
+    reconcile_skipped (guard tripped), missing_dir, watching, nothing_to_watch, started,
+    reindexed, error, stopping, stopped. `message` is human-readable detail; `result`
+    is set for reconcile and reindexed.
+    """
+    kind: str
+    source_id: str = ""
+    message: str = ""
+    result: Optional[ReindexResult] = None
+    paths: int = 0
+
+
+OnEvent = Callable[[WatchEvent], None]
 
 
 @dataclass
@@ -71,9 +101,14 @@ class _Engine:
     chunk_size: int
     overlap: int
     min_chunk: int
+    on_event: Optional[OnEvent] = None
     _pending: dict[tuple[str, str], _Pending] = field(default_factory=dict)
     _cond: threading.Condition = field(default_factory=threading.Condition)
     _stop: bool = False
+
+    def _emit(self, ev: WatchEvent) -> None:
+        if self.on_event is not None:
+            self.on_event(ev)
 
     def notify(self, source: DataSourceBase, path: Path, debounce: int) -> None:
         key = (source.source_id, str(path))
@@ -105,15 +140,14 @@ class _Engine:
             entry[1].append(p.path)
         for source, paths in by_source.values():
             try:
-                counts = self.kb.reindex_paths(
+                res = self.kb.reindex_paths(
                     source, paths, self.chunk_size, self.overlap, self.min_chunk)
             except Exception as e:  # one bad batch must not kill the watcher
                 logger.exception("watch reindex failed: source=%s", source.source_id)
-                print(f"  ! reindex error on '{source.source_id}': {e}", file=sys.stderr, flush=True)
+                self._emit(WatchEvent("error", source.source_id, f"reindex error: {e}", paths=len(paths)))
                 continue
-            done = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
-            print(f"  [{time.strftime('%H:%M:%S')}] reindexed {source.source_id}: "
-                  f"{done or 'no change'} ({len(paths)} file(s))", flush=True)
+            logger.info("watch reindexed source=%s %s (%d file(s))", source.source_id, res.summary(), len(paths))
+            self._emit(WatchEvent("reindexed", source.source_id, res.summary(), result=res, paths=len(paths)))
 
     def stop(self) -> None:
         with self._cond:
@@ -142,94 +176,132 @@ class _Handler:
                 self.engine.notify(self.source, Path(p), self.debounce)
 
 
-def resolve_settings(raw_source: dict, debounce_override: Optional[int]) -> WatchSettings:
-    """Watch options are PER-SOURCE: read this source's `watch:` block, falling back to
-    the engine defaults (WatchSettings). A CLI --debounce overrides all sources for the run."""
-    sw = raw_source.get("watch", {}) or {}
-    default = WatchSettings()
-    enabled = bool(sw.get("enabled", default.enabled))
-    debounce = int(sw.get("debounce_seconds", default.debounce_seconds))
-    if debounce_override is not None:
-        debounce = debounce_override
-    return WatchSettings(enabled=enabled, debounce_seconds=debounce)
+class Watcher:
+    """Watch a set of sources and keep their index current. See the module docstring."""
 
+    def __init__(
+        self,
+        kb: KnowledgeBase,
+        watched: list[tuple[DataSourceBase, WatchSettings]],
+        chunk_size: int,
+        overlap: int,
+        min_chunk: int,
+        *,
+        guard: bool = True,
+        guard_threshold: float = 0.9,
+        on_event: Optional[OnEvent] = None,
+        model_wait_s: float = 60,
+    ) -> None:
+        self.kb = kb
+        self.watched = [(s, st) for s, st in watched if st.enabled]
+        self.chunk = (chunk_size, overlap, min_chunk)
+        self.guard = guard
+        self.guard_threshold = guard_threshold
+        self.on_event = on_event
+        self.model_wait_s = model_wait_s
+        self._engine = _Engine(kb, chunk_size, overlap, min_chunk, on_event=on_event)
+        self._observer = None
+        self._worker: Optional[threading.Thread] = None
+        self._stopping = threading.Event()
+        self.scheduled = 0
 
-def run_watch(kb: KnowledgeBase, watched: list[tuple[DataSourceBase, WatchSettings]],
-              config, chunk_size: int, overlap: int, min_chunk: int) -> None:
-    """Reconcile offline edits, then watch until interrupted. `watched` is already
-    filtered to enabled sources."""
-    engine = _Engine(kb, chunk_size, overlap, min_chunk)
+    def _emit(self, ev: WatchEvent) -> None:
+        if self.on_event is not None:
+            self.on_event(ev)
 
-    # A watcher must never be the one to switch models. While a model switch or rebuild
-    # is in progress (or nobody has run `index --force --source all` yet), the store holds
-    # another model's vectors. Exiting here would make a supervisor (systemd Restart=)
-    # crash-loop us; instead wait and re-check, so the watcher picks up on its own once
-    # the rebuild lands. The message says exactly what to run.
-    wait_s = 60
-    while True:
-        try:
-            kb.prepare_model_switch([s for s, _ in watched], accept=False)
-            break
-        except StoreError as e:
-            print(f"  ! {e}\n  ! watcher idle; re-checking every {wait_s}s.", file=sys.stderr, flush=True)
-            logger.warning("watch waiting for store/model to match: %s", e)
-            time.sleep(wait_s)
-
-    # 1) Startup reconcile: embed anything that changed while the watcher was down.
-    for source, _ in watched:
-        stale = kb.stale_paths(source)
-        if not stale:
-            continue
-        base = len(kb.store.manifest(source.source_id))
-        # Reuse the corruption guard: a huge offline delta is likely a moved/broken
-        # source, not real edits — don't silently re-embed it unattended.
-        if (config.reindex_guard and base and
-                len(stale) / base >= config.reindex_guard_threshold and
-                len(stale) >= 5):
-            print(f"  ! '{source.source_id}': {len(stale)}/{base} files changed offline "
-                  f"(>= {int(config.reindex_guard_threshold*100)}%). Skipping auto-reconcile — "
-                  f"run `basic-kb index --source {source.source_id} --yes` if this is real.",
-                  file=sys.stderr, flush=True)
-            logger.warning("watch reconcile skipped by guard: source=%s stale=%d base=%d",
-                           source.source_id, len(stale), base)
-            continue
-        counts = kb.reindex_paths(source, stale, chunk_size, overlap, min_chunk)
-        print(f"  reconcile {source.source_id}: "
-              f"{', '.join(f'{k}={v}' for k, v in counts.items() if v) or 'no change'}", flush=True)
-
-    # 2) Schedule watches on one native observer (OS file events).
-    from watchdog.observers import Observer
-    observer = Observer()
-    scheduled = 0
-    for source, settings in watched:
-        if not source.directory.exists():
-            print(f"  ! '{source.source_id}': {source.directory} does not exist — not watching it.",
-                  file=sys.stderr, flush=True)
-            continue
-        observer.schedule(_Handler(engine, source, settings.debounce_seconds),
-                          str(source.directory), recursive=True)
-        scheduled += 1
-        print(f"  watching {source.source_id:<12} {source.directory}  "
-              f"(debounce {settings.debounce_seconds}s)", flush=True)
-
-    if not scheduled:
-        print("Nothing to watch (no enabled sources with an existing directory).", file=sys.stderr)
-        return
-
-    worker = threading.Thread(target=engine.run, name="reindex-worker", daemon=True)
-    worker.start()
-    observer.start()
-
-    print(f"\nWatching {scheduled} source(s). Edits reindex after their debounce. "
-          f"Ctrl-C to stop.\n", flush=True)
-    try:
+    def _wait_for_model(self) -> bool:
+        """A watcher must never be the one to switch models. While the store holds another
+        model's vectors (a rebuild in progress, or `index --switch-model` not run yet),
+        idle and re-check instead of exiting, so a supervisor's Restart= does not crash-loop
+        us. Returns False if stop() arrived while waiting."""
         while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nStopping — flushing pending reindexes...", flush=True)
-    finally:
-        observer.stop()
-        observer.join()
-        engine.stop()
-        worker.join(timeout=120)
-        print("Watch stopped.", flush=True)
+            try:
+                self.kb.prepare_model_switch([s for s, _ in self.watched], accept=False)
+                return True
+            except StoreError as e:
+                logger.warning("watch waiting for store/model to match: %s", e)
+                self._emit(WatchEvent("waiting", message=f"{e}; watcher idle, re-checking every {self.model_wait_s:g}s"))
+                if self._stopping.wait(self.model_wait_s):
+                    return False
+
+    def _reconcile(self) -> None:
+        """Embed anything that changed while the watcher was down."""
+        chunk_size, overlap, min_chunk = self.chunk
+        for source, _ in self.watched:
+            stale = self.kb.stale_paths(source)
+            if not stale:
+                continue
+            base = len(self.kb.store.manifest(source.source_id))
+            # Reuse the corruption guard: a huge offline delta is likely a moved/broken
+            # source, not real edits. Never re-embed it unattended.
+            if self.guard and base and len(stale) / base >= self.guard_threshold and len(stale) >= 5:
+                msg = (f"{len(stale)}/{base} files changed offline (>= {int(self.guard_threshold * 100)}%); "
+                       f"skipping auto-reconcile. Run `basic-kb index --source {source.source_id} --yes` if this is real.")
+                logger.warning("watch reconcile skipped by guard: source=%s stale=%d base=%d",
+                               source.source_id, len(stale), base)
+                self._emit(WatchEvent("reconcile_skipped", source.source_id, msg, paths=len(stale)))
+                continue
+            res = self.kb.reindex_paths(source, stale, chunk_size, overlap, min_chunk)
+            self._emit(WatchEvent("reconcile", source.source_id, res.summary(), result=res, paths=len(stale)))
+
+    def start(self) -> int:
+        """Reconcile, then schedule the observers and start the worker. Returns how many
+        source directories are being watched; 0 means there is nothing to do (every
+        directory missing, or stop() arrived during the model wait)."""
+        # Held until stop(): a CLI `index` in another shell now fails with StoreBusy instead
+        # of racing this process. Reentrant, so a server that already holds it is fine.
+        self.kb.writer_lock.acquire(timeout=0)
+        if not self._wait_for_model():
+            self.kb.writer_lock.release()
+            return 0
+        self._reconcile()
+
+        from watchdog.observers import Observer
+        self._observer = Observer()
+        for source, settings in self.watched:
+            if not source.directory.exists():
+                self._emit(WatchEvent("missing_dir", source.source_id,
+                                      f"{source.directory} does not exist; not watching it"))
+                continue
+            self._observer.schedule(_Handler(self._engine, source, settings.debounce_seconds),
+                                    str(source.directory), recursive=True)
+            self.scheduled += 1
+            self._emit(WatchEvent("watching", source.source_id,
+                                  f"{source.directory}  (debounce {settings.debounce_seconds}s)"))
+        if not self.scheduled:
+            self._emit(WatchEvent("nothing_to_watch", message="no enabled sources with an existing directory"))
+            self._observer = None
+            self.kb.writer_lock.release()
+            return 0
+
+        self._worker = threading.Thread(target=self._engine.run, name="reindex-worker", daemon=True)
+        self._worker.start()
+        self._observer.start()
+        self._emit(WatchEvent("started", message=f"watching {self.scheduled} source(s)", paths=self.scheduled))
+        return self.scheduled
+
+    def stop(self, timeout: float = 120) -> None:
+        """Stop observing, flush pending debounced files so nothing is lost, join the worker."""
+        self._stopping.set()
+        self._emit(WatchEvent("stopping", message="flushing pending reindexes"))
+        if self._observer is not None:
+            self._observer.stop()
+            self._observer.join()
+        self._engine.stop()
+        if self._worker is not None:
+            self._worker.join(timeout=timeout)
+            self._worker = None
+            self.kb.writer_lock.release()
+        self._emit(WatchEvent("stopped"))
+
+    def run_forever(self, poll_s: float = 1.0) -> None:
+        """Foreground mode: start, sleep until KeyboardInterrupt, stop."""
+        if not self.start():
+            return
+        try:
+            while not self._stopping.wait(poll_s):
+                pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop()

@@ -13,10 +13,14 @@ import fnmatch
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 from .chunkers import ChunkerBase, build_chunker
+from .errors import UnknownSource
 from .models import ParsedDocument
+
+if TYPE_CHECKING:
+    from .config import Config
 
 
 def path_excluded(rel_posix: str, patterns: list[str]) -> bool:
@@ -45,7 +49,7 @@ def path_excluded(rel_posix: str, patterns: list[str]) -> bool:
         core = pat.rstrip("/")
         if not core:
             continue
-        if "/" in core.strip("/"):
+        if core.startswith("/") or "/" in core.strip("/"):
             # Anchored pattern: match against the whole relative path.
             anchor = core.lstrip("/")
             if dir_only:
@@ -306,3 +310,24 @@ def build_source(cfg: dict, base_dir: Path, content_type_filter: Optional[str] =
     if cls is MarkdownSource and content_type_filter:
         kwargs["content_type_filter"] = content_type_filter
     return cls(**kwargs)
+
+
+def resolve_sources(config: "Config", selector: Union[str, list[str], None] = "all",
+                    content_type_filter: Optional[str] = None) -> list[DataSourceBase]:
+    """Turn a `--source` style selector into built DataSources, in config order.
+
+    `selector` is "all" (or None/empty) for every configured source, a comma-separated
+    string of ids, or a list of ids. Raises UnknownSource naming every id the config
+    does not define, so the caller can report all of them at once.
+    """
+    configured = {s["id"]: s for s in config.sources}
+    if selector is None or selector == "" or selector == "all":
+        ids = list(configured)
+    elif isinstance(selector, str):
+        ids = [s.strip() for s in selector.split(",") if s.strip()]
+    else:
+        ids = [str(s) for s in selector]
+    unknown = [i for i in ids if i not in configured]
+    if unknown:
+        raise UnknownSource(unknown, list(configured))
+    return [build_source(configured[i], config.base_dir, content_type_filter) for i in ids]

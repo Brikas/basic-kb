@@ -187,7 +187,7 @@ class BreadcrumbHeadingChunker(ChunkerBase):
         return [
             Chunk(
                 text=f"{breadcrumb}\n\n{piece}",
-                metadata={**meta, "breadcrumb": breadcrumb},
+                metadata={**meta, "breadcrumb": breadcrumb, "oversized": True},
                 id_suffix=str(start_idx + j),
             )
             for j, piece in enumerate(pieces)

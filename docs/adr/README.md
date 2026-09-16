@@ -5,3 +5,5 @@ Small, numbered, append-only records of load-bearing choices — Context, Decisi
 | # | Title | Status | Date |
 |---|---|---|---|
 | [0001](0001-sqlite-vec-as-vector-store.md) | Use sqlite-vec with exact search as the vector store, replacing Chroma/HNSW | Accepted | 2026-08-29 |
+| [0002](0002-native-bearer-api-keys.md) | Native bearer API keys for the served API, off by default, flat, wrapper-friendly | Accepted | 2026-09-11 |
+| [0003](0003-serve-attach-writer-lock.md) | Serve the engine over HTTP, attach the CLI to it, and gate writers with an OS lock | Accepted | 2026-09-11 |

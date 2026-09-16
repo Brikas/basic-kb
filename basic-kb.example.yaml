@@ -83,6 +83,13 @@ throttle:
 #   pause_ms: 0         # sleep this many ms every `pause_every` embedded files (hard duty cap)
 #   pause_every: 50
 
+# `basic-kb serve` runs this instance as an HTTP API.
+# serve:
+#   host: 127.0.0.1     # a non-loopback host needs auth: true (or --allow-unauthenticated behind your own proxy)
+#   port: 8765          # 0 = pick a free port
+#   auth: false         # require a bearer API key on every route; keys: `basic-kb keys create --name NAME`
+#   watch: false        # run the file watcher inside the server process (one process owns all writes)
+
 # Corruption guard: if a big fraction of already-indexed files change or vanish at
 # once (a moved/corrupted/re-pointed source), incremental index confirms before
 # re-embedding. On a TTY it prompts; unattended it aborts (leaving the index intact).

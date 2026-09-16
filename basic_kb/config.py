@@ -156,6 +156,11 @@ class Config:
     reindex_guard_threshold: float = 0.9     # churn fraction (changed+deleted / indexed) that triggers it
     env_file: Optional[Path] = None          # resolved dotenv path to load (may walk up — see below)
     env_file_search_up: int = 5              # parent levels to climb for the nearest dotenv (0 = no walk-up)
+    # `serve:` block — defaults for `basic-kb serve`; each is overridden by its CLI flag.
+    serve_host: str = "127.0.0.1"            # bind address; anything but loopback needs auth or --allow-unauthenticated
+    serve_port: int = 8765                   # 0 = pick a free port
+    serve_auth: bool = False                 # require a bearer API key on every route (ADR 0002)
+    serve_watch: bool = False                # run the watcher inside the server process
     # Watch/auto-reindex is configured PER SOURCE (a `watch:` block on each source),
     # not instance-wide — see basic_kb.watcher.resolve_settings.
 
@@ -227,6 +232,8 @@ def load_config(config_path: Path) -> Config:
     thr = data.get("throttle", {}) or {}
     thr_cores = thr.get("cores_fraction")
 
+    srv = data.get("serve", {}) or {}
+
     # `reindex_guard:` may be a bare bool (reindex_guard: false) or a mapping
     # ({enabled, threshold}). Both disable/tune the mass-change corruption check.
     rg = data.get("reindex_guard")
@@ -281,4 +288,8 @@ def load_config(config_path: Path) -> Config:
         reindex_guard_threshold=rg_threshold,
         env_file=env_file,
         env_file_search_up=env_search_up,
+        serve_host=str(srv.get("host", "127.0.0.1")),
+        serve_port=int(srv.get("port", 8765)),
+        serve_auth=bool(srv.get("auth", False)),
+        serve_watch=bool(srv.get("watch", False)),
     )

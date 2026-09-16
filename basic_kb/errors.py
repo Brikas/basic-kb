@@ -22,6 +22,21 @@ class EmbeddingError(BasicKBError):
     silently poison the index."""
 
 
+class UnknownSource(BasicKBError):
+    """A source id was requested that the instance config does not define.
+
+    Carries both lists so a CLI can print them and an API can return them.
+    """
+
+    def __init__(self, requested: list[str], known: list[str]) -> None:
+        self.requested = list(requested)
+        self.known = list(known)
+        names = ", ".join(repr(r) for r in self.requested)
+        super().__init__(
+            f"Unknown source {names}. Configured: {', '.join(self.known)} (or 'all')."
+        )
+
+
 class IndexNotFound(BasicKBError):
     """No index exists for the requested source(s), so no query could run."""
 

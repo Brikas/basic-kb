@@ -17,15 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import warnings
-
-# Windows consoles default to cp1252; our output uses →, ─, ⚠. Force UTF-8 so
-# printing results never raises UnicodeEncodeError. (No-op where already UTF-8.)
-for _stream in (sys.stdout, sys.stderr):
-    reconfigure = getattr(_stream, "reconfigure", None)
-    if reconfigure:
-        reconfigure(encoding="utf-8")
 
 # Silence HF Hub / tokenizer download noise before any heavy import.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -44,26 +36,66 @@ for _noisy in ("fastembed", "huggingface_hub", "onnxruntime", "transformers"):
 logging.getLogger("basic_kb").addHandler(logging.NullHandler())
 
 from .config import Config, load_config, load_env_file
-from .core import KnowledgeBase, ScanResult
+from .core import KnowledgeBase
 from .store import SqliteVecStore, VacuumPolicy
 from .errors import (
-    BasicKBError, EmbeddingError, IndexNotFound, MassChangeRefused, QueryFailed, StoreError,
+    BasicKBError, EmbeddingError, IndexNotFound, MassChangeRefused, QueryFailed, StoreError, UnknownSource,
 )
-from .embedders import EmbedderBase, FastEmbedEmbedder
-from .models import Chunk, FileError, IndexResult, ParsedDocument, SearchResult, SourceStatus
-from .rerankers import DeepInfraCompatibleReranker, JinaCompatibleReranker, RerankerBase
-from .sources import DataSourceBase, MarkdownSource, TranscriptSource, build_source
+from .embedders import EMBEDDER_PROVIDERS, EmbedderBase, FastEmbedEmbedder, OpenAICompatibleEmbedder, build_embedder
+from .models import (
+    Chunk, FileError, IndexResult, InstanceInfo, ParsedDocument, ReindexResult, ScanResult, SearchResult,
+    SourceInfo, SourceStatus,
+)
+from .rerankers import RERANKER_TYPES, DeepInfraCompatibleReranker, JinaCompatibleReranker, RerankerBase, build_reranker
+from .serialize import from_dict, to_jsonable
+from .sources import DataSourceBase, MarkdownSource, TranscriptSource, build_source, resolve_sources
 
 from .version import __version__  # noqa: E402
 
+
+def open(config_path=None, **kwargs):  # noqa: A001 - `basic_kb.open(...)` reads as intended
+    """A local KnowledgeBase for an instance: `basic_kb.open("path/to/basic-kb.yaml")`.
+
+    With no path the config is discovered like the CLI does ($BASIC_KB_CONFIG, then a
+    basic-kb.yaml up from the working directory). The config's env_file is loaded so
+    provider API keys are available. Extra keyword arguments go to
+    `KnowledgeBase.from_config` (model=, threads=, reranker=, strict_reranker=, on_warning=).
+    """
+    from pathlib import Path
+
+    from .config import find_config
+
+    path = Path(config_path).expanduser() if config_path else find_config()
+    if path is None:
+        raise FileNotFoundError("no basic-kb.yaml found: pass a path, set BASIC_KB_CONFIG, "
+                                "or run from inside an instance folder")
+    config = load_config(path)
+    if config.env_file and config.env_file.exists():
+        load_env_file(config.env_file)
+    return KnowledgeBase.from_config(config, **kwargs)
+
+
+def connect(url, api_key=None, **kwargs):
+    """A served instance over HTTP: `basic_kb.connect("http://host:8765", api_key)`.
+
+    Same methods and return types as a local KnowledgeBase. The key falls back to
+    `BASIC_KB_API_KEY` when omitted.
+    """
+    from .client import RemoteKnowledgeBase, resolve_api_key
+
+    return RemoteKnowledgeBase(url, api_key=resolve_api_key(api_key), **kwargs)
+
 __all__ = [
     "Config", "load_config", "load_env_file",
-    "KnowledgeBase", "ScanResult", "SqliteVecStore", "StoreError", "VacuumPolicy",
+    "KnowledgeBase", "SqliteVecStore", "VacuumPolicy",
     "BasicKBError", "EmbeddingError", "IndexNotFound", "MassChangeRefused", "QueryFailed", "StoreError",
-    "EmbedderBase", "FastEmbedEmbedder",
-    "RerankerBase", "JinaCompatibleReranker", "DeepInfraCompatibleReranker",
+    "UnknownSource",
+    "EMBEDDER_PROVIDERS", "EmbedderBase", "FastEmbedEmbedder", "OpenAICompatibleEmbedder", "build_embedder",
+    "RERANKER_TYPES", "RerankerBase", "JinaCompatibleReranker", "DeepInfraCompatibleReranker", "build_reranker",
     "Chunk", "ParsedDocument", "SearchResult",
-    "FileError", "IndexResult", "SourceStatus",
-    "DataSourceBase", "MarkdownSource", "TranscriptSource", "build_source",
+    "FileError", "IndexResult", "InstanceInfo", "ReindexResult", "ScanResult", "SourceInfo", "SourceStatus",
+    "from_dict", "to_jsonable",
+    "DataSourceBase", "MarkdownSource", "TranscriptSource", "build_source", "resolve_sources",
+    "open", "connect",
     "__version__",
 ]

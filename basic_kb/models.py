@@ -1,7 +1,7 @@
 """Core data models passed between sources, chunkers, and the knowledge base."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Optional
 
 
@@ -73,6 +73,76 @@ class IndexResult:
     @property
     def embedded(self) -> int:
         return self.added + self.updated
+
+
+@dataclass
+class ScanResult:
+    """Read-only diff of a source's files on disk vs. what was last indexed."""
+    source_id: str
+    label: str
+    tracked: bool        # False if nothing indexed yet for this source
+    files_on_disk: int
+    new: int
+    updated: int
+    unchanged: int
+    deleted: int
+
+    @property
+    def stale(self) -> int:
+        """Files that differ from the index (would change it on re-index)."""
+        return self.new + self.updated + self.deleted
+
+
+@dataclass
+class ReindexResult:
+    """What a targeted re-index of specific files did. Returned by `KnowledgeBase.reindex_paths`."""
+    source_id: str
+    embedded: int = 0         # files whose chunks were (re)embedded
+    empty: int = 0            # files that parsed to no chunks (tracked, hold nothing)
+    pruned: int = 0           # files removed because they vanished from disk
+    unchanged: int = 0        # files whose hash already matched the manifest
+    chunks_embedded: int = 0
+    chunks_reused: int = 0
+
+    @property
+    def changed(self) -> bool:
+        """True when the store was written (the index clock moved)."""
+        return bool(self.embedded or self.empty or self.pruned)
+
+    def summary(self) -> str:
+        """`k=v` for every non-zero counter, or "no change"."""
+        parts = [f"{f.name}={getattr(self, f.name)}" for f in fields(self)
+                 if f.name != "source_id" and getattr(self, f.name)]
+        return ", ".join(parts) or "no change"
+
+
+@dataclass
+class PreviewChunk:
+    """One chunk as the chunker would produce it, for a dry run."""
+    text: str
+    breadcrumb: Optional[str] = None
+
+
+@dataclass
+class PreviewFile:
+    """One file's dry-run chunking. `body_chars == 0` means the file parsed to nothing."""
+    rel_path: str
+    body_chars: int
+    chunks: list[PreviewChunk] = field(default_factory=list)
+
+    @property
+    def skipped(self) -> bool:
+        return self.body_chars == 0
+
+
+@dataclass
+class VacuumResult:
+    """What `KnowledgeBase.vacuum` did, with the store's size and counters afterwards."""
+    vacuumed: bool            # False when the database was busy or there is no store yet
+    path: str
+    size_bytes: int
+    live: int                 # chunks in the store
+    deleted_since_vacuum: int
 
 
 @dataclass

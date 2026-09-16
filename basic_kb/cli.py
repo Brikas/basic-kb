@@ -26,21 +26,23 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import json
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
+from .attach import attach
 from .config import Config, find_config, load_config, load_env_file
-from .errors import BasicKBError
+from .errors import BasicKBError, UnknownSource
+from .freshness import FreshnessTracker
+from .keys import ApiKeyStore
 from .version import __version__
 from .core import DEFAULT_N, KnowledgeBase, cores_to_threads, lower_process_priority, setup_file_logging
-from .embedders import FastEmbedEmbedder, build_embedder
-from .models import SearchResult
-from .rerankers import RERANKER_TYPES, RerankerBase, build_reranker
-from .sources import DataSourceBase, build_source
-from .store import VacuumPolicy
+from .embedders import FastEmbedEmbedder
+from .render import (
+    emit_json, print_info, print_inspect, print_results, print_sources, print_status, print_watch_event,
+)
+from .rerankers import RERANKER_TYPES
+from .sources import DataSourceBase, resolve_sources
 
 
 # ---------------------------------------------------------------------------
@@ -56,93 +58,56 @@ def _effective(args: argparse.Namespace, config: Config) -> tuple[str, int, int,
     return model, chunk_size, overlap, min_chunk
 
 
-def _with_model_override(args: argparse.Namespace, config: Config) -> Config:
-    """`--model NAME` overrides the config's embedding_model for this run (same provider)."""
-    override = getattr(args, "model", None)
-    if not override or override == config.embedding_model:
-        return config
-    from dataclasses import replace
-    return replace(config, embedding_model=override)
+def _attached(args: argparse.Namespace, config: Config):
+    """The served instance for this config when one is alive and attach is allowed, else None.
+    Anything worth knowing about the decision goes to stderr as one `[basic-kb]` line."""
+    return attach(
+        config,
+        no_attach=getattr(args, "no_attach", False),
+        attach_url=getattr(args, "attach", None),
+        api_key=getattr(args, "api_key", None),
+        model_override=getattr(args, "model", None),
+        on_note=lambda m: print(f"[basic-kb] {m}", file=sys.stderr),
+    )
 
 
-def _vacuum_policy(config: Config) -> VacuumPolicy:
-    """The auto-vacuum policy from the `vacuum:` config block. Passed to every
-    KnowledgeBase the CLI builds so index, watch and search all honour it."""
-    return VacuumPolicy(enabled=config.vacuum_enabled,
-                        deleted_fraction=config.vacuum_deleted_fraction,
-                        min_deleted=config.vacuum_min_deleted)
+def _kb_for(args: argparse.Namespace, config: Config, *, search: bool, threads: Optional[int] = None):
+    """Attached RemoteKnowledgeBase when possible, else a local KnowledgeBase (with a reranker
+    only when `search`, the one operation that uses it)."""
+    remote = _attached(args, config)
+    if remote is not None:
+        return remote
+    return _build_kb(args, config, threads=threads) if search else _scan_kb(args, config, threads=threads)
 
 
 def _build_kb(args: argparse.Namespace, config: Config, threads: Optional[int] = None) -> KnowledgeBase:
-    embedder = build_embedder(_with_model_override(args, config), threads=threads)
+    """The KnowledgeBase for a search: `KnowledgeBase.from_config` with the run's flags applied.
 
-    reranker: Optional[RerankerBase] = None
-    if not getattr(args, "no_rerank", False):
-        # Type/model: CLI flag wins, else config, else off.
-        rtype = (getattr(args, "reranker", None) or config.reranker_type or "none").lower()
-        rmodel = getattr(args, "reranker_model", None) or config.reranker_model
-        strict = getattr(args, "rerank", False)
-        # A --reranker flag picks a different protocol, so the config's vendor
-        # options (base_url, api_key_env…) no longer apply — fall back to defaults.
-        ropts = config.reranker_options if rtype == (config.reranker_type or "").lower() else {}
-        if rtype != "none":
-            try:
-                reranker = build_reranker(rtype, rmodel, **ropts)
-            except Exception as e:
-                # e.g. a cloud backend with no API key. Strict → fail; else cosine-only.
-                if strict:
-                    print(f"Error: reranker '{rtype}' unavailable: {e}", file=sys.stderr)
-                    sys.exit(1)
-                print(f"Warning: reranker '{rtype}' unavailable, using cosine scores only ({e})",
-                      file=sys.stderr)
-        elif strict:
-            print(f"Error: --rerank set but no reranker chosen. Use --reranker "
-                  f"{'|'.join(sorted(RERANKER_TYPES))} or set `reranker:` in the config.",
-                  file=sys.stderr)
-            sys.exit(1)
-
-    return KnowledgeBase(embedder=embedder, store_dir=config.store_dir, reranker=reranker,
-                         vacuum=_vacuum_policy(config))
-
-
-# --- Rendering ---------------------------------------------------------------
-# The library returns dataclasses. JSON and human text are two renderers over the
-# same object — neither is derived from the other, so no type information is lost
-# round-tripping through a string.
-
-def _json_default(o):
-    if isinstance(o, Path):
-        return str(o)
-    raise TypeError(f"not JSON serialisable: {type(o).__name__}")
-
-
-def emit_json(payload) -> None:
-    """Print one JSON document to stdout.
-
-    Callers must suppress progress output in this mode — a stray progress line on
-    stdout makes the document unparseable.
+    `--no-rerank` turns reranking off; `--reranker KEY` replaces the configured protocol;
+    `--rerank` (strict) makes an unavailable reranker an error instead of a warning.
     """
-    from dataclasses import fields, is_dataclass
-
-    def conv(x):
-        if is_dataclass(x) and not isinstance(x, type):
-            # Built field-by-field rather than with asdict(), which converts nested
-            # dataclasses to plain dicts before the property loop below can see them.
-            d = {f.name: conv(getattr(x, f.name)) for f in fields(x)}
-            # Derived values live as properties, not fields, and a caller reading
-            # JSON wants them — so include every property the class defines rather
-            # than a hand-maintained list that goes stale.
-            for name, attr in vars(type(x)).items():
-                if isinstance(attr, property):
-                    d[name] = conv(getattr(x, name))
-            return d
-        if isinstance(x, list):
-            return [conv(i) for i in x]
-        if isinstance(x, dict):
-            return {k: conv(v) for k, v in x.items()}
-        return x
-
-    print(json.dumps(conv(payload), indent=2, ensure_ascii=False, default=_json_default))
+    strict = getattr(args, "rerank", False)
+    if getattr(args, "no_rerank", False):
+        rtype = "none"
+    else:
+        rtype = (getattr(args, "reranker", None) or config.reranker_type or "none").lower()
+    if strict and rtype == "none":
+        print(f"Error: --rerank set but no reranker chosen. Use --reranker "
+              f"{'|'.join(sorted(RERANKER_TYPES))} or set `reranker:` in the config.",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        return KnowledgeBase.from_config(
+            config, model=getattr(args, "model", None), threads=threads,
+            reranker=rtype, reranker_model=getattr(args, "reranker_model", None),
+            strict_reranker=strict,
+            on_warning=lambda m: print(f"Warning: {m}", file=sys.stderr),
+        )
+    except Exception as e:
+        if strict and rtype != "none":
+            print(f"Error: reranker '{rtype}' unavailable: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise
 
 
 def _confirm_mass_change_on_tty(detail) -> bool:
@@ -165,211 +130,17 @@ def _confirm_mass_change_on_tty(detail) -> bool:
         return False
 
 
-def _freshness_state(config: Config) -> dict:
-    """Per-source nudge state from the store dir: `{source: {first_stale, last_eval, nudges}}`.
-
-    Written by the post-search reminder, read here so `status` can report how many
-    nudges a stale source has already produced. A corrupt file reads as "never
-    checked" — the reminder rewrites it on its next pass.
-    """
-    path = config.store_dir / "freshness_state.json"
-    if not path.exists():
-        return {}
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        print(f"⚠  freshness state at {path} is not valid JSON; nudge counts start over.",
-              file=sys.stderr)
-        return {}
-    return state if isinstance(state, dict) else {}
-
-
-def _clear_nudges(config: Config, source_ids: list[str]) -> None:
-    """Drop the nudge state for sources that just finished indexing.
-
-    An index run is the thing a nudge asks for, so the count and the stale clock both
-    start over here rather than waiting for the next search to notice.
-    """
-    path = config.store_dir / "freshness_state.json"
-    if not path.exists():
-        return
-    state = _freshness_state(config)
-    # A list, not any(): any() short-circuits and would leave later sources in place.
-    removed = [sid for sid in source_ids if state.pop(sid, None) is not None]
-    if removed:
-        path.write_text(json.dumps(state), encoding="utf-8")
-
-
-def _nudges_for(state: dict, source_id: str) -> int:
-    """Nudges emitted for this source since its last index. Legacy state files hold
-    no counter, which reads as 0 until the next reminder writes one."""
-    entry = state.get(source_id)
-    return int(entry.get("nudges", 0)) if isinstance(entry, dict) else 0
-
-
-def _ago(ts: Optional[float]) -> str:
-    """Coarse age of a timestamp for a status row: minutes, hours or days.
-
-    One unit, no calendar date — reading a status you want to know whether the index
-    is an hour or a week behind, not which day the run happened.
-    """
-    if not ts:
-        return "unknown"
-    secs = max(0.0, time.time() - ts)
-    if secs < 90:
-        return "just now"
-    if secs < 90 * 60:
-        return f"{round(secs / 60)}m ago"
-    if secs < 36 * 3600:
-        return f"{round(secs / 3600)}h ago"
-    return f"{round(secs / 86400)}d ago"
-
-
-def _print_inspect(config: Config) -> None:
-    """Resolved runtime detail that reading the config file does not give you.
-
-    One section for now: the freshness nudge exactly as it will be rendered, so you
-    can see the built-in template when the config overrides nothing.
-    """
-    from .config import DEFAULT_FRESHNESS_MESSAGE
-
-    print(f"\nInstance '{config.name or '(unnamed)'}'  ({config.path})")
-    origin = "default" if config.freshness_message == DEFAULT_FRESHNESS_MESSAGE else "config override"
-    print("\nFreshness nudge")
-    print(f"  enabled           : {config.freshness_enabled}")
-    print(f"  stale_after_days  : {config.freshness_stale_after_days:g}")
-    print(f"  remind_every_days : {config.freshness_remind_every_days:g}")
-    print(f"  template ({origin}):")
-    print(f"    {config.freshness_message}")
-    print("\n  placeholders: {source} {new} {updated} {deleted} {unchanged} {stale} "
-          "{total} {days} {nudges}")
-    print(f"  nudge state: {config.store_dir / 'freshness_state.json'}")
-
-
-def _print_status(st, nudges: Optional[int] = None) -> None:
-    """Human rendering of one SourceStatus: a fixed set of rows, one line each.
-
-    `nudges` is how many freshness reminders this source has produced since its last
-    index; None when the reminder is switched off, which keeps it out of the output.
-    """
-    print(f"\n{'='*55}")
-    print(f"Source  : {st.label}  ({st.source_id})")
-    print(f"Store   : {st.store_dir}")
-    print(f"Model   : {st.model_id}")
-
-    if not st.directory_exists:
-        print(f"  ⚠  SOURCE PATH MISSING: {st.directory}")
-        print("     directory does not exist — moved, unmounted, or a broken symlink.")
-
-    if not st.indexed or st.chunks == 0:
-        print(f"Chunks  : 0")
-        print(f"State   : {'not indexed' if not st.indexed else 'index empty'}")
-        return
-
-    print(f"Chunks  : {st.chunks:,}")
-    print(f"Tokens  : ~{st.approx_tokens:,}  ({st.chars:,} chars)")
-    print(f"Docs    : {st.docs_with_chunks:,} with chunks / {st.files_on_disk:,} files on disk")
-
-    # One `State` row: the state, how much work is waiting, and how old the index is.
-    # Files too short to chunk are tracked (hashed) but hold no chunks, so they never
-    # count as missing — that is why Docs can be below files on disk.
-    if st.files_on_disk == 0:
-        why = "source path missing" if not st.directory_exists else "directory holds no matching files"
-        state = f"⚠  0 files on disk ({why}); {st.docs_with_chunks:,} indexed docs orphaned"
-    elif not st.tracked:
-        state = "untracked — index once to enable change detection"
-    elif st.stale:
-        parts = [f"{n} {w}" for n, w in ((st.pending, "new"), (st.deleted, "deleted")) if n]
-        if nudges:
-            parts.append(f"nudges {nudges}")
-        state = f"stale ({', '.join(parts)})"
-    else:
-        state = "up to date"
-    print(f"State   : {state}. Last index: {_ago(st.indexed_at)}")
-
-    if st.date_min:
-        print(f"Dates   : {st.date_min} → {st.date_max}")
-    for ct, count in sorted(st.content_types.items()):
-        print(f"  {ct}: {count:,} chunks")
-    if st.oversized_chunks:
-        print(f"  ⚠  oversized chunks: {st.oversized_chunks}")
-
-
-def _print_sources(config: Config) -> None:
-    print(f"\nInstance '{config.name}' sources (use with --source):\n")
-    for s in config.sources:
-        try:
-            src = build_source(s, config.base_dir)
-            n_files = len(src.get_files())
-            where = src.directory
-        except Exception as e:  # bad source entry — report, don't hide
-            print(f"  {s.get('id', '?'):<16}  [config error: {e}]")
-            continue
-        print(f"  {src.source_id:<16}  {src.label}  ({s.get('type', 'markdown')}, {n_files} files)")
-        if src.description:
-            print(f"                    {src.description}")
-        print(f"                    {where}")
-        print()
-    print("  all               All sources combined (default)\n")
-
-
 def _load_sources(config: Config, source_arg: str,
                   content_type: Optional[str] = None) -> list[DataSourceBase]:
     """Resolve --source into DataSource objects. 'list' prints and exits."""
-    configured = {s["id"]: s for s in config.sources}
     if source_arg == "list":
-        _print_sources(config)
+        print_sources(config)
         sys.exit(0)
-    ids = list(configured) if source_arg == "all" else [s.strip() for s in source_arg.split(",") if s.strip()]
-    out: list[DataSourceBase] = []
-    for sid in ids:
-        if sid not in configured:
-            print(f"Unknown source {sid!r}. Configured: {', '.join(configured)} (or 'all', 'list').",
-                  file=sys.stderr)
-            sys.exit(1)
-        out.append(build_source(configured[sid], config.base_dir, content_type))
-    return out
-
-
-def _print_results(hits: list[SearchResult], max_chars: int) -> None:
-    """Human rendering of hits.
-
-    Header: rank, title, `[source · content_type]`, scores. Second line: where the chunk
-    came from — the url for web content, else the path inside the source — omitted when
-    it would only repeat the title (LogSeq pages: title == filename stem).
-    """
-    reranked = any(r.rerank_score is not None for r in hits)
-    print(f"Top {len(hits)} results{'  [reranked]' if reranked else ''}\n")
-
-    for rank, r in enumerate(hits, 1):
-        meta = r.metadata
-        score_str = f"score={round(r.score, 3)}"
-        if r.rerank_score is not None:
-            score_str += f"  rerank={round(r.rerank_score, 4)}"
-
-        title = meta.get("title", "?")
-        tags = [meta.get("source", "?")]
-        if meta.get("content_type", "unknown") != "unknown":
-            tags.append(meta["content_type"])
-        # Show the date only when there is one (transcripts have it; notes usually don't).
-        date = meta.get("date")
-        date_str = f"  ({date})" if date and date != "unknown" else ""
-        header = f"[{rank}] {title}{date_str}  [{' · '.join(tags)}]  {score_str}"
-
-        ref = meta.get("url") or meta.get("rel_path") or meta.get("file", "")
-        stem = ref.rsplit("/", 1)[-1].rsplit(".", 1)[0] if ref else ""
-        show_ref = bool(ref) and stem != title
-
-        print("=" * 60)
-        print(header)
-        if show_ref:
-            print(f"    {ref}")
-        print("─" * 60)
-        output = r.doc if not max_chars else r.doc[:max_chars]
-        print(output)
-        if max_chars and len(r.doc) > max_chars:
-            print(f"  [...{len(r.doc) - max_chars} more chars]")
-        print()
+    try:
+        return resolve_sources(config, source_arg, content_type)
+    except UnknownSource as e:
+        print(f"{e} Use --source list to see them.", file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +172,7 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
     _, chunk_size, overlap, min_chunk = _effective(args, config)
 
     if getattr(args, "preview", False):
-        _preview_chunks(sources, config, chunk_size, overlap, min_chunk, args)
+        _preview_chunks(_scan_kb(args, config), sources, config, chunk_size, overlap, min_chunk, args)
         return
 
     cores, priority, pause_ms, pause_every = _resolve_throttle(args, config)
@@ -419,49 +190,23 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
         guard_threshold = config.reindex_guard_threshold
 
     as_json = getattr(args, "json", False)
-    kb = _build_kb(args, config, threads=threads)
+    kb = _kb_for(args, config, search=False, threads=threads)
     switch = getattr(args, "switch_model", False)
-    force = args.force or switch
     if switch:
         # A switch re-embeds everything; `--source` would leave the other sources' vectors
         # in a different space, so the run always covers every configured source.
         sources = _load_sources(config, "all")
-    note = kb.prepare_model_switch(sources, accept=switch)   # refuses on a mismatch unless --switch-model
-    if note and not as_json:
-        print(note)
-    # --limit is a budget for the whole run, spent source by source in order, so
-    # `--limit 3` across three sources embeds 3 files total, not 9. The old
-    # per-source behaviour stays reachable with --limit-per-source.
-    limit = getattr(args, "limit", None)
-    per_source = getattr(args, "limit_per_source", False)
-    remaining = limit
-    results = []
-    for i, source in enumerate(sources):
-        source_limit = limit
-        if limit is not None and not per_source:
-            if remaining <= 0:
-                skipped = ", ".join(s.source_id for s in sources[i:])
-                if not as_json:
-                    print(f"[limit] budget of {limit} file(s) spent — skipping: {skipped}", flush=True)
-                break
-            source_limit = remaining
-        result = kb.index(
-            source=source, chunk_size=chunk_size, overlap=overlap,
-            min_chunk=min_chunk, force=force, limit=source_limit,
-            pause_ms=pause_ms, pause_every=pause_every,
-            guard=guard, guard_threshold=guard_threshold,
-            assume_yes=getattr(args, "yes", False),
-            # No progress on stdout in --json mode; it would break the document.
-            on_progress=None if as_json else print,
-            on_confirm=_confirm_mass_change_on_tty,
-        )
-        results.append(result)
-        if limit is not None and not per_source:
-            # files_on_disk is the pre-limit count, so the source spent whichever of
-            # the two is smaller.
-            remaining -= min(result.files_on_disk, source_limit)
-
-    _clear_nudges(config, [r.source_id for r in results if not r.aborted])
+    results = kb.index_many(
+        sources, chunk_size=chunk_size, overlap=overlap, min_chunk=min_chunk,
+        force=args.force, switch_model=switch,
+        limit=getattr(args, "limit", None), limit_per_source=getattr(args, "limit_per_source", False),
+        pause_ms=pause_ms, pause_every=pause_every,
+        guard=guard, guard_threshold=guard_threshold,
+        assume_yes=getattr(args, "yes", False),
+        # No progress on stdout in --json mode; it would break the document.
+        on_progress=None if as_json else lambda m: print(m, flush=True),
+        on_confirm=_confirm_mass_change_on_tty,
+    )
 
     if as_json:
         emit_json(results)
@@ -471,10 +216,10 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
         sys.exit(1)
 
 
-def _preview_chunks(sources: list[DataSourceBase], config: Config,
+def _preview_chunks(kb: KnowledgeBase, sources: list[DataSourceBase], config: Config,
                     chunk_size: int, overlap: int, min_chunk: int,
                     args: argparse.Namespace) -> None:
-    """Write chunks for each source to a file without embedding anything."""
+    """Write `KnowledgeBase.preview` output for each source to a file. Nothing is embedded."""
     file_filter = getattr(args, "file", None)
     max_chars = getattr(args, "max_chars", 0)
     out_arg = getattr(args, "out", None)
@@ -502,39 +247,33 @@ def _preview_chunks(sources: list[DataSourceBase], config: Config,
         for source in sources:
             if limit is not None and not per_source and remaining <= 0:
                 break
-            chunker = source.make_chunker(chunk_size, overlap, min_chunk)
-            files = source.get_files()
-            if file_filter:
-                files = [f for f in files if f.name == file_filter]
-                if not files:
-                    print(f"[{source.source_id}] No file named '{file_filter}' found.", file=sys.stderr)
-                    continue
-            if limit is not None:
-                files = files[:limit if per_source else remaining]
-                if not per_source:
-                    remaining -= len(files)
+            source_limit = None if limit is None else (limit if per_source else remaining)
+            files = kb.preview(source, chunk_size, overlap, min_chunk, limit=source_limit, file_name=file_filter)
+            if file_filter and not files:
+                print(f"[{source.source_id}] No file named '{file_filter}' found.", file=sys.stderr)
+                continue
+            if limit is not None and not per_source:
+                remaining -= len(files)
 
             p(f"\n{'='*60}")
             p(f"Source: {source.source_id}  |  {len(files)} file(s)  |  chunk_size={chunk_size}")
             p(f"{'='*60}")
 
-            for f in files:
-                doc = source.parse_file(f)
-                if doc is None:
-                    p(f"\n[{f.name}] — empty/unparseable, skipped")
+            for pf in files:
+                if pf.skipped:
+                    p(f"\n[{pf.rel_path}] — empty/unparseable, skipped")
                     continue
-                chunks = chunker.chunk(doc)
                 total_files += 1
-                total_chunks += len(chunks)
+                total_chunks += len(pf.chunks)
 
                 p(f"\n{'─'*60}")
-                p(f"FILE: {f.name}  ({len(doc.body)} chars body → {len(chunks)} chunks)")
+                p(f"FILE: {pf.rel_path}  ({pf.body_chars} chars body → {len(pf.chunks)} chunks)")
                 p(f"{'─'*60}")
-                for i, c in enumerate(chunks):
+                for i, c in enumerate(pf.chunks):
                     body_preview = c.text if not max_chars else c.text[:max_chars]
                     suffix = "…" if max_chars and len(c.text) > max_chars else ""
-                    p(f"\n  Chunk {i+1}/{len(chunks)}  ({len(c.text)} chars)")
-                    p(f"  breadcrumb: {c.metadata.get('breadcrumb', '(none)')}")
+                    p(f"\n  Chunk {i+1}/{len(pf.chunks)}  ({len(c.text)} chars)")
+                    p(f"  breadcrumb: {c.breadcrumb or '(none)'}")
                     p()
                     for line in (body_preview + suffix).splitlines():
                         p(f"    {line}")
@@ -568,7 +307,7 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
     if not args.queries:
         print("Error: at least one query is required.", file=sys.stderr)
         sys.exit(1)
-    kb = _build_kb(args, config)
+    kb = _kb_for(args, config, search=True)
     common = dict(
         sources=sources,
         queries=args.queries,
@@ -590,59 +329,47 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         if as_json:
             emit_json({"mode": "separate",
                        "groups": [{"query": q, "hits": h} for q, h in groups]})
-            return
-        for q, hits in groups:
-            print("#" * 60)
-            print(f"# Query: {q}  ({len(hits)} results)")
-            print("#" * 60 + "\n")
-            if hits:
-                _print_results(hits, max_chars)
-            else:
-                print("No results.\n")
-        _freshness_reminder(kb, sources, config)
-        return
+        else:
+            for q, hits in groups:
+                print("#" * 60)
+                print(f"# Query: {q}  ({len(hits)} results)")
+                print("#" * 60 + "\n")
+                if hits:
+                    print_results(hits, max_chars)
+                else:
+                    print("No results.\n")
+    else:
+        # Fused mode (default): all queries merged into one ranked list.
+        hits = kb.search(**common)
+        if as_json:
+            emit_json({"mode": "fused", "queries": args.queries, "hits": hits})
+        elif not hits:
+            print("No results.")
+        else:
+            if len(args.queries) > 1:
+                print(f"[{len(args.queries)} queries merged into one ranked list]")
+            print_results(hits, max_chars)
 
-    # Fused mode (default): all queries merged into one ranked list.
-    hits = kb.search(**common)
-    if as_json:
-        emit_json({"mode": "fused", "queries": args.queries, "hits": hits})
-        return
-    if not hits:
-        print("No results.")
-        return
-    if len(args.queries) > 1:
-        print(f"[{len(args.queries)} queries merged into one ranked list]")
-    _print_results(hits, max_chars)
-    _freshness_reminder(kb, sources, config)
+    # The nudge goes to stderr in every mode, so a --json caller (usually an agent, the
+    # reader the nudge exists for) sees it without the JSON document being touched. A served
+    # instance evaluated freshness itself and sent the notices along with the hits.
+    notices = getattr(kb, "last_notices", None)
+    if notices is None:
+        notices = FreshnessTracker.from_config(config).evaluate(kb, sources)
+    for message in notices:
+        print(message, file=sys.stderr)
 
 
 def cmd_status(args: argparse.Namespace, config: Config) -> None:
     sources = _load_sources(config, getattr(args, "source", "all"))
-    kb = _build_kb(args, config)
+    kb = _kb_for(args, config, search=False)
     statuses = kb.status(sources)
     if getattr(args, "json", False):
         emit_json(statuses)
         return
-    state = _freshness_state(config) if config.freshness_enabled else {}
+    tracker = FreshnessTracker.from_config(config) if config.freshness_enabled else None
     for st in statuses:
-        _print_status(st, _nudges_for(state, st.source_id) if config.freshness_enabled else None)
-
-
-def _print_info(inf) -> None:
-    """Human rendering of InstanceInfo. Compact on purpose — this is meant to be
-    read at a glance before choosing a source to search."""
-    print(f"\n{inf.name or '(unnamed instance)'}")
-    print(f"  model : {inf.model_id}")
-    print(f"  store : {inf.store_dir}")
-    print(f"  totals: {len(inf.sources)} sources, {inf.total_files:,} files, {inf.total_chunks:,} chunks\n")
-
-    for s in inf.sources:
-        state = "" if s.indexed else "   [NOT INDEXED]"
-        print(f"  {s.source_id}{state}")
-        print(f"    {s.label}  ({s.type}, {s.chunker} chunker)")
-        if s.description:
-            print(f"    {s.description}")
-        print(f"    {s.files:,} files -> {s.chunks:,} chunks  ({s.chunks_per_file} per file)\n")
+        print_status(st, tracker.nudges_for(st.source_id) if tracker else None)
 
 
 def cmd_info(args: argparse.Namespace, config: Config) -> None:
@@ -653,23 +380,24 @@ def cmd_info(args: argparse.Namespace, config: Config) -> None:
     a source reads the descriptions, which status has no reason to show.
     """
     sources = _load_sources(config, getattr(args, "source", "all"))
-    kb = _scan_kb(args, config)          # no reranker needed; the model is never loaded
+    kb = _kb_for(args, config, search=False)
     inf = kb.info(sources, name=config.name)
     if getattr(args, "json", False):
         emit_json(inf)
         return
-    _print_info(inf)
+    print_info(inf)
 
 
-def _scan_kb(args: argparse.Namespace, config: Config) -> KnowledgeBase:
-    """A KnowledgeBase for scan/freshness — no reranker needed (scan only hashes files)."""
-    return KnowledgeBase(embedder=build_embedder(_with_model_override(args, config)),
-                         store_dir=config.store_dir, vacuum=_vacuum_policy(config))
+def _scan_kb(args: argparse.Namespace, config: Config, threads: Optional[int] = None) -> KnowledgeBase:
+    """A KnowledgeBase for index/scan/info/watch: the reranker is never used there, so it
+    is left out and no reranker model or API key is needed."""
+    return KnowledgeBase.from_config(config, model=getattr(args, "model", None), threads=threads,
+                                     reranker="none")
 
 
 def cmd_scan(args: argparse.Namespace, config: Config) -> None:
     sources = _load_sources(config, getattr(args, "source", "all"))
-    kb = _scan_kb(args, config)
+    kb = _kb_for(args, config, search=False)
     results = [kb.scan(s) for s in sources]
     if getattr(args, "json", False):
         emit_json(results)
@@ -692,7 +420,7 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> None:
 
 
 def cmd_watch(args: argparse.Namespace, config: Config) -> None:
-    from .watcher import resolve_settings, run_watch
+    from .watcher import Watcher, resolve_settings
 
     sources = _load_sources(config, getattr(args, "source", "all"))
     raw_by_id = {s["id"]: s for s in config.sources}
@@ -721,118 +449,121 @@ def cmd_watch(args: argparse.Namespace, config: Config) -> None:
     if priority == "low":
         lower_process_priority()
 
-    kb = KnowledgeBase(embedder=build_embedder(_with_model_override(args, config), threads=threads),
-                       store_dir=config.store_dir, vacuum=_vacuum_policy(config))  # no reranker needed
+    kb = _scan_kb(args, config, threads=threads)
     if config.log_file:
         print(f"(logging events to {config.log_file})", file=sys.stderr)
-    run_watch(kb, watched, config, chunk_size, overlap, min_chunk)
+    Watcher(kb, watched, chunk_size, overlap, min_chunk,
+            guard=config.reindex_guard, guard_threshold=config.reindex_guard_threshold,
+            on_event=print_watch_event).run_forever()
 
 
 def cmd_vacuum(args: argparse.Namespace, config: Config) -> None:
     """Compact the store file now. Auto-vacuum (config `vacuum:`) normally does this
     after writes; this is for a one-off after a big manual clean-up."""
-    kb = _scan_kb(args, config)
-    before = kb.store.vacuum_stats()
-    ok = kb.vacuum()
-    after = kb.store.vacuum_stats()
+    kb = _kb_for(args, config, search=False)
+    res = kb.vacuum()
     if getattr(args, "json", False):
-        emit_json({"vacuumed": ok, "before": before, "after": after, "path": str(kb.store.path)})
+        emit_json(res)
         return
-    size = kb.store.path.stat().st_size if kb.store.exists() else 0
-    print(f"{'Vacuumed' if ok else 'Vacuum skipped (busy or no store)'}: {kb.store.path}  "
-          f"({size:,} bytes; live chunks={after['live']}, deleted since={after['deleted_since_vacuum']})")
+    print(f"{'Vacuumed' if res.vacuumed else 'Vacuum skipped (busy or no store)'}: {res.path}  "
+          f"({res.size_bytes:,} bytes; live chunks={res.live}, deleted since={res.deleted_since_vacuum})")
 
 
-# TEMPORARY (2026-08-29): migration notice for stores built on the old ChromaDB backend.
-# Remove this function, its call in main(), and the legacy_chroma_leftovers() helpers once
-# every instance on every machine has been re-indexed on sqlite-vec (see docs/adr/0001).
-def _legacy_chroma_notice(config: Config) -> None:
-    from .store import SqliteVecStore
-    leftovers = SqliteVecStore(config.store_dir).legacy_chroma_leftovers()
-    if not leftovers:
-        return
-    where = sorted({str(p.parent) for p in leftovers})
-    print(
-        f"⚠  Legacy ChromaDB index found ({len(leftovers)} item(s) in {', '.join(where)}).\n"
-        f"   basic-kb {__version__} stores vectors in sqlite-vec ({config.store_dir / 'kb.sqlite3'}); the old\n"
-        f"   index is not read. Rebuild once:  python -m basic_kb index --force --source all\n"
-        f"   then delete the leftovers to silence this notice:\n"
-        + "".join(f"     {p}\n" for p in leftovers),
-        file=sys.stderr, end="")
+def _tri_state(on: bool, off: bool) -> Optional[bool]:
+    """--x / --no-x pairs: True, False, or None for "use the config"."""
+    if off:
+        return False
+    return True if on else None
 
 
-def _format_freshness(template: str, res, days: int, nudges: int) -> str:
-    fields = dict(source=res.source_id, new=res.new, updated=res.updated,
-                  deleted=res.deleted, unchanged=res.unchanged, stale=res.stale,
-                  total=res.files_on_disk, days=days, nudges=nudges)
+def cmd_serve(args: argparse.Namespace, config: Config) -> None:
+    """Run the HTTP API (and optionally the watcher) for this instance in the foreground."""
+    from .server import KBServer
+
+    _, chunk_size, overlap, min_chunk = _effective(args, config)
+    cores, priority, _, _ = _resolve_throttle(args, config)
+    threads = cores_to_threads(cores)
+    if priority == "low":
+        lower_process_priority()
     try:
-        return template.format(**fields)
-    except (KeyError, IndexError) as e:
-        return (f"[basic-kb] freshness message has an invalid placeholder {e}; "
-                f"valid: {', '.join(fields)}. Source '{res.source_id}' is stale "
-                f"({res.stale} file(s)).")
+        server = KBServer(
+            config,
+            host=getattr(args, "host", None), port=getattr(args, "port", None),
+            auth=_tri_state(getattr(args, "auth", False), getattr(args, "no_auth", False)),
+            watch=_tri_state(getattr(args, "watch", False), getattr(args, "no_watch", False)),
+            allow_unauthenticated=getattr(args, "allow_unauthenticated", False),
+            model=getattr(args, "model", None), threads=threads,
+            chunk_size=chunk_size, overlap=overlap, min_chunk=min_chunk,
+            debounce=getattr(args, "debounce", None),
+            on_event=lambda m: print(f"[serve] {m}", file=sys.stderr, flush=True),
+            on_watch_event=print_watch_event,
+            on_warning=lambda m: print(f"Warning: {m}", file=sys.stderr),
+        )
+    except ValueError as e:          # the bind rule: non-loopback host without auth
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    server.serve_forever()
 
 
-def _freshness_reminder(kb: KnowledgeBase, sources: list[DataSourceBase], config: Config) -> None:
-    """After a search, nag about sources that have stayed stale for a while.
-
-    A source must be *continuously* stale for `stale_after_days` before the first
-    nudge; after that it re-nags at most once per `remind_every_days` (once/day)
-    for as long as it stays un-indexed. Re-indexing (source goes clean) clears the
-    per-source state, so it must age past the threshold again before it can nag.
-
-    Per-source state is `{first_stale, last_eval, nudges}`. The `last_eval` gate means
-    we re-scan a source at most once per remind window, which both bounds the hashing
-    cost to once/day and gives the once/day nag cadence. `nudges` counts the reminders
-    already emitted since the last index; `status` reports it and the reset on a clean
-    source zeroes it, so a rising count is how a caller sees a nudge being ignored.
-    """
-    if not config.freshness_enabled:
-        return
-    state_path = config.store_dir / "freshness_state.json"
-    state = _freshness_state(config)
-
-    now = time.time()
-    stale_after = max(0.0, config.freshness_stale_after_days) * 86400
-    remind_every = max(0.0, config.freshness_remind_every_days) * 86400
-
-    messages: list[str] = []
-    dirty = False
-    for s in sources:
-        st = state.get(s.source_id)
-        st = st if isinstance(st, dict) else {}   # migrate legacy single-timestamp state
-        if now - float(st.get("last_eval", 0)) < remind_every:
-            continue   # evaluated within this window — don't re-scan or re-nag yet
-        dirty = True
-        res = kb.scan(s)
-        if not (res.tracked and res.stale):
-            state.pop(s.source_id, None)   # clean or freshly re-indexed → reset the clock
-            continue
-        first_stale = float(st.get("first_stale") or now)   # start counting on first sighting
-        nudges = _nudges_for(state, s.source_id)
-        if now - first_stale >= stale_after:
-            nudges += 1                                     # this pass is about to nag
-            messages.append(_format_freshness(config.freshness_message, res,
-                                              int(config.freshness_stale_after_days), nudges))
-        state[s.source_id] = {"first_stale": first_stale, "last_eval": now, "nudges": nudges}
-
-    if dirty:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-    for m in messages:
-        print(m, file=sys.stderr)
+def cmd_keys(args: argparse.Namespace, config: Config) -> None:
+    """Mint, list and revoke API keys for this instance's served API (ADR 0002). Local only:
+    the file lives in the store dir and a running server picks up changes by itself."""
+    store = ApiKeyStore(config.store_dir)
+    sub = args.keys_cmd
+    if sub == "create":
+        record, plaintext = store.create(args.name)
+        if getattr(args, "json", False):
+            emit_json({"id": record.id, "name": record.name, "prefix": record.prefix, "key": plaintext})
+            return
+        print(plaintext)
+        print(f"API key '{record.name}' (id {record.id}) created. This is the only time it is shown; "
+              f"store it where the consumer reads it (BASIC_KB_API_KEY). Revoke with: basic-kb keys revoke {record.id}",
+              file=sys.stderr)
+    elif sub == "list":
+        keys = store.list()
+        if getattr(args, "json", False):
+            emit_json(keys)
+            return
+        if not keys:
+            print(f"No API keys. Create one with: basic-kb keys create --name NAME   (file: {store.path})")
+            return
+        print(f"{'ID':<10} {'NAME':<20} {'PREFIX':<12} {'CREATED':<17} STATE")
+        for k in keys:
+            created = datetime.datetime.fromtimestamp(k.created_at).strftime("%Y-%m-%d %H:%M")
+            state = "active" if k.active else "revoked " + datetime.datetime.fromtimestamp(k.revoked_at).strftime("%Y-%m-%d")
+            print(f"{k.id:<10} {k.name:<20} {k.prefix:<12} {created:<17} {state}")
+    elif sub == "revoke":
+        record = store.revoke(args.ident)
+        print(f"Revoked API key '{record.name}' (id {record.id}). A running server refuses it from now on.")
 
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
-def _shared_args(parser: argparse.ArgumentParser) -> None:
+def _config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default=None, metavar="FILE",
                         help="Instance config YAML. If omitted: $BASIC_KB_CONFIG, "
                              "else basic-kb.yaml found by walking up from the current dir.")
     parser.add_argument("--env-file", metavar="FILE",
                         help="Dotenv file to load (e.g. for JINA_API_KEY). Overrides config env_file.")
+
+
+def _attach_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--no-attach", action="store_true",
+                        help="Run locally even if a `basic-kb serve` for this instance is alive "
+                             "(also: BASIC_KB_NO_ATTACH=1). Writes still refuse while a server holds the store.")
+    parser.add_argument("--attach", metavar="URL", default=None,
+                        help="Use the served instance at URL (another machine, say) instead of anything local. "
+                             "Example: --attach https://kb.example.com")
+    parser.add_argument("--api-key", metavar="KEY", default=None,
+                        help="Bearer API key for --attach / a served instance with auth on "
+                             "(default: $BASIC_KB_API_KEY, which the config's env_file may set).")
+
+
+def _shared_args(parser: argparse.ArgumentParser) -> None:
+    _config_args(parser)
+    _attach_args(parser)
     known = ", ".join(FastEmbedEmbedder.SUPPORTED)
     parser.add_argument("--model", default=None, metavar="NAME",
                         help=f"Embedding model alias or HF id (default: from config). Known: {known}")
@@ -880,7 +611,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb scan                                          new/changed/deleted files vs the index\n"
             "  basic_kb watch                                         auto-reindex edited files (foreground)\n"
             "  basic_kb vacuum                                        compact the store file now\n"
+            "  basic_kb serve [--watch] [--auth]                      HTTP API for this instance (foreground)\n"
+            "  basic_kb keys create --name NAME                       mint an API key for the served API\n"
             "  basic_kb --inspect                                     resolved settings (freshness template)\n\n"
+            "Attach: when `serve` runs for this instance, every command above uses it instead of loading\n"
+            "        models again; --no-attach runs locally, --attach URL [--api-key K] targets a remote one.\n\n"
             "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina-compatible|deepinfra-compatible|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --switch-model  --limit N [--limit-per-source]  --preview [--file NAME]  --yes  --no-reindex-guard\n"
@@ -991,6 +726,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_vacuum.add_argument("--json", action="store_true", help="emit before/after stats as JSON")
     _shared_args(p_vacuum)
 
+    p_serve = sub.add_parser("serve", help="Serve this instance over HTTP (and optionally watch); foreground")
+    _shared_args(p_serve)
+    p_serve.add_argument("--host", default=None, metavar="ADDR",
+                         help="Bind address (default: `serve.host` in the config, else 127.0.0.1). A non-loopback "
+                              "address needs --auth or --allow-unauthenticated.")
+    p_serve.add_argument("--port", type=int, default=None, metavar="N",
+                         help="Port (default: `serve.port`, else 8765; 0 = pick a free one)")
+    auth = p_serve.add_mutually_exclusive_group()
+    auth.add_argument("--auth", action="store_true", help="Require a bearer API key on every route (keys: `basic-kb keys`)")
+    auth.add_argument("--no-auth", action="store_true", help="Serve without authentication (default unless `serve.auth: true`)")
+    watch = p_serve.add_mutually_exclusive_group()
+    watch.add_argument("--watch", action="store_true", help="Also run the file watcher inside the server process")
+    watch.add_argument("--no-watch", action="store_true", help="Serve without the watcher (default unless `serve.watch: true`)")
+    p_serve.add_argument("--allow-unauthenticated", action="store_true",
+                         help="Acknowledge serving on a non-loopback host with auth off; for setups where a proxy, "
+                              "tailnet or tunnel in front of basic-kb handles access control.")
+    p_serve.add_argument("--debounce", type=int, default=None, metavar="SEC",
+                         help="Watcher debounce override, as for `watch`.")
+    p_serve.add_argument("--throttle", action="store_true", help="Ease CPU load: ~half the cores + low OS priority.")
+    p_serve.add_argument("--cores-fraction", type=float, default=None, metavar="F",
+                         help="Fraction of CPU cores the embedder may use, e.g. 0.5.")
+    p_serve.add_argument("--priority", choices=["low", "normal"], default=None,
+                         help="OS process priority (default: config, else normal).")
+
+    p_keys = sub.add_parser("keys", help="Manage API keys for the served API (create, list, revoke); local only")
+    ksub = p_keys.add_subparsers(dest="keys_cmd", required=True)
+    k_create = ksub.add_parser("create", help="Mint a key; the plaintext is printed once")
+    _config_args(k_create)
+    k_create.add_argument("--name", required=True, metavar="NAME", help="Who or what will use it, e.g. autotemple")
+    k_create.add_argument("--json", action="store_true", help="emit {id, name, prefix, key} as JSON")
+    k_list = ksub.add_parser("list", help="List keys (hashes only; never the plaintext)")
+    _config_args(k_list)
+    k_list.add_argument("--json", action="store_true", help="emit the key records as JSON")
+    k_revoke = ksub.add_parser("revoke", help="Revoke a key by id (or by name when unambiguous)")
+    _config_args(k_revoke)
+    k_revoke.add_argument("ident", metavar="ID_OR_NAME")
+
     p_watch = sub.add_parser("watch",
                              help="Watch sources and auto-reindex edited files (foreground; Ctrl-C to stop)")
     _shared_args(p_watch)
@@ -1007,7 +779,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _utf8_streams() -> None:
+    """Windows consoles default to cp1252; our output uses →, ─, ⚠. Force UTF-8 so
+    printing results never raises UnicodeEncodeError. (No-op where already UTF-8.)
+    A CLI concern: a host application that imports the library keeps its own streams."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8")
+
+
 def main(argv: Optional[list[str]] = None) -> None:
+    _utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1039,14 +822,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                            config.log_max_bytes, config.log_backup_count)
 
     if args.inspect:
-        _print_inspect(config)
+        print_inspect(config)
         return
-
-    _legacy_chroma_notice(config)   # TEMPORARY — see the function's comment
 
     try:
         {"index": cmd_index, "search": cmd_search, "status": cmd_status,
-         "scan": cmd_scan, "watch": cmd_watch, "info": cmd_info, "vacuum": cmd_vacuum}[args.cmd](args, config)
+         "scan": cmd_scan, "watch": cmd_watch, "info": cmd_info, "vacuum": cmd_vacuum,
+         "serve": cmd_serve, "keys": cmd_keys}[args.cmd](args, config)
     except BasicKBError as e:
         # Library errors are deliberate and already say what to do; a traceback adds nothing.
         print(f"Error: {e}", file=sys.stderr)
