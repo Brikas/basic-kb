@@ -1,0 +1,18 @@
+# Only pyproject, README and the package are copied; everything else would just
+# invalidate the build cache or leak local state into the image.
+.git
+.github
+.venv
+venv
+tests
+docs
+tmp
+logs
+**/__pycache__
+*.py[cod]
+*.egg-info
+**/.basic-kb
+**/.chroma
+.env
+**/basic-kb.local.yaml
+**/basic-kb.local.yml

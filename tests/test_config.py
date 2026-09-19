@@ -244,3 +244,35 @@ def test_find_config_walks_up(tmp_path: Path, monkeypatch):
 def test_find_config_none_when_absent(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("BASIC_KB_CONFIG", raising=False)
     assert find_config(tmp_path) is None
+
+
+def test_attach_cli_block(tmp_path: Path):
+    cfg = load_config(write(tmp_path / "basic-kb.yaml", yaml_for("""\
+        attach_cli:
+          url: https://pkb.example.com
+          key_env: PKB_KEY
+          key_file: keys/local.key
+        """)))
+    assert cfg.attach_url == "https://pkb.example.com"
+    assert cfg.attach_key_env == "PKB_KEY"
+    assert cfg.attach_key_file == tmp_path / "keys" / "local.key"
+
+    bare = load_config(write(tmp_path / "b" / "basic-kb.yaml", yaml_for("attach_cli: https://x\n")))
+    assert bare.attach_url == "https://x" and bare.attach_key_env is None
+
+
+def test_a_client_config_may_omit_sources(tmp_path: Path):
+    cfg = load_config(write(tmp_path / "basic-kb.yaml",
+                            "name: client\nattach_cli:\n  url: https://pkb.example.com\n"))
+    assert cfg.sources == [] and cfg.attach_url == "https://pkb.example.com"
+
+
+def test_the_old_attach_key_is_refused_rather_than_ignored(tmp_path: Path):
+    """Silently dropping it would send every command to the local store instead."""
+    with pytest.raises(ValueError, match="now `attach_cli:`"):
+        load_config(write(tmp_path / "basic-kb.yaml", yaml_for("attach:\n  url: https://x\n")))
+
+
+def test_a_literal_key_in_the_config_is_refused(tmp_path: Path):
+    with pytest.raises(ValueError, match="never live in a config file"):
+        load_config(write(tmp_path / "basic-kb.yaml", yaml_for("attach_cli:\n  url: https://x\n  key: secret\n")))

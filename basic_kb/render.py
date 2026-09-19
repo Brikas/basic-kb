@@ -27,6 +27,16 @@ def emit_json(payload) -> None:
     """
     print(json.dumps(to_jsonable(payload), indent=2, ensure_ascii=False))
 
+def print_origin(kb) -> None:
+    """One line naming where a command's answers came from: a served instance or this
+    machine's own store."""
+    url = getattr(kb, "url", None)
+    if url:
+        print(f"Reading : {url}  (attached)")
+    else:
+        print(f"Reading : {kb.store.path}  (local store)")
+
+
 def ago(ts: Optional[float]) -> str:
     """Coarse age of a timestamp for a status row: minutes, hours or days.
 

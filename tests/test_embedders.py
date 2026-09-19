@@ -195,3 +195,18 @@ def test_prefixes_apply_per_side(key, transport):
 def test_empty_input_makes_no_request(key, transport):
     assert api().embed([]) == []
     assert transport["calls"] == []
+
+
+def test_missing_fastembed_names_the_extra(monkeypatch):
+    """The on-device backend is optional; its absence must say how to fix it."""
+    import builtins
+    real = builtins.__import__
+
+    def blocked(name, *a, **kw):
+        if name.startswith("fastembed"):
+            raise ImportError("no fastembed")
+        return real(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    with pytest.raises(EmbeddingError, match=r"basic-kb\[local\]"):
+        FastEmbedEmbedder("bge-small-en-v1.5").embed(["x"])

@@ -62,7 +62,7 @@ def test_remote_signatures_accept_the_local_call_shapes():
 def test_every_operation_has_a_route(kb, config):
     from basic_kb.server import create_app, ServerState
     import threading, time
-    app = create_app(ServerState(kb=kb, config=config, nonce="", started_at=time.time(), auth=False,
+    app = create_app(ServerState(kb=kb, config=config, started_at=time.time(), auth=False,
                                  keys=None, local_key=None, index_lock=threading.Lock()))
     routes = {(m, r.path) for r in app.routes for m in getattr(r, "methods", [])}
     for op in OPERATIONS:

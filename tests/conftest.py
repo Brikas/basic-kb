@@ -180,7 +180,7 @@ def fake_provider(monkeypatch):
 @pytest.fixture
 def served(indexed_kb, config, fake_provider):
     """A live `KBServer` for the indexed fixture instance, on a free loopback port, auth off.
-    Yields the server; `served.info.url` is where it listens."""
+    Yields the server; `served.url` is where it listens."""
     from basic_kb.server import KBServer
 
     server = KBServer(config, port=0)

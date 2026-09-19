@@ -37,6 +37,14 @@ class UnknownSource(BasicKBError):
         )
 
 
+class IncompatibleVersion(BasicKBError):
+    """A client and a served instance are too far apart to talk safely.
+
+    Raised instead of falling back to a local run: a version gap is a deployment mistake
+    to fix, and masking it would hide why results or writes looked wrong.
+    """
+
+
 class IndexNotFound(BasicKBError):
     """No index exists for the requested source(s), so no query could run."""
 

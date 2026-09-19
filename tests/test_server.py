@@ -14,7 +14,7 @@ from .conftest import write_tree
 
 
 def make_client(kb, config, *, auth=False, local_key=None) -> TestClient:
-    state = ServerState(kb=kb, config=config, nonce="n0nce", started_at=time.time(), auth=auth,
+    state = ServerState(kb=kb, config=config, started_at=time.time(), auth=auth,
                         keys=ApiKeyStore(config.store_dir) if auth else None, local_key=local_key,
                         index_lock=threading.Lock())
     return TestClient(create_app(state), raise_server_exceptions=False)
@@ -34,7 +34,7 @@ def test_is_loopback():
 
 def test_health(client):
     body = client.get("/health").json()
-    assert body["ok"] and body["nonce"] == "n0nce" and body["model_id"] == "fake-bow-64"
+    assert body["ok"] and body["model_id"] == "fake-bow-64" and body["min_client_version"]
     assert body["sources"] == ["notes", "meetings"] and body["auth"] is False and body["pid"]
 
 
@@ -176,3 +176,56 @@ def test_auth_on_requires_a_valid_key_everywhere(indexed_kb, config):
     assert client.get("/health", headers={"Authorization": "bearer bkb_localkey"}).status_code == 200
     store.revoke(rec.id)                            # picked up without a restart
     assert client.get("/health", headers={"Authorization": f"Bearer {plain}"}).status_code == 401
+
+
+def test_search_response_shaping(client):
+    body = client.post("/search", json={"queries": ["burr grinder"], "n": 1}).json()
+    assert "content_hash" not in body["hits"][0]["metadata"]
+    full = len(body["hits"][0]["doc"])
+
+    body = client.post("/search", json={"queries": ["burr grinder"], "n": 1, "detailed": True}).json()
+    assert "content_hash" in body["hits"][0]["metadata"]
+
+    body = client.post("/search", json={"queries": ["burr grinder"], "n": 1, "max_chars": 30}).json()
+    assert len(body["hits"][0]["doc"]) == 30 < full
+
+
+def test_openapi_declares_a_bearer_scheme_so_swagger_can_authorise(client):
+    spec = client.get("/openapi.json").json()
+    assert "HTTPBearer" in spec["components"]["securitySchemes"]
+
+
+def test_docs_can_be_switched_off(indexed_kb, config):
+    from dataclasses import replace
+    off = make_client(indexed_kb, replace(config, serve_docs=False))
+    assert off.get("/docs").status_code == 404
+    assert off.get("/openapi.json").status_code == 404
+
+
+def test_serve_forever_runs_the_real_entry_point(instance, tmp_path):
+    """`serve --watch` is what the deployment runs, and `start()` does not exercise it:
+    a stale attribute in serve_forever crashed the container while every test passed."""
+    import subprocess, sys, time
+    from basic_kb.client import RemoteKnowledgeBase
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "basic_kb", "serve", "--watch",
+         "--config", str(instance / "basic-kb.yaml"), "--port", "8791"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        remote = RemoteKnowledgeBase("http://127.0.0.1:8791")
+        deadline = time.monotonic() + 30
+        while True:
+            if proc.poll() is not None:
+                raise AssertionError(f"serve exited {proc.returncode}: {proc.stdout.read()[-2000:]}")
+            try:
+                assert remote.health(timeout=1)["ok"]
+                break
+            except Exception:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.2)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)

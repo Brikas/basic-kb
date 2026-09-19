@@ -212,7 +212,13 @@ class FastEmbedReranker(RerankerBase):
             return
         with self._load_lock:
             if self._encoder is None:
-                from fastembed.rerank.cross_encoder import TextCrossEncoder
+                try:
+                    from fastembed.rerank.cross_encoder import TextCrossEncoder
+                except ImportError as e:
+                    raise RuntimeError(
+                        f"reranker {self.model!r} runs on-device, which needs the `local` extra: "
+                        f"pip install 'basic-kb[local]'. The cloud protocols need nothing extra."
+                    ) from e
                 self._encoder = TextCrossEncoder(self.model)
 
     def rerank(self, query: str, results: list[SearchResult], top_n: int) -> list[SearchResult]:

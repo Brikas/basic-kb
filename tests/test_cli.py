@@ -387,12 +387,16 @@ def test_serve_refuses_when_another_writer_holds_the_store(run, instance, monkey
 
 @pytest.fixture
 def live(run, fake_cli, instance):
-    """Index locally, then start a server for the instance on a free port."""
+    """Index locally, start a server on a free port, then point the config at it — which is
+    how a machine with a served instance is actually set up now."""
     from basic_kb.config import load_config
     from basic_kb.server import KBServer
     run("index", "--json")
-    server = KBServer(load_config(instance / "basic-kb.yaml"), port=0)
+    cfg_path = instance / "basic-kb.yaml"
+    server = KBServer(load_config(cfg_path), port=0)
     server.start()
+    cfg_path.write_text(cfg_path.read_text(encoding="utf-8") + f"\nattach_cli:\n  url: {server.url}\n",
+                        encoding="utf-8")
     try:
         yield server
     finally:
@@ -437,23 +441,120 @@ def test_cli_no_attach_runs_locally_and_writes_refuse(run, fake_cli, live):
 
 def test_cli_attach_url(run, fake_cli, live):
     before = len(fake_cli)
-    out, _ = run("info", "--json", "--attach", live.info.url)
+    out, _ = run("info", "--json", "--attach", live.url)
     assert loads(out)["name"] == "test-instance" and len(fake_cli) == before
     _, err = run("info", "--attach", "http://127.0.0.1:9", expect_exit=1)
     assert "cannot reach" in err
 
 
 def test_cli_attach_with_auth_uses_local_key(run, fake_cli, instance):
+    """On the box, the server's local.key means no key has to be typed."""
     from basic_kb.config import load_config
     from basic_kb.server import KBServer
     run("index", "--json")
-    server = KBServer(load_config(instance / "basic-kb.yaml"), port=0, auth=True)
+    cfg_path = instance / "basic-kb.yaml"
+    server = KBServer(load_config(cfg_path), port=0, auth=True)
     server.start()
+    cfg_path.write_text(cfg_path.read_text(encoding="utf-8") + f"\nattach_cli:\n  url: {server.url}\n",
+                        encoding="utf-8")
     try:
         before = len(fake_cli)
         out, _ = run("status", "--json")
         assert loads(out)[0]["chunks"] == 6 and len(fake_cli) == before
-        _, err = run("status", "--attach", server.info.url, "--api-key", "bkb_wrong", expect_exit=1)
+        _, err = run("status", "--attach", server.url, "--api-key", "bkb_wrong", expect_exit=1)
         assert "unauthorized" in err
     finally:
         server.stop()
+
+
+# --- an attached run needs no local instance (the server owns the config) ------------------
+
+def test_attach_needs_no_local_config_at_all(fake_cli, live, tmp_path, monkeypatch, capsys):
+    """A remote node should not have to duplicate the box's source list to query it."""
+    monkeypatch.chdir(tmp_path)                       # nowhere near a basic-kb.yaml
+    monkeypatch.delenv("BASIC_KB_CONFIG", raising=False)
+    cli.main(["status", "--json", "--attach", live.url])
+    st = json.loads(capsys.readouterr().out)
+    assert [s["source_id"] for s in st] == ["notes", "meetings"]
+
+
+def test_attach_resolves_source_ids_on_the_server(fake_cli, live, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BASIC_KB_CONFIG", raising=False)
+    cli.main(["search", "coffee", "--json", "--source", "notes", "--attach", live.url])
+    assert json.loads(capsys.readouterr().out)["hits"]
+
+    with pytest.raises(SystemExit) as e:
+        cli.main(["status", "--source", "nope", "--attach", live.url])
+    assert e.value.code == 1
+    assert "Unknown source 'nope'" in capsys.readouterr().err
+
+
+def test_attach_source_list_describes_the_remote(fake_cli, live, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BASIC_KB_CONFIG", raising=False)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["search", "--source", "list", "--attach", live.url])
+    assert e.value.code == 0
+    out = capsys.readouterr().out
+    assert "notes" in out and "Markdown notes with frontmatter." in out
+
+
+def test_no_config_error_mentions_attach(fake_cli, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BASIC_KB_CONFIG", raising=False)
+    with pytest.raises(SystemExit):
+        cli.main(["status"])
+    assert "--attach URL" in capsys.readouterr().err
+
+
+# --- response shaping: what a machine reader gets ------------------------------------------
+
+def test_json_search_strips_bookkeeping_metadata_by_default(run):
+    run("index", "--json")
+    out, _ = run("search", "burr grinder", "--source", "notes", "--json", "--n", "1")
+    meta = loads(out)["hits"][0]["metadata"]
+    assert "rel_path" in meta and "title" in meta and "source" in meta
+    for dead in ("content_hash", "position", "chunk_index", "file"):
+        assert dead not in meta, dead
+
+
+def test_detailed_keeps_everything(run):
+    run("index", "--json")
+    out, _ = run("search", "burr grinder", "--source", "notes", "--json", "--n", "1", "--detailed")
+    meta = loads(out)["hits"][0]["metadata"]
+    assert {"content_hash", "position", "file"} <= set(meta)
+
+
+def test_json_search_honours_max_chars(run):
+    run("index", "--json")
+    out, _ = run("search", "burr grinder", "--source", "notes", "--json", "--n", "1", "--max-chars", "40")
+    assert len(loads(out)["hits"][0]["doc"]) == 40
+    out, _ = run("search", "burr grinder", "--source", "notes", "--json", "--n", "1")
+    assert len(loads(out)["hits"][0]["doc"]) > 40          # full text by default
+
+
+def test_status_says_where_it_read_from(run, fake_cli, live, instance):
+    """A status from a served instance and one from the local store can disagree, so the
+    output has to say which it was."""
+    out, _ = run("status", "--source", "notes")
+    assert f"Reading : {live.url}  (attached)" in out
+
+    out, _ = run("status", "--source", "notes", "--no-attach")
+    assert "(local store)" in out and "kb.sqlite3" in out
+
+
+def test_serve_ignores_attach_cli_and_never_calls_itself(fake_cli, instance, capsys):
+    """An instance config may carry `attach_cli:` so a CLI run from its folder talks to the
+    server. `serve` must read that as 'not for me' rather than attaching to itself."""
+    from basic_kb.cli import LOCAL_ONLY_COMMANDS
+    assert {"serve", "watch"} <= set(LOCAL_ONLY_COMMANDS)
+
+    cfg = instance / "basic-kb.yaml"
+    cfg.write_text(cfg.read_text(encoding="utf-8") + "\nattach_cli:\n  url: http://127.0.0.1:9\n",
+                   encoding="utf-8")
+    # Port 9 refuses connections, so attaching would fail loudly. Binding wide without auth
+    # is the first thing serve checks, which proves it got past attach resolution entirely.
+    with pytest.raises(SystemExit):
+        cli.main(["serve", "--host", "0.0.0.0", "--config", str(cfg)])
+    assert "refusing to serve on 0.0.0.0" in capsys.readouterr().err

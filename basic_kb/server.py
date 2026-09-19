@@ -1,14 +1,14 @@
 """The served API: a FastAPI app over one KnowledgeBase, and the process around it.
 
 `create_app` builds the routes; `KBServer` owns the process-level pieces: the writer
-lock held for the server's lifetime (lock.py), `served.json` and the local key for
-same-machine attach (attach.py, keys.py), optional bearer-key authentication
+lock held for the server's lifetime (lock.py), the local key that lets a CLI on this
+machine attach without one being typed (keys.py), optional bearer-key authentication
 (ADR 0002), and an optional in-process watcher so one process owns the loaded models
 and every write to the store.
 
 Routes mirror KnowledgeBase one to one (the parity test enforces it):
 
-    GET  /health           identity: name, version, model, nonce, pid, sources, auth
+    GET  /health           identity: name, version, minimum client version, model, sources
     GET  /info             KnowledgeBase.info
     GET  /status?source=   KnowledgeBase.status
     GET  /scan?source=     KnowledgeBase.scan per source
@@ -32,14 +32,11 @@ import hmac
 import ipaddress
 import logging
 import os
-import secrets
-import socket
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
-from .attach import ServedInfo, remove_served, write_served
 from .config import Config
 from .core import DEFAULT_N, KnowledgeBase
 from .errors import (
@@ -50,17 +47,23 @@ from .keys import ApiKeyStore, LocalKey
 from .lock import StoreBusy
 from .serialize import to_jsonable
 from .sources import resolve_sources
-from .version import __version__
+from .version import MIN_CLIENT_VERSION, __version__
 from .watcher import Watcher, WatchEvent, resolve_settings
 
 logger = logging.getLogger("basic_kb")
 
 try:
-    from fastapi import FastAPI, Depends, Request
+    from fastapi import FastAPI, Depends, Request, Security
     from fastapi.responses import JSONResponse
+    from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
     from pydantic import BaseModel
 except ImportError as _e:   # pragma: no cover - exercised only without the extra installed
     raise BasicKBError("`basic-kb serve` needs the serve extra: pip install 'basic-kb[serve]'") from _e
+
+# Declared so the OpenAPI document carries a security scheme and Swagger renders an
+# Authorize button. auto_error=False because whether a key is required is decided per
+# server (ADR 0002), not per route.
+_bearer = HTTPBearer(auto_error=False, description="An API key from `basic-kb keys create`.")
 
 
 class Busy(BasicKBError):
@@ -84,7 +87,6 @@ def is_loopback(host: str) -> bool:
 class ServerState:
     kb: KnowledgeBase
     config: Config
-    nonce: str
     started_at: float
     auth: bool
     keys: Optional[ApiKeyStore]
@@ -102,6 +104,8 @@ class SearchRequest(BaseModel):
     sources: Selector = "all"
     separate: bool = False
     n: Optional[int] = None
+    max_chars: Optional[int] = None      # cap each hit's text; 0/None = full text
+    detailed: bool = False               # keep indexing bookkeeping in the metadata
     content_type: Optional[str] = None
     rerank_candidates: Optional[int] = None
     cand_multiplier: Optional[int] = None
@@ -141,14 +145,14 @@ def _state(request: Request) -> ServerState:
     return request.app.state.kb
 
 
-def require_key(request: Request) -> None:
+def require_key(request: Request,
+                creds: Optional[HTTPAuthorizationCredentials] = Security(_bearer)) -> None:
     """Global dependency: with authentication on, every route wants a bearer key that is
     either this start's local key or an active key in api-keys.json."""
     st = _state(request)
     if not st.auth:
         return
-    header = request.headers.get("authorization", "")
-    token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+    token = creds.credentials.strip() if creds and creds.scheme.lower() == "bearer" else ""
     if token:
         if st.local_key and hmac.compare_digest(token, st.local_key):
             return
@@ -166,8 +170,12 @@ def _chunk_params(cfg: Config, chunk_size, overlap, min_chunk) -> dict:
 
 
 def create_app(state: ServerState) -> "FastAPI":
+    show_docs = state.config.serve_docs
     app = FastAPI(title=f"basic-kb: {state.config.name}", version=__version__,
-                  dependencies=[Depends(require_key)])
+                  dependencies=[Depends(require_key)],
+                  docs_url="/docs" if show_docs else None,
+                  redoc_url="/redoc" if show_docs else None,
+                  openapi_url="/openapi.json" if show_docs else None)
     app.state.kb = state
 
     @app.exception_handler(BasicKBError)
@@ -200,8 +208,9 @@ def create_app(state: ServerState) -> "FastAPI":
     @app.get("/health")
     def health(request: Request):
         st = _state(request)
-        return {"ok": True, "name": st.config.name, "version": __version__, "model_id": st.kb.embedder.model_id,
-                "nonce": st.nonce, "pid": os.getpid(), "started_at": st.started_at,
+        return {"ok": True, "name": st.config.name, "version": __version__,
+                "min_client_version": MIN_CLIENT_VERSION, "model_id": st.kb.embedder.model_id,
+                "pid": os.getpid(), "started_at": st.started_at,
                 "sources": [s["id"] for s in st.config.sources], "auth": st.auth}
 
     @app.get("/info")
@@ -234,11 +243,15 @@ def create_app(state: ServerState) -> "FastAPI":
             cand_min=req.cand_min or cfg.cand_min, cand_max=req.cand_max or cfg.cand_max,
             strict_rerank=req.strict_rerank,
         )
+        shape = dict(detailed=req.detailed, max_chars=req.max_chars or 0)
         if req.separate:
             groups = st.kb.search_grouped(**kwargs)
-            body = {"mode": "separate", "groups": [{"query": q, "hits": to_jsonable(h)} for q, h in groups]}
+            body = {"mode": "separate",
+                    "groups": [{"query": q, "hits": to_jsonable([r.trimmed(**shape) for r in h])}
+                               for q, h in groups]}
         else:
-            body = {"mode": "fused", "queries": req.queries, "hits": to_jsonable(st.kb.search(**kwargs))}
+            hits = [r.trimmed(**shape) for r in st.kb.search(**kwargs)]
+            body = {"mode": "fused", "queries": req.queries, "hits": to_jsonable(hits)}
         body["notices"] = FreshnessTracker.from_config(cfg).evaluate(st.kb, sources)
         return body
 
@@ -325,7 +338,7 @@ class KBServer:
         self.on_event = on_event
         self.on_watch_event = on_watch_event
         self.kb = KnowledgeBase.from_config(config, model=model, threads=threads, on_warning=on_warning)
-        self.info: Optional[ServedInfo] = None
+        self.url: Optional[str] = None
         self.local_key: Optional[str] = None
         self._uv = None
         self._sock = None
@@ -338,7 +351,7 @@ class KBServer:
         if self.on_event is not None:
             self.on_event(msg)
 
-    def _prepare(self) -> ServedInfo:
+    def _prepare(self) -> str:
         import uvicorn
 
         cfg = self.config
@@ -358,7 +371,7 @@ class KBServer:
                 if not keys.active():
                     self._emit("authentication is on and no API keys exist yet: only same-machine attach "
                                "works until you run `basic-kb keys create --name NAME`")
-            state = ServerState(kb=self.kb, config=cfg, nonce=secrets.token_hex(8), started_at=time.time(),
+            state = ServerState(kb=self.kb, config=cfg, started_at=time.time(),
                                 auth=self.auth, keys=keys, local_key=self.local_key, index_lock=threading.Lock())
             app = create_app(state)
 
@@ -366,7 +379,8 @@ class KBServer:
                                       log_config=None, access_log=False)
             self._sock = uvconfig.bind_socket()
             bound_host, bound_port = self._sock.getsockname()[:2]
-            # served.json is read by a CLI on this machine: a wildcard bind is reachable via loopback.
+            # Reported for logs and for a caller that let the port be chosen; a wildcard bind
+            # is reachable over loopback, so name that rather than 0.0.0.0.
             url_host = "127.0.0.1" if bound_host in ("0.0.0.0", "::") else bound_host
             if ":" in url_host:
                 url_host = f"[{url_host}]"
@@ -379,15 +393,22 @@ class KBServer:
                                         guard_threshold=cfg.reindex_guard_threshold,
                                         on_event=self.on_watch_event or (lambda ev: None))
 
-            self.info = ServedInfo(url=f"http://{url_host}:{bound_port}", nonce=state.nonce, pid=os.getpid(),
-                                   hostname=socket.gethostname(), model_id=self.kb.embedder.model_id,
-                                   version=__version__, config_path=str(cfg.path), started_at=state.started_at,
-                                   auth=self.auth)
-            write_served(store_dir, self.info)
-            return self.info
+            self.url = f"http://{url_host}:{bound_port}"
+            return self.url
         except BaseException:
             self._cleanup()
             raise
+
+    def _announce(self, timeout: float = 30.0) -> bool:
+        """Start the watcher once uvicorn is accepting, so its startup reconcile runs beside
+        a server that already answers rather than delaying one that does not."""
+        deadline = time.monotonic() + timeout
+        while not self._uv.started:
+            if time.monotonic() > deadline or self._uv.should_exit:
+                return False
+            time.sleep(0.02)
+        self._start_watcher()
+        return True
 
     def _start_watcher(self) -> None:
         """The startup reconcile can take a while; it runs beside the HTTP server, which is
@@ -397,9 +418,9 @@ class KBServer:
         self._watcher_thread = threading.Thread(target=self._watcher.start, name="basic-kb-watch", daemon=True)
         self._watcher_thread.start()
 
-    def start(self, timeout: float = 15.0) -> ServedInfo:
-        """Run in a background thread; returns once the server answers."""
-        info = self._prepare()
+    def start(self, timeout: float = 15.0) -> str:
+        """Run in a background thread; returns the URL once the server answers."""
+        url = self._prepare()
         self._thread = threading.Thread(target=self._uv.run, kwargs={"sockets": [self._sock]},
                                         name="basic-kb-serve", daemon=True)
         self._thread.start()
@@ -409,17 +430,17 @@ class KBServer:
                 self.stop()
                 raise BasicKBError("the server did not start within the timeout")
             time.sleep(0.02)
-        self._start_watcher()
-        return info
+        self._announce()
+        return url
 
     def serve_forever(self) -> None:
         """Foreground: uvicorn owns the main thread and turns SIGINT/SIGTERM into a clean exit."""
-        info = self._prepare()
-        self._emit(f"serving '{self.config.name}' at {info.url} (pid {info.pid}, auth "
+        url = self._prepare()
+        self._emit(f"serving '{self.config.name}' at {url} (pid {os.getpid()}, auth "
                    f"{'on' if self.auth else 'off'}, watch {'on' if self.watch else 'off'}); Ctrl-C to stop")
-        # The watcher starts once uvicorn is listening; uvicorn calls startup handlers itself,
-        # so hang the watcher start off a tiny delayed thread instead.
-        threading.Timer(0.5, self._start_watcher).start()
+        # The watcher waits for uvicorn to accept; uvicorn owns the main thread from here,
+        # so the wait runs beside it.
+        threading.Thread(target=self._announce, name="basic-kb-announce", daemon=True).start()
         try:
             self._uv.run(sockets=[self._sock])
         finally:
@@ -439,7 +460,6 @@ class KBServer:
             if self._watcher_thread is not None:
                 self._watcher_thread.join(timeout=30)
             self._watcher = None
-        remove_served(self.config.store_dir)
         LocalKey(self.config.store_dir).remove()
         if self._sock is not None:
             try:

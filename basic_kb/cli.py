@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Optional
 
 from .attach import attach
+from .chunkers import DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK, DEFAULT_OVERLAP
+from .client import RemoteKnowledgeBase
 from .config import Config, find_config, load_config, load_env_file
 from .errors import BasicKBError, UnknownSource
 from .freshness import FreshnessTracker
@@ -39,7 +41,8 @@ from .version import __version__
 from .core import DEFAULT_N, KnowledgeBase, cores_to_threads, lower_process_priority, setup_file_logging
 from .embedders import FastEmbedEmbedder
 from .render import (
-    emit_json, print_info, print_inspect, print_results, print_sources, print_status, print_watch_event,
+    emit_json, print_info, print_inspect, print_origin, print_results, print_sources, print_status,
+    print_watch_event,
 )
 from .rerankers import RERANKER_TYPES
 from .sources import DataSourceBase, resolve_sources
@@ -58,15 +61,28 @@ def _effective(args: argparse.Namespace, config: Config) -> tuple[str, int, int,
     return model, chunk_size, overlap, min_chunk
 
 
+def _remote_stub_config(url: str) -> Config:
+    """Stand-in Config for `--attach URL` run outside any instance folder.
+
+    An attached command resolves sources, chunk sizes and freshness on the server, so
+    nothing here is read except as a last-resort default. The paths deliberately point
+    at nothing: an attached run must never open a local store.
+    """
+    here = Path.cwd()
+    return Config(path=here / "(attached)", base_dir=here, name=url,
+                  store_dir=here / "(attached)", embedding_model="(remote)",
+                  chunk_size=DEFAULT_CHUNK_SIZE, overlap=DEFAULT_OVERLAP,
+                  min_chunk=DEFAULT_MIN_CHUNK, sources=[])
+
+
 def _attached(args: argparse.Namespace, config: Config):
-    """The served instance for this config when one is alive and attach is allowed, else None.
-    Anything worth knowing about the decision goes to stderr as one `[basic-kb]` line."""
+    """The served instance this config points at, or None to run locally. Raises if a URL is
+    configured or given and the server cannot be used."""
     return attach(
         config,
         no_attach=getattr(args, "no_attach", False),
         attach_url=getattr(args, "attach", None),
         api_key=getattr(args, "api_key", None),
-        model_override=getattr(args, "model", None),
         on_note=lambda m: print(f"[basic-kb] {m}", file=sys.stderr),
     )
 
@@ -143,6 +159,32 @@ def _load_sources(config: Config, source_arg: str,
         sys.exit(1)
 
 
+def _sources_for(kb, config: Config, source_arg: str,
+                 content_type: Optional[str] = None) -> list:
+    """The sources a command should operate on, for whichever kb it got.
+
+    Local runs get built DataSource objects. An attached run gets plain source ids and
+    lets the SERVER resolve them against its own config: a served instance already knows
+    its sources, so a remote caller needs no local source list (and, with --attach, no
+    local config at all). Every downstream call site takes either form, because the
+    client sends ids on the wire regardless.
+    """
+    if not isinstance(kb, RemoteKnowledgeBase):
+        return _load_sources(config, source_arg, content_type)
+    if source_arg == "list":
+        print_info(kb.info())
+        sys.exit(0)
+    known = list(kb.health().get("sources") or [])
+    if source_arg in (None, "", "all"):
+        return known
+    ids = [s.strip() for s in source_arg.split(",") if s.strip()]
+    unknown = [i for i in ids if known and i not in known]
+    if unknown:
+        print(f"{UnknownSource(unknown, known)} Use --source list to see them.", file=sys.stderr)
+        sys.exit(1)
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -168,11 +210,12 @@ def _resolve_throttle(args: argparse.Namespace, config: Config) -> tuple[Optiona
 
 
 def cmd_index(args: argparse.Namespace, config: Config) -> None:
-    sources = _load_sources(config, getattr(args, "source", "all"))
     _, chunk_size, overlap, min_chunk = _effective(args, config)
 
     if getattr(args, "preview", False):
-        _preview_chunks(_scan_kb(args, config), sources, config, chunk_size, overlap, min_chunk, args)
+        preview_kb = _scan_kb(args, config)
+        sources = _load_sources(config, getattr(args, "source", "all"))
+        _preview_chunks(preview_kb, sources, config, chunk_size, overlap, min_chunk, args)
         return
 
     cores, priority, pause_ms, pause_every = _resolve_throttle(args, config)
@@ -191,11 +234,12 @@ def cmd_index(args: argparse.Namespace, config: Config) -> None:
 
     as_json = getattr(args, "json", False)
     kb = _kb_for(args, config, search=False, threads=threads)
+    sources = _sources_for(kb, config, getattr(args, "source", "all"))
     switch = getattr(args, "switch_model", False)
     if switch:
         # A switch re-embeds everything; `--source` would leave the other sources' vectors
         # in a different space, so the run always covers every configured source.
-        sources = _load_sources(config, "all")
+        sources = _sources_for(kb, config, "all")
     results = kb.index_many(
         sources, chunk_size=chunk_size, overlap=overlap, min_chunk=min_chunk,
         force=args.force, switch_model=switch,
@@ -224,7 +268,7 @@ def _preview_chunks(kb: KnowledgeBase, sources: list[DataSourceBase], config: Co
     max_chars = getattr(args, "max_chars", 0)
     out_arg = getattr(args, "out", None)
 
-    source_ids = "-".join(s.source_id for s in sources)
+    source_ids = "-".join(getattr(s, "source_id", str(s)) for s in sources)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     if out_arg:
         out_path = Path(out_arg)
@@ -303,11 +347,14 @@ def _search_defaults(args: argparse.Namespace, config: Config) -> tuple[int, boo
 
 def cmd_search(args: argparse.Namespace, config: Config) -> None:
     n, separate, max_chars, content_type, timing = _search_defaults(args, config)
-    sources = _load_sources(config, getattr(args, "source", "all"), content_type)
-    if not args.queries:
+    source_arg = getattr(args, "source", "all")
+    # `--source list` is a lookup, not a search, so it must not demand a query. Everything
+    # else fails here before a model or a connection is touched.
+    if not args.queries and source_arg != "list":
         print("Error: at least one query is required.", file=sys.stderr)
         sys.exit(1)
     kb = _kb_for(args, config, search=True)
+    sources = _sources_for(kb, config, source_arg, content_type)
     common = dict(
         sources=sources,
         queries=args.queries,
@@ -324,11 +371,12 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
     # Batch mode: each query gets its OWN top-n block (no cross-query merging).
     as_json = getattr(args, "json", False)
 
+    shape = dict(detailed=getattr(args, "detailed", False), max_chars=max_chars)
     if separate:
         groups = kb.search_grouped(**common)
         if as_json:
             emit_json({"mode": "separate",
-                       "groups": [{"query": q, "hits": h} for q, h in groups]})
+                       "groups": [{"query": q, "hits": [r.trimmed(**shape) for r in h]} for q, h in groups]})
         else:
             for q, hits in groups:
                 print("#" * 60)
@@ -342,7 +390,8 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         # Fused mode (default): all queries merged into one ranked list.
         hits = kb.search(**common)
         if as_json:
-            emit_json({"mode": "fused", "queries": args.queries, "hits": hits})
+            emit_json({"mode": "fused", "queries": args.queries,
+                       "hits": [r.trimmed(**shape) for r in hits]})
         elif not hits:
             print("No results.")
         else:
@@ -361,12 +410,15 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
 
 
 def cmd_status(args: argparse.Namespace, config: Config) -> None:
-    sources = _load_sources(config, getattr(args, "source", "all"))
     kb = _kb_for(args, config, search=False)
+    sources = _sources_for(kb, config, getattr(args, "source", "all"))
     statuses = kb.status(sources)
     if getattr(args, "json", False):
         emit_json(statuses)
         return
+    # Where the numbers came from. Without this a status read from a served instance is
+    # indistinguishable from one read off the local store, and the two can disagree.
+    print_origin(kb)
     tracker = FreshnessTracker.from_config(config) if config.freshness_enabled else None
     for st in statuses:
         print_status(st, tracker.nudges_for(st.source_id) if tracker else None)
@@ -379,8 +431,8 @@ def cmd_info(args: argparse.Namespace, config: Config) -> None:
     info answers "what does this hold and is it worth querying". A caller picking
     a source reads the descriptions, which status has no reason to show.
     """
-    sources = _load_sources(config, getattr(args, "source", "all"))
     kb = _kb_for(args, config, search=False)
+    sources = _sources_for(kb, config, getattr(args, "source", "all"))
     inf = kb.info(sources, name=config.name)
     if getattr(args, "json", False):
         emit_json(inf)
@@ -396,8 +448,8 @@ def _scan_kb(args: argparse.Namespace, config: Config, threads: Optional[int] = 
 
 
 def cmd_scan(args: argparse.Namespace, config: Config) -> None:
-    sources = _load_sources(config, getattr(args, "source", "all"))
     kb = _kb_for(args, config, search=False)
+    sources = _sources_for(kb, config, getattr(args, "source", "all"))
     results = [kb.scan(s) for s in sources]
     if getattr(args, "json", False):
         emit_json(results)
@@ -474,6 +526,11 @@ def _tri_state(on: bool, off: bool) -> Optional[bool]:
     if off:
         return False
     return True if on else None
+
+
+# Commands that own the store rather than query one. They never attach, so an instance
+# config may carry `attach_cli:` for the CLI without the server trying to call itself.
+LOCAL_ONLY_COMMANDS = ("serve", "watch", "keys")
 
 
 def cmd_serve(args: argparse.Namespace, config: Config) -> None:
@@ -603,9 +660,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb search \"angle one\" \"angle two\"                multi-query, merged (better recall)\n"
             "  basic_kb search \"topic a\" \"topic b\" --separate         batch: n results per query\n"
             "  basic_kb search --source list                          list configured sources\n"
+            "  basic_kb search \"...\" --source notes                   search one source\n"
+            "  basic_kb search \"...\" --source notes,meetings          search several (comma-separated)\n"
             "  basic_kb index                                         incremental: new/changed only\n"
             "  basic_kb index --force                                 re-embed the selected sources (same model)\n"
-            "  basic_kb index --switch-model                          embedding model changed: wipe + rebuild all\n"
+
             "  basic_kb index --limit 10                              embed only the first N files total (test)\n"
             "  basic_kb status                                        chunk/doc counts per source\n"
             "  basic_kb scan                                          new/changed/deleted files vs the index\n"
@@ -614,8 +673,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  basic_kb serve [--watch] [--auth]                      HTTP API for this instance (foreground)\n"
             "  basic_kb keys create --name NAME                       mint an API key for the served API\n"
             "  basic_kb --inspect                                     resolved settings (freshness template)\n\n"
-            "Attach: when `serve` runs for this instance, every command above uses it instead of loading\n"
-            "        models again; --no-attach runs locally, --attach URL [--api-key K] targets a remote one.\n\n"
+            "Attach: with an `attach_cli:` block in the config, every command above runs on that served\n"
+            "        instance instead of opening the store; --no-attach runs locally, --attach URL\n"
+            "        [--api-key K] points at a different one. `status` says which it used.\n\n"
             "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina-compatible|deepinfra-compatible|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --switch-model  --limit N [--limit-per-source]  --preview [--file NAME]  --yes  --no-reindex-guard\n"
@@ -706,6 +766,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Truncate each result to N chars (default: `search.max_chars`, else 0 = full)")
     p_search.add_argument("--json", action="store_true",
                           help="emit hits as JSON instead of formatted text")
+    p_search.add_argument("--detailed", action="store_true",
+                          help="keep indexing bookkeeping (content_hash, position, chunk_index, file) "
+                               "in each hit's metadata. Default strips it: rel_path already carries the "
+                               "filename and its folder. Affects --json only.")
     p_search.add_argument("--timing", action="store_true",
                           help="Print per-phase timings (embed/retrieve/rerank/total) to stderr. "
                                "Also enabled by `search.timing: true` in the config.")
@@ -802,24 +866,33 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Resolve the config: explicit flag > $BASIC_KB_CONFIG > basic-kb.yaml up the tree.
     config_path = Path(getattr(args, "config", None)).expanduser() if getattr(args, "config", None) else find_config()
     if config_path is None:
-        print(
-            "No config found. Do one of:\n"
-            "  • pass --config PATH\n"
-            "  • set BASIC_KB_CONFIG=PATH\n"
-            "  • add a basic-kb.yaml to this directory (or any parent).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        # `--attach URL` targets a served instance that carries its own config, so a local
+        # one is not needed (and must not be invented from the working directory).
+        if getattr(args, "attach", None):
+            config_path = None
+        else:
+            print(
+                "No config found. Do one of:\n"
+                "  • pass --config PATH\n"
+                "  • set BASIC_KB_CONFIG=PATH\n"
+                "  • add a basic-kb.yaml to this directory (or any parent),\n"
+                "  • or point at a served instance with --attach URL.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Load secrets first: --env-file (explicit) wins over config env_file (both setdefault).
     if getattr(args, "env_file", None):
         load_env_file(Path(args.env_file).expanduser())
-    config = load_config(config_path)
-    if config.env_file and config.env_file.exists():
-        load_env_file(config.env_file)
-    if config.log_file:
-        setup_file_logging(config.log_file, config.log_level,
-                           config.log_max_bytes, config.log_backup_count)
+    if config_path is None:
+        config = _remote_stub_config(args.attach)
+    else:
+        config = load_config(config_path)
+        if config.env_file and config.env_file.exists():
+            load_env_file(config.env_file)
+        if config.log_file:
+            setup_file_logging(config.log_file, config.log_level,
+                               config.log_max_bytes, config.log_backup_count)
 
     if args.inspect:
         print_inspect(config)

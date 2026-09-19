@@ -17,12 +17,14 @@ from typing import Any, Callable, Optional, Union
 import requests
 
 from .errors import (
-    BasicKBError, EmbeddingError, IndexNotFound, MassChangeRefused, QueryFailed, StoreError, UnknownSource,
+    BasicKBError, EmbeddingError, IncompatibleVersion, IndexNotFound, MassChangeRefused, QueryFailed,
+    StoreError, UnknownSource,
 )
 from .models import (
     IndexResult, InstanceInfo, PreviewFile, ScanResult, SearchResult, SourceStatus, VacuumResult,
 )
 from .serialize import from_dict
+from .version import MIN_SERVER_VERSION, __version__, parse_version
 
 API_KEY_ENV = "BASIC_KB_API_KEY"
 
@@ -105,7 +107,28 @@ class RemoteKnowledgeBase:
     # --- the KnowledgeBase surface ----------------------------------------------------------
 
     def health(self, timeout: Optional[float] = None) -> dict:
-        return self._request("GET", "/health", timeout=timeout)
+        """Server identity, and the compatibility check for this pair.
+
+        Checked here because every path that reaches a server goes through health first:
+        the CLI's attach probe, `--attach URL`, and `basic_kb.connect`. A mismatch raises
+        rather than degrading to a local run, so a half-upgraded pair fails once, loudly,
+        at connect time instead of at some later call with a missing field.
+        """
+        info = self._request("GET", "/health", timeout=timeout)
+        self._check_versions(info)
+        return info
+
+    def _check_versions(self, info: dict) -> None:
+        server = info.get("version") or "0"
+        needs_client = info.get("min_client_version") or "0"
+        if parse_version(__version__) < parse_version(needs_client):
+            raise IncompatibleVersion(
+                f"the served instance at {self.url} needs a client of at least {needs_client}; "
+                f"this one is {__version__}. Upgrade it: pip install -U basic-kb")
+        if parse_version(server) < parse_version(MIN_SERVER_VERSION):
+            raise IncompatibleVersion(
+                f"the served instance at {self.url} is {server}; this client needs at least "
+                f"{MIN_SERVER_VERSION}. Upgrade the server, or use an older client against it.")
 
     def info(self, sources=None, name: str = "") -> InstanceInfo:
         params = {"source": _ids(sources)} if _ids(sources) else None
@@ -120,27 +143,30 @@ class RemoteKnowledgeBase:
         return from_dict(ScanResult, data[0])
 
     def _search(self, separate: bool, sources, queries: list[str], n: Optional[int], content_type_filter,
-                rerank_candidates, cand_multiplier, cand_min, cand_max, strict_rerank) -> dict:
+                rerank_candidates, cand_multiplier, cand_min, cand_max, strict_rerank,
+                max_chars: int = 0, detailed: bool = False) -> dict:
         body = {"queries": list(queries), "sources": _ids(sources) or "all", "separate": separate,
                 "n": n, "content_type": content_type_filter, "rerank_candidates": rerank_candidates,
                 "cand_multiplier": cand_multiplier, "cand_min": cand_min, "cand_max": cand_max,
-                "strict_rerank": strict_rerank}
+                "strict_rerank": strict_rerank, "max_chars": max_chars, "detailed": detailed}
         data = self._request("POST", "/search", json=body)
         self.last_notices = list(data.get("notices", []))
         return data
 
     def search(self, sources, queries: list[str], n: Optional[int] = None, content_type_filter=None,
                rerank_candidates=None, cand_multiplier=None, cand_min=None, cand_max=None,
-               strict_rerank: bool = False, timing: bool = False) -> list[SearchResult]:
+               strict_rerank: bool = False, timing: bool = False,
+               max_chars: int = 0, detailed: bool = False) -> list[SearchResult]:
         data = self._search(False, sources, queries, n, content_type_filter, rerank_candidates,
-                            cand_multiplier, cand_min, cand_max, strict_rerank)
+                            cand_multiplier, cand_min, cand_max, strict_rerank, max_chars, detailed)
         return [from_dict(SearchResult, h) for h in data["hits"]]
 
     def search_grouped(self, sources, queries: list[str], n: Optional[int] = None, content_type_filter=None,
                        rerank_candidates=None, cand_multiplier=None, cand_min=None, cand_max=None,
-                       strict_rerank: bool = False, timing: bool = False) -> list[tuple[str, list[SearchResult]]]:
+                       strict_rerank: bool = False, timing: bool = False,
+                       max_chars: int = 0, detailed: bool = False) -> list[tuple[str, list[SearchResult]]]:
         data = self._search(True, sources, queries, n, content_type_filter, rerank_candidates,
-                            cand_multiplier, cand_min, cand_max, strict_rerank)
+                            cand_multiplier, cand_min, cand_max, strict_rerank, max_chars, detailed)
         return [(g["query"], [from_dict(SearchResult, h) for h in g["hits"]]) for g in data["groups"]]
 
     def index_many(self, sources, chunk_size=None, overlap=None, min_chunk=None, force: bool = False,

@@ -79,7 +79,14 @@ class FastEmbedEmbedder(EmbedderBase):
 
     def _load(self):
         if self._model is None:
-            from fastembed import TextEmbedding
+            try:
+                from fastembed import TextEmbedding
+            except ImportError as e:
+                raise EmbeddingError(
+                    f"embedding model {self._model_id!r} runs on-device, which needs the `local` "
+                    f"extra: pip install 'basic-kb[local]'. An instance that embeds through an API "
+                    f"needs no local model - give it an `embedding:` block instead."
+                ) from e
             self._model = TextEmbedding(self._model_id, show_progress=False, threads=self._threads)
 
     @property

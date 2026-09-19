@@ -11,7 +11,6 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "sqlite-vec>=0.1.9",  # exact vector search inside SQLite; see docs/adr/0001
-    "fastembed>=0.8.0",
     "pyyaml>=6.0",
     "requests>=2.31",   # cloud embedders/rerankers and the attach client
     "watchdog>=4.0",    # cross-platform file events for `basic-kb watch`
@@ -19,6 +18,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# On-device embedding and reranking. Optional because an instance that embeds through an
+# API needs none of it, and fastembed pulls onnxruntime with it (~60 MB of native wheels).
+# Both imports are lazy, so a missing install only surfaces if a config selects a local model.
+local = [
+    "fastembed>=0.8.0",
+]
 serve = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
@@ -26,7 +31,7 @@ serve = [
 dev = [
     "pytest>=8",
     "httpx>=0.27",      # FastAPI's TestClient
-    "basic-kb[serve]",
+    "basic-kb[serve,local]",
 ]
 
 [project.scripts]

@@ -5,6 +5,11 @@ from dataclasses import dataclass, field, fields
 from typing import Optional
 
 
+# Metadata an agent cannot act on: indexing bookkeeping, and `file`, which `rel_path`
+# already contains together with the folder it sits in. Stripped unless `detailed`.
+BOOKKEEPING_METADATA = frozenset({"content_hash", "position", "chunk_index", "file"})
+
+
 @dataclass
 class SearchResult:
     doc: str
@@ -15,6 +20,18 @@ class SearchResult:
     @property
     def sort_key(self) -> float:
         return self.rerank_score if self.rerank_score is not None else self.score
+
+    def trimmed(self, detailed: bool = False, max_chars: int = 0) -> "SearchResult":
+        """A copy shaped for a machine reader. `detailed` keeps every stored field;
+        `max_chars` caps the chunk text (0 = full, which is the default everywhere).
+
+        Applied at the serialisation boundary, so the CLI, the API and the client all
+        return the same thing, and nothing about the stored index changes.
+        """
+        meta = self.metadata if detailed else {
+            k: v for k, v in self.metadata.items() if k not in BOOKKEEPING_METADATA}
+        doc = self.doc if not max_chars else self.doc[:max_chars]
+        return SearchResult(doc=doc, metadata=meta, score=self.score, rerank_score=self.rerank_score)
 
 
 @dataclass

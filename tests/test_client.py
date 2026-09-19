@@ -15,12 +15,12 @@ CH = dict(chunk_size=400, overlap=40, min_chunk=20)
 
 @pytest.fixture
 def remote(served) -> RemoteKnowledgeBase:
-    return RemoteKnowledgeBase(served.info.url)
+    return RemoteKnowledgeBase(served.url)
 
 
 def test_health_and_info(remote, served):
     h = remote.health()
-    assert h["nonce"] == served.info.nonce and h["auth"] is False
+    assert h["name"] == "test-instance" and h["auth"] is False
     inf = remote.info()
     assert isinstance(inf, InstanceInfo) and inf.total_chunks == 8 and inf.sources[0].chunks_per_file == 1.5
 
@@ -60,7 +60,7 @@ def test_index_not_found_over_http(config, fake_provider, kb):
     server.start()
     try:
         with pytest.raises(IndexNotFound):
-            RemoteKnowledgeBase(server.info.url).search("all", ["x"])
+            RemoteKnowledgeBase(server.url).search("all", ["x"])
     finally:
         server.stop()
 
@@ -86,7 +86,7 @@ def test_index_mass_change_prompts_through_on_confirm(served, instance, config):
     server = KBServer(load_config(cfg), port=0)
     server.start()
     try:
-        remote = RemoteKnowledgeBase(server.info.url)
+        remote = RemoteKnowledgeBase(server.url)
         remote.index_many("many", **CH)
         for f in (instance / "data" / "many").glob("*.md"):
             f.write_text(f.read_text(encoding="utf-8") + "edited\n", encoding="utf-8")
@@ -113,7 +113,7 @@ def test_unreachable_server_is_a_remote_error():
 
 
 def test_auth_over_http(served_auth, config):
-    url = served_auth.info.url
+    url = served_auth.url
     with pytest.raises(RemoteError, match="unauthorized"):
         RemoteKnowledgeBase(url).health()
     assert RemoteKnowledgeBase(url, api_key=served_auth.local_key).health()["auth"] is True
@@ -128,6 +128,34 @@ def test_auth_over_http(served_auth, config):
 def test_connect_helper(served, monkeypatch):
     import basic_kb
     monkeypatch.setenv("BASIC_KB_API_KEY", "bkb_from_env")
-    remote = basic_kb.connect(served.info.url)
+    remote = basic_kb.connect(served.url)
     assert isinstance(remote, RemoteKnowledgeBase) and remote.api_key == "bkb_from_env"
-    assert basic_kb.connect(served.info.url, api_key="explicit").api_key == "explicit"
+    assert basic_kb.connect(served.url, api_key="explicit").api_key == "explicit"
+
+
+# --- wire compatibility between a client and a served instance --------------------------
+
+def test_health_advertises_the_minimum_client(remote):
+    h = remote.health()
+    assert h["min_client_version"] and h["version"]
+
+
+def test_client_too_old_is_refused_loudly(served, monkeypatch):
+    """A half-upgraded pair must fail once at connect, not at some later missing field."""
+    import basic_kb.client as client_mod
+    from basic_kb.errors import IncompatibleVersion
+
+    monkeypatch.setattr(client_mod, "__version__", "0.1.0")
+    with pytest.raises(IncompatibleVersion, match="needs a client of at least"):
+        RemoteKnowledgeBase(served.url).health()
+
+
+def test_server_too_old_is_refused_loudly(served, monkeypatch):
+    import basic_kb.client as client_mod
+    from basic_kb.errors import IncompatibleVersion
+
+    monkeypatch.setattr(client_mod, "MIN_SERVER_VERSION", "99.0.0")
+    with pytest.raises(IncompatibleVersion, match="this client needs at least"):
+        RemoteKnowledgeBase(served.url).health()
+
+

@@ -161,6 +161,13 @@ class Config:
     serve_port: int = 8765                   # 0 = pick a free port
     serve_auth: bool = False                 # require a bearer API key on every route (ADR 0002)
     serve_watch: bool = False                # run the watcher inside the server process
+    serve_docs: bool = True                  # expose /docs, /redoc, /openapi.json (turn off on a public bind)
+    # An `attach_cli:` block points a CLI on this machine at a served instance, which makes
+    # the config a thin client: the server resolves sources, chunking and freshness, so
+    # nothing below it is read. The key is only ever named here, never written.
+    attach_url: Optional[str] = None
+    attach_key_env: Optional[str] = None
+    attach_key_file: Optional[Path] = None   # a file holding the key, e.g. the server's local.key
     # Watch/auto-reindex is configured PER SOURCE (a `watch:` block on each source),
     # not instance-wide — see basic_kb.watcher.resolve_settings.
 
@@ -187,8 +194,10 @@ def load_config(config_path: Path) -> Config:
     chunker_cfg = data.get("chunker", {}) or {}
 
     sources = data.get("sources", []) or []
-    if not sources:
-        raise ValueError(f"Config {config_path} defines no `sources:`.")
+    if not sources and not (data.get("attach_cli") or {}):
+        raise ValueError(
+            f"Config {config_path} defines no `sources:`. A client config may omit them, "
+            f"but then it needs an `attach_cli:` block naming the served instance to use.")
 
     # Default 5: find a shared dotenv up the tree without config. Explicit 0 disables
     # the walk-up; an empty value falls back to the default rather than disabling.
@@ -233,6 +242,28 @@ def load_config(config_path: Path) -> Config:
     thr_cores = thr.get("cores_fraction")
 
     srv = data.get("serve", {}) or {}
+
+    # `attach_cli:` may be a bare URL string or a mapping ({url, key_env}). Named for the
+    # side it configures: `serve:` is this instance being a server, `attach_cli:` is a CLI
+    # on this machine talking to one.
+    if "attach" in data:
+        raise ValueError(
+            f"Config {config_path} uses `attach:`, which is now `attach_cli:` — `serve:` and "
+            f"`attach:` side by side read as the same thing. Rename the block.")
+    att = data.get("attach_cli")
+    attach_key_file = None
+    if isinstance(att, str):
+        attach_url, attach_key_env = att.strip(), None
+    elif isinstance(att, dict):
+        attach_url = str(att["url"]).strip() if att.get("url") else None
+        attach_key_env = str(att["key_env"]).strip() if att.get("key_env") else None
+        attach_key_file = _resolve(base_dir, att["key_file"]) if att.get("key_file") else None
+        if att.get("key"):
+            raise ValueError(
+                "attach_cli.key is not supported: a literal API key must never live in a config file. "
+                "Use `key_env: BASIC_KB_API_KEY` and put the value in the environment or the env_file.")
+    else:
+        attach_url = attach_key_env = None
 
     # `reindex_guard:` may be a bare bool (reindex_guard: false) or a mapping
     # ({enabled, threshold}). Both disable/tune the mass-change corruption check.
@@ -292,4 +323,8 @@ def load_config(config_path: Path) -> Config:
         serve_port=int(srv.get("port", 8765)),
         serve_auth=bool(srv.get("auth", False)),
         serve_watch=bool(srv.get("watch", False)),
+        serve_docs=bool(srv.get("docs", True)),
+        attach_url=attach_url,
+        attach_key_env=attach_key_env,
+        attach_key_file=attach_key_file,
     )

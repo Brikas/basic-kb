@@ -51,8 +51,8 @@ class WriterLock:
         except Timeout:
             raise StoreBusy(
                 f"another process is writing the store in {self.store_dir} (it holds {self.path.name}). "
-                f"If a basic-kb server or watcher is running for this instance, the CLI attaches to it "
-                f"automatically; otherwise stop the other writer and retry."
+                f"If that is this instance's server, talk to it instead — give the config an "
+                f"`attach_cli:` block, or pass --attach URL. Otherwise stop the other writer and retry."
             ) from None
         return self
 
