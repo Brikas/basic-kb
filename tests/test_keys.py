@@ -18,8 +18,8 @@ def test_generate_key_shape():
 
 def test_create_list_verify_revoke(tmp_path):
     store = ApiKeyStore(tmp_path)
-    rec, plain = store.create("autotemple")
-    assert rec.name == "autotemple" and rec.active and rec.prefix == plain[:10]
+    rec, plain = store.create("laptop")
+    assert rec.name == "laptop" and rec.active and rec.prefix == plain[:10]
     assert plain not in store.path.read_text()                # only the hash is stored
     assert store.verify(plain) == rec
     assert store.verify("bkb_wrong") is None and store.verify("") is None

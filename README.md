@@ -55,12 +55,12 @@ basic-kb serve --watch --auth
 
 `GET /health /info /status /scan`, `POST /search /index /vacuum /preview`.
 
-While it runs, CLI commands for that instance attach to it instead of loading models again. `--no-attach` runs locally; `--attach URL --api-key K` targets another machine. One writer per store, enforced by an OS lock. How and why: [ADR 0003](docs/adr/0003-serve-attach-writer-lock.md).
+A CLI run attaches when it has a URL — `--attach URL`, `BASIC_KB_ATTACH_URL`, or `attach_cli:` in the config — and reaches the server instead of loading models again. The env var is there so one committed config serves every machine: the box running the server points it at its own loopback, everyone else falls through to the configured host. `--no-attach` works on the store directly. One writer per store, enforced by an OS lock: [ADR 0003](docs/adr/0003-serve-attach-writer-lock.md), [ADR 0004](docs/adr/0004-container-and-configured-attach.md).
 
 Auth is off by default ([ADR 0002](docs/adr/0002-native-bearer-api-keys.md)). With `--auth` every route needs `Authorization: Bearer <key>`:
 
 ```bash
-basic-kb keys create --name autotemple    # printed once
+basic-kb keys create --name laptop        # printed once
 basic-kb keys list
 basic-kb keys revoke <id>
 ```

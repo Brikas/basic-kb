@@ -338,19 +338,19 @@ def test_json_search_nudges_on_stderr(fake_cli, instance, capsys):
 # --- keys (ADR 0002) ---------------------------------------------------------------------------------------------
 
 def test_keys_create_list_revoke(run, instance):
-    out, err = run("keys", "create", "--name", "autotemple")
+    out, err = run("keys", "create", "--name", "laptop")
     key = out.strip()
     assert key.startswith("bkb_") and "only time it is shown" in err
     out, _ = run("keys", "list")
-    assert "autotemple" in out and key not in out and "active" in out
+    assert "laptop" in out and key not in out and "active" in out
     out, _ = run("keys", "list", "--json")
     (rec,) = loads(out)
-    assert rec["name"] == "autotemple" and rec["active"] is True and "sha256" in rec
+    assert rec["name"] == "laptop" and rec["active"] is True and "sha256" in rec
     out, _ = run("keys", "revoke", rec["id"])
     assert "Revoked" in out
     out, _ = run("keys", "list")
     assert "revoked" in out
-    _, err = run("keys", "revoke", "autotemple", expect_exit=1)
+    _, err = run("keys", "revoke", "laptop", expect_exit=1)
     assert "no active key" in err
 
 

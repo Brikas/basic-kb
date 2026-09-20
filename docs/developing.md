@@ -39,9 +39,9 @@ DataSourceBase  SOURCE_TYPES registry (sources.py)  ──►  ChunkerBase  _CHU
 
 Surfaces over the same operations (core.OPERATIONS):
   cli.py + render.py      argparse, attach decision, human/JSON rendering
-  server.py               FastAPI routes + KBServer (lock for life, served.json, local key, optional Watcher)
+  server.py               FastAPI routes + KBServer (lock for life, local key, optional Watcher)
   client.py               RemoteKnowledgeBase: same methods over HTTP; errors rebuilt as the same types
-  attach.py               served.json and the CLI's attach decision
+  attach.py               the CLI's attach decision: flag, env var, config
   keys.py                 API keys (ADR 0002)
   freshness.py            stale-source nudges (state in store_dir)
   watcher.py              Watcher: start/stop, events to a callback, one reindex worker
@@ -52,7 +52,7 @@ Surfaces over the same operations (core.OPERATIONS):
 
 **Flow, search:** embed each query once; `SqliteVecStore.knn` per source (exact cosine, optional `content_type`), merge by chunk id keeping the highest score, optionally rerank the top candidates, return `SearchResult`s.
 
-**Flow, serve/attach:** `KBServer` takes the writer lock, binds the socket, writes `served.json` (URL, per-start nonce, pid, hostname, model, config path, auth flag) and serves; with `--watch` a `Watcher` runs inside it. A CLI command for the same config runs `attach.attach()`: lock free means stale file, delete it and run locally; lock held means probe `/health`, require the nonce to match, then forward. ADR 0003 has the full procedure and its rationale.
+**Flow, serve/attach:** `KBServer` takes the writer lock, binds the socket, mints a `local.key` and serves; with `--watch` a `Watcher` runs inside it. A CLI command runs `attach.attach()`, which takes the first URL it finds: `--attach`, `BASIC_KB_ATTACH_URL`, then `attach_cli.url`. With none it runs locally; with one it resolves a key, checks identity and version over `/health` and forwards every call, raising rather than falling back. `serve`, `watch` and `keys` own the store and never attach. ADR 0003 covers the lock, 0004 the attach design.
 
 ---
 
@@ -74,15 +74,15 @@ Surfaces over the same operations (core.OPERATIONS):
 | `basic_kb/freshness.py` | FreshnessSettings, FreshnessTracker (state file `freshness_state.json`) |
 | `basic_kb/watcher.py` | Watcher, WatchEvent, WatchSettings, `resolve_settings` |
 | `basic_kb/keys.py` | ApiKeyStore (`api-keys.json`), LocalKey (`local.key`) |
-| `basic_kb/attach.py` | ServedInfo (`served.json`), `attach()` |
+| `basic_kb/attach.py` | `attach()`, `resolve_attach_key()`, `BASIC_KB_ATTACH_URL` / `BASIC_KB_NO_ATTACH` |
 | `basic_kb/client.py` | RemoteKnowledgeBase, RemoteError, `resolve_api_key` |
 | `basic_kb/server.py` | FastAPI app (`create_app`), KBServer, request models, error mapping, `require_key` |
 | `basic_kb/config.py` | Instance config, local override merge, dotenv resolution, `find_config` |
 | `basic_kb/render.py` | Human renderers and `emit_json` |
 | `basic_kb/cli.py` | argparse, commands, attach wiring |
 | `basic_kb/__init__.py` | Public API, `basic_kb.open`, `basic_kb.connect` |
-| `<store_dir>/` | `kb.sqlite3`, `writer.lock`, `served.json`, `local.key`, `api-keys.json`, `freshness_state.json` |
-| `docs/adr/` | 0001 sqlite-vec + exact search; 0002 API keys; 0003 serve, attach, writer lock |
+| `<store_dir>/` | `kb.sqlite3`, `writer.lock`, `local.key`, `api-keys.json`, `freshness_state.json` |
+| `docs/adr/` | 0001 sqlite-vec + exact search; 0002 API keys; 0003 serve, attach, writer lock; 0004 container + configured attach |
 
 ---
 

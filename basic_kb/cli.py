@@ -818,7 +818,7 @@ def build_parser() -> argparse.ArgumentParser:
     ksub = p_keys.add_subparsers(dest="keys_cmd", required=True)
     k_create = ksub.add_parser("create", help="Mint a key; the plaintext is printed once")
     _config_args(k_create)
-    k_create.add_argument("--name", required=True, metavar="NAME", help="Who or what will use it, e.g. autotemple")
+    k_create.add_argument("--name", required=True, metavar="NAME", help="Who or what will use it, e.g. laptop")
     k_create.add_argument("--json", action="store_true", help="emit {id, name, prefix, key} as JSON")
     k_list = ksub.add_parser("list", help="List keys (hashes only; never the plaintext)")
     _config_args(k_list)

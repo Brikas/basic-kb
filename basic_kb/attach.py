@@ -1,8 +1,8 @@
 """Deciding whether a command runs against a served instance or against the local store.
 
-One rule, one path: a URL is either configured (`attach_cli.url`) or given (`--attach URL`),
-or there is none and the work happens locally. There is no discovery, no state file, and
-nothing to go stale.
+One rule, one path: a URL is given (`--attach URL`), set for the machine
+(`BASIC_KB_ATTACH_URL`) or configured (`attach_cli.url`), in that order — or there is none
+and the work happens locally. There is no discovery, no state file, and nothing to go stale.
 
 A URL is a promise that the work happens there, so anything that stops it raises rather
 than quietly falling back. A command that silently searched a stale local copy because the
@@ -26,6 +26,11 @@ from .keys import LocalKey
 logger = logging.getLogger("basic_kb")
 
 NO_ATTACH_ENV = "BASIC_KB_NO_ATTACH"
+
+# Where this machine reaches the served instance, overriding `attach_cli.url`. One config
+# committed for every machine then needs no per-machine copy: the box running the server
+# points this at its own loopback, everyone else falls through to the configured URL.
+ATTACH_URL_ENV = "BASIC_KB_ATTACH_URL"
 
 
 def _env_says_no_attach() -> bool:
@@ -88,10 +93,13 @@ def attach(
     if no_attach or _env_says_no_attach():
         return None
 
-    url = attach_url or config.attach_url
+    env_url = os.environ.get(ATTACH_URL_ENV, "").strip() or None
+    url = attach_url or env_url or config.attach_url
     if not url:
         return None
 
+    # Only the flag announces itself. The env var is what a machine is set to, so saying so
+    # on every command would be noise on the one box that needs it most.
     if on_note is not None and attach_url and config.attach_url and attach_url != config.attach_url:
         on_note(f"--attach {url} overrides the configured {config.attach_url}")
 

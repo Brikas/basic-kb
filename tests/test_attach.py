@@ -43,6 +43,25 @@ def test_explicit_url_attaches_and_overrides_the_configured_one(served, config):
     assert notes and "overrides the configured" in notes[0]
 
 
+def test_env_url_overrides_the_configured_one_and_yields_to_the_flag(served, config, monkeypatch):
+    notes: list[str] = []
+    cfg = replace(config, attach_url="http://127.0.0.1:9")
+
+    monkeypatch.setenv("BASIC_KB_ATTACH_URL", served.url)
+    assert attach(cfg, on_note=notes.append).url == served.url
+    assert not notes          # a machine's standing setting, announced on no command
+
+    # The flag stays the last word, and an empty var reads as unset.
+    assert attach(cfg, attach_url=served.url).url == served.url
+    monkeypatch.setenv("BASIC_KB_ATTACH_URL", "   ")
+    assert attach(replace(config, attach_url=served.url)).url == served.url
+
+
+def test_env_url_attaches_when_the_config_names_none(served, config, monkeypatch):
+    monkeypatch.setenv("BASIC_KB_ATTACH_URL", served.url)
+    assert attach(config).url == served.url
+
+
 def test_unreachable_server_raises_rather_than_running_locally(config):
     cfg = replace(config, attach_url="http://127.0.0.1:9")
     with pytest.raises(RemoteError, match="cannot reach"):

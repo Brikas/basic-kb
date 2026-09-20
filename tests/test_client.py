@@ -118,7 +118,7 @@ def test_auth_over_http(served_auth, config):
         RemoteKnowledgeBase(url).health()
     assert RemoteKnowledgeBase(url, api_key=served_auth.local_key).health()["auth"] is True
     store = ApiKeyStore(config.store_dir)
-    rec, plain = store.create("autotemple")
+    rec, plain = store.create("laptop")
     assert RemoteKnowledgeBase(url, api_key=plain).info().total_chunks == 8
     store.revoke(rec.id)
     with pytest.raises(RemoteError, match="unauthorized"):

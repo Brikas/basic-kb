@@ -1,5 +1,5 @@
 ---
-status: Accepted
+status: Accepted; discovery superseded by 0004
 date: 2026-09-11
 authors: [Airidas Brikas]
 assisting_agent: Claude (Fable 5.1), Claude Code session 6112e168-ce21-4e13-a74a-b33083d2b446
@@ -33,7 +33,7 @@ Alternatives considered:
 
 **`basic-kb serve`.** FastAPI over one `KnowledgeBase`, routes mirroring the library, errors carrying the exception class so the client rebuilds the same types. `--watch` runs the watcher inside it. Loopback by default; auth is ADR 0002.
 
-**`served.json` answers "where", the lock answers "whether".** The server writes URL, a per-start nonce echoed by `/health`, hostname, model and config path. A CLI with a free lock treats any file as stale and deletes it; with the lock held it probes `/health` and attaches only on a matching nonce, hostname, config and model. `--no-attach` skips it, `--attach URL` targets a remote server. Writes attach too, so the server stays the only writer.
+**`served.json` answers "where", the lock answers "whether".** *Superseded by [0004](0004-container-and-configured-attach.md).* The server writes URL, a per-start nonce echoed by `/health`, hostname, model and config path. A CLI with a free lock treats any file as stale and deletes it; with the lock held it probes `/health` and attaches only on a matching nonce, hostname, config and model. `--no-attach` skips it, `--attach URL` targets a remote server. Writes attach too, so the server stays the only writer.
 
 **One composition root.** `KnowledgeBase.from_config` builds an instance; `basic_kb.open` and `basic_kb.connect` return local and remote objects with the same methods. A parity test asserts every operation has a method on both, a route and a CLI command.
 
