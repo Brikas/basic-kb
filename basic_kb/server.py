@@ -154,7 +154,10 @@ def require_key(request: Request,
         return
     token = creds.credentials.strip() if creds and creds.scheme.lower() == "bearer" else ""
     if token:
-        if st.local_key and hmac.compare_digest(token, st.local_key):
+        # Compare as bytes: compare_digest rejects a str holding anything outside ASCII, so
+        # comparing the header directly turns a malformed token into a 500 and a traceback.
+        # `keys.verify` needs no such care — it hashes to hex before it compares.
+        if st.local_key and hmac.compare_digest(token.encode("utf-8"), st.local_key.encode("utf-8")):
             return
         if st.keys is not None and st.keys.verify(token) is not None:
             return

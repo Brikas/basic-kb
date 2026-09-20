@@ -162,9 +162,9 @@ def test_auth_off_is_open(client):
     assert client.get("/health").status_code == 200
 
 
-def test_auth_on_requires_a_valid_key_everywhere(indexed_kb, config):
+def test_auth_on_requires_a_valid_key_on_api_routes(indexed_kb, config):
     store = ApiKeyStore(config.store_dir)
-    rec, plain = store.create("autotemple")
+    rec, plain = store.create("laptop")
     client = make_client(indexed_kb, config, auth=True, local_key="bkb_localkey")
     assert client.get("/health").status_code == 401
     assert client.get("/health").headers["WWW-Authenticate"] == "Bearer"
@@ -176,6 +176,20 @@ def test_auth_on_requires_a_valid_key_everywhere(indexed_kb, config):
     assert client.get("/health", headers={"Authorization": "bearer bkb_localkey"}).status_code == 200
     store.revoke(rec.id)                            # picked up without a restart
     assert client.get("/health", headers={"Authorization": f"Bearer {plain}"}).status_code == 401
+
+
+def test_a_malformed_token_is_refused_rather_than_raising(indexed_kb, config):
+    """Anyone can put any bytes in a header. A token outside ASCII used to reach
+    compare_digest as a str, which raises — turning an unauthenticated request into a 500
+    and a traceback in the log.
+
+    The header goes in as bytes because the test client refuses to encode a non-ASCII str,
+    which is also why this case never showed up: it cannot be written the obvious way.
+    """
+    client = make_client(indexed_kb, config, auth=True, local_key="bkb_localkey")
+    for token in (b"\xff\xfe", "ключ".encode(), "🔑".encode(), b"bkb_\xc3"):
+        response = client.get("/health", headers={b"Authorization": b"Bearer " + token})
+        assert response.status_code == 401
 
 
 def test_search_response_shaping(client):
