@@ -144,10 +144,9 @@ class RemoteKnowledgeBase:
 
     def _search(self, separate: bool, sources, queries: list[str], n: Optional[int], content_type_filter,
                 rerank_candidates, cand_multiplier, cand_min, cand_max, strict_rerank,
-                max_chars: int = 0, detailed: bool = False, offset: int = 0) -> dict:
+                max_chars: int = 0, detailed: bool = False) -> dict:
         body = {"queries": list(queries), "sources": _ids(sources) or "all", "separate": separate,
-                "n": n, "offset": offset, "content_type": content_type_filter,
-                "rerank_candidates": rerank_candidates,
+                "n": n, "content_type": content_type_filter, "rerank_candidates": rerank_candidates,
                 "cand_multiplier": cand_multiplier, "cand_min": cand_min, "cand_max": cand_max,
                 "strict_rerank": strict_rerank, "max_chars": max_chars, "detailed": detailed}
         data = self._request("POST", "/search", json=body)
@@ -157,20 +156,17 @@ class RemoteKnowledgeBase:
     def search(self, sources, queries: list[str], n: Optional[int] = None, content_type_filter=None,
                rerank_candidates=None, cand_multiplier=None, cand_min=None, cand_max=None,
                strict_rerank: bool = False, timing: bool = False,
-               max_chars: int = 0, detailed: bool = False, offset: int = 0) -> list[SearchResult]:
+               max_chars: int = 0, detailed: bool = False) -> list[SearchResult]:
         data = self._search(False, sources, queries, n, content_type_filter, rerank_candidates,
-                            cand_multiplier, cand_min, cand_max, strict_rerank, max_chars, detailed,
-                            offset)
+                            cand_multiplier, cand_min, cand_max, strict_rerank, max_chars, detailed)
         return [from_dict(SearchResult, h) for h in data["hits"]]
 
     def search_grouped(self, sources, queries: list[str], n: Optional[int] = None, content_type_filter=None,
                        rerank_candidates=None, cand_multiplier=None, cand_min=None, cand_max=None,
                        strict_rerank: bool = False, timing: bool = False,
-                       max_chars: int = 0, detailed: bool = False,
-                       offset: int = 0) -> list[tuple[str, list[SearchResult]]]:
+                       max_chars: int = 0, detailed: bool = False) -> list[tuple[str, list[SearchResult]]]:
         data = self._search(True, sources, queries, n, content_type_filter, rerank_candidates,
-                            cand_multiplier, cand_min, cand_max, strict_rerank, max_chars, detailed,
-                            offset)
+                            cand_multiplier, cand_min, cand_max, strict_rerank, max_chars, detailed)
         return [(g["query"], [from_dict(SearchResult, h) for h in g["hits"]]) for g in data["groups"]]
 
     def index_many(self, sources, chunk_size=None, overlap=None, min_chunk=None, force: bool = False,

@@ -41,10 +41,6 @@ logger = logging.getLogger("basic_kb")
 SCHEMA_VERSION = 1
 DB_FILENAME = "kb.sqlite3"
 
-# sqlite-vec refuses a larger k than this, compiled in rather than configurable. Callers
-# that compute k from a request (paging especially) clamp against it.
-MAX_K = 4096
-
 from .errors import StoreError  # noqa: E402  (re-exported for callers that import it from here)
 
 

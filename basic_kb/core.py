@@ -27,7 +27,7 @@ from .models import (
 )
 from .rerankers import RerankerBase, build_reranker
 from .sources import DataSourceBase
-from .store import MAX_K, SqliteVecStore, VacuumPolicy
+from .store import SqliteVecStore, VacuumPolicy
 
 DEFAULT_N = 15
 
@@ -722,7 +722,6 @@ class KnowledgeBase:
         cand_max: int = 200,
         strict_rerank: bool = False,
         timing: bool = False,
-        offset: int = 0,
     ) -> list[SearchResult]:
         """Fused multi-query search: all queries pool into ONE ranked list of n hits.
 
@@ -730,15 +729,11 @@ class KnowledgeBase:
         per chunk) and optionally reranked. Best when the queries are re-framings of the
         same information need (they reinforce recall). For n hits *per* query instead,
         use search_grouped(). With timing=True, prints per-phase durations.
-
-        `offset` skips that many hits from the top of the ranked list, for paging through
-        results. Reranking still stops at the configured candidate ceiling, so a deep
-        enough offset returns a short page or none at all.
         """
         self._require_store()
         return self._run_query_group(
             sources, queries, n, content_type_filter, rerank_candidates,
-            cand_multiplier, cand_min, cand_max, strict_rerank, timing, offset=offset,
+            cand_multiplier, cand_min, cand_max, strict_rerank, timing,
         )
 
     def search_grouped(
@@ -753,22 +748,18 @@ class KnowledgeBase:
         cand_max: int = 200,
         strict_rerank: bool = False,
         timing: bool = False,
-        offset: int = 0,
     ) -> list[tuple[str, list[SearchResult]]]:
         """Batch search (msearch-style): each query independently returns its OWN top-n.
 
         Returns [(query, hits), ...] — no cross-query merging. Best when the queries ask
         for *different* things in one call and you want a full result set for each.
-
-        `offset` applies within each query's own list, so one page number pages them all.
         """
         self._require_store()
         out: list[tuple[str, list[SearchResult]]] = []
         for q in queries:
             hits = self._run_query_group(
                 sources, [q], n, content_type_filter, rerank_candidates,
-                cand_multiplier, cand_min, cand_max, strict_rerank, timing,
-                timing_label=q, offset=offset,
+                cand_multiplier, cand_min, cand_max, strict_rerank, timing, timing_label=q,
             )
             out.append((q, hits))
         return out
@@ -783,41 +774,24 @@ class KnowledgeBase:
         self, sources: list[DataSourceBase], queries: list[str], n: int,
         content_type_filter: Optional[str], rerank_candidates: Optional[int],
         cand_multiplier: int, cand_min: int, cand_max: int,
-        strict_rerank: bool, timing: bool, timing_label: str = "", offset: int = 0,
+        strict_rerank: bool, timing: bool, timing_label: str = "",
     ) -> list[SearchResult]:
         """Run one group of queries into a single ranked list (embed→retrieve→merge→rerank).
 
         The reranker scores against queries[0], so a group is one information need.
         """
-        if offset < 0:
-            raise ValueError(f"offset must be zero or greater, got {offset}")
         t0 = time.perf_counter()
         t_embed = t_retrieve = t_rerank = 0.0
         best: dict[str, SearchResult] = {}
         missing: list[str] = []      # sources with nothing indexed yet
         resolved = 0                 # sources that actually got queried
 
-        # Paging slices off the top of the ranked list, so every stage has to produce the
-        # offset as well as the page itself.
-        depth = offset + n
-
         if self.reranker and rerank_candidates is None:
-            # How many top hits to rerank: clamp(depth × multiplier, min, max).
+            # How many top hits to rerank: clamp(n × multiplier, min, max).
             # If min exceeds max (misconfig), min wins.
             hi = max(cand_max, cand_min)
-            rerank_candidates = min(max(depth * cand_multiplier, cand_min), hi)
-        fetch_n = (rerank_candidates or depth) if self.reranker else depth
-        fetch_n = min(fetch_n, MAX_K)                    # the store refuses a larger k
-
-        # Both ceilings are deliberate: reranking is the expensive, billable stage and
-        # retrieval has a hard limit, so neither widens however deep the paging goes.
-        # Paging past either returns a short page, which reads exactly like running out of
-        # results — say which one happened.
-        reached = min(rerank_candidates, MAX_K) if (self.reranker and rerank_candidates) else fetch_n
-        if offset and depth > reached:
-            logger.warning(
-                "search: offset=%d n=%d needs %d ranked hits, ranking stops at %d — this "
-                "page is cut short by that ceiling, not by the index", offset, n, depth, reached)
+            rerank_candidates = min(max(n * cand_multiplier, cand_min), hi)
+        fetch_n = (rerank_candidates or n) if self.reranker else n
 
         self.store.check_model(self.embedder.model_id)       # wrong model = confident nonsense; refuse
         # Embed each query once; the same vector serves every source.
@@ -863,17 +837,16 @@ class KnowledgeBase:
 
         _trr = time.perf_counter()
         if self.reranker and hits:
-            candidates = hits[: rerank_candidates or depth]
+            candidates = hits[: rerank_candidates or n]
             try:
-                hits = self.reranker.rerank(queries[0], candidates, top_n=depth)
+                hits = self.reranker.rerank(queries[0], candidates, top_n=n)
             except Exception as e:
                 if strict_rerank:
                     raise
                 logger.warning("reranking failed, falling back to cosine scores: %s", e)
-                hits = hits[:depth]
+                hits = hits[:n]
         else:
-            hits = hits[:depth]
-        hits = hits[offset:]
+            hits = hits[:n]
         t_rerank = time.perf_counter() - _trr
 
         if timing:
@@ -886,9 +859,9 @@ class KnowledgeBase:
             )
 
         logger.info(
-            "search: sources=%s queries=%r n=%d offset=%d candidates=%s hits=%d "
+            "search: sources=%s queries=%r n=%d candidates=%s hits=%d "
             "embed_ms=%d retrieve_ms=%d rerank_ms=%d reranker=%s",
-            [s.source_id for s in sources], queries, n, offset, rerank_candidates, len(hits),
+            [s.source_id for s in sources], queries, n, rerank_candidates, len(hits),
             t_embed * 1000, t_retrieve * 1000, t_rerank * 1000,
             type(self.reranker).__name__ if self.reranker else None,
         )
