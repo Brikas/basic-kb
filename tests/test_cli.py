@@ -194,6 +194,13 @@ def test_search_json_fused(run):
     assert "grinder" in hit["doc"]
 
 
+def test_search_offset_pages(run):
+    run("index", "--json")
+    whole = loads(run("search", "coffee burr grinder", "--json", "--n", "4")[0])["hits"]
+    page, _ = run("search", "coffee burr grinder", "--json", "--n", "2", "--offset", "2")
+    assert [h["doc"] for h in loads(page)["hits"]] == [h["doc"] for h in whole[2:4]]
+
+
 def test_search_json_separate(run):
     run("index", "--json")
     out, _ = run("search", "coffee grinder", "tax receipts", "--separate", "--json", "--n", "2")

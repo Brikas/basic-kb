@@ -68,6 +68,16 @@ def test_search_fused_and_separate_with_notices(client):
     assert all(len(g["hits"]) <= 2 for g in body["groups"])
 
 
+def test_search_offset_pages_over_http(client):
+    whole = client.post("/search", json={"queries": ["coffee burr grinder"], "n": 4}).json()["hits"]
+    page = client.post("/search", json={"queries": ["coffee burr grinder"], "n": 2, "offset": 2}).json()
+    assert [h["doc"] for h in page["hits"]] == [h["doc"] for h in whole[2:4]]
+    deep = client.post("/search", json={"queries": ["coffee"], "n": 2, "offset": 9999}).json()
+    assert deep["hits"] == []
+    bad = client.post("/search", json={"queries": ["coffee"], "offset": -1})
+    assert bad.status_code == 400 and bad.json()["error"] == "ValueError"
+
+
 def test_search_content_type_and_validation(client):
     r = client.post("/search", json={"queries": ["anything"], "content_type": "admin", "n": 10})
     assert r.json()["hits"] and all(h["metadata"]["content_type"] == "admin" for h in r.json()["hits"])

@@ -42,6 +42,12 @@ def test_search_matches_local(remote, indexed_kb, sources):
     assert remote.last_notices == []
 
 
+def test_search_offset_matches_local(remote, indexed_kb, sources):
+    local = indexed_kb.search(sources, ["coffee burr grinder"], n=2, offset=2)
+    over_http = remote.search(sources, ["coffee burr grinder"], n=2, offset=2)
+    assert [h.doc for h in over_http] == [h.doc for h in local]
+
+
 def test_search_grouped(remote, notes):
     groups = remote.search_grouped([notes], ["coffee grinder", "tax receipts"], n=2)
     assert [q for q, _ in groups] == ["coffee grinder", "tax receipts"]

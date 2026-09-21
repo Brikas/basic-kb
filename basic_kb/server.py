@@ -104,6 +104,7 @@ class SearchRequest(BaseModel):
     sources: Selector = "all"
     separate: bool = False
     n: Optional[int] = None
+    offset: int = 0                      # skip this many ranked hits; reranking still stops at cand_max
     max_chars: Optional[int] = None      # cap each hit's text; 0/None = full text
     detailed: bool = False               # keep indexing bookkeeping in the metadata
     content_type: Optional[str] = None
@@ -244,7 +245,7 @@ def create_app(state: ServerState) -> "FastAPI":
             content_type_filter=content_type, rerank_candidates=req.rerank_candidates,
             cand_multiplier=req.cand_multiplier or cfg.cand_multiplier,
             cand_min=req.cand_min or cfg.cand_min, cand_max=req.cand_max or cfg.cand_max,
-            strict_rerank=req.strict_rerank,
+            strict_rerank=req.strict_rerank, offset=req.offset,
         )
         shape = dict(detailed=req.detailed, max_chars=req.max_chars or 0)
         if req.separate:

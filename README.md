@@ -18,7 +18,7 @@ Run from the folder holding `basic-kb.yaml` ([example](basic-kb.example.yaml)); 
 
 ```bash
 basic-kb index                  # incremental; --force --switch-model --limit N --preview
-basic-kb search "a statement the note would contain"   # --n --separate --source --content-type
+basic-kb search "a statement the note would contain"   # --n --offset --separate --source --content-type
 basic-kb status                 # counts, staleness, index age
 basic-kb scan                   # what changed since the last index
 basic-kb info                   # what each source holds
@@ -30,7 +30,7 @@ basic-kb keys create --name NAME
 
 `--json` works on every command; progress, nudges and warnings go to stderr. `--source a,b`, `--source list`. Config override: `--config PATH` or `BASIC_KB_CONFIG`. `basic-kb` and `python -m basic_kb` are the same thing.
 
-Write queries as statements, not keywords. Several queries fuse into one ranked list; `--separate` gives each its own.
+Write queries as statements, not keywords. Several queries fuse into one ranked list; `--separate` gives each its own. `--offset N` pages further down that list, within the rerank candidate ceiling — reranking cost stays fixed however deep you go, and a page cut short by the ceiling says so on stderr.
 
 ## Module
 

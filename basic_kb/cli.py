@@ -366,6 +366,7 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         cand_max=config.cand_max,
         strict_rerank=getattr(args, "rerank", False),
         timing=timing,
+        offset=getattr(args, "offset", 0) or 0,
     )
 
     # Batch mode: each query gets its OWN top-n block (no cross-query merging).
@@ -676,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Attach: with an `attach_cli:` block in the config, every command above runs on that served\n"
             "        instance instead of opening the store; --no-attach runs locally, --attach URL\n"
             "        [--api-key K] points at a different one. `status` says which it used.\n\n"
-            "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
+            "Search flags:  --n N (results)  --offset N (paging)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
             "Reranking:     --reranker local|jina-compatible|deepinfra-compatible|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --switch-model  --limit N [--limit-per-source]  --preview [--file NAME]  --yes  --no-reindex-guard\n"
             "Throttle:      --throttle  --cores-fraction F  --priority low|normal  --pause-ms MS [--pause-every N]\n"
@@ -759,6 +760,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--n", type=int, default=None, metavar="N",
                           help=f"Number of results (default: {DEFAULT_N}, or `search.n` in the config). "
                                f"In --separate mode, per query.")
+    p_search.add_argument("--offset", type=int, default=0, metavar="N",
+                          help="Skip the first N results, for paging through a long list. "
+                               "Reranking still stops at its candidate ceiling, so a deep enough "
+                               "offset returns a short page. Example: --n 10 --offset 10 for page 2.")
     p_search.add_argument("--content-type", default=None, metavar="TYPE",
                           help="Filter by frontmatter content_type (markdown sources). "
                                "Default: `search.content_type` in the config, else none.")

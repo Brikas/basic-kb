@@ -50,7 +50,7 @@ Surfaces over the same operations (core.OPERATIONS):
 
 **Flow, index:** `resolve_sources` builds each configured source; every file is hashed and only files whose hash differs from the store's `files` table are processed; the source's chunker splits the body; chunk ids are `rel_path::sha1(text)[:16]` so `SqliteVecStore.sync_file` embeds only chunks whose text is new and keeps the rest; one commit per file. `index_many` runs several sources with a shared `--limit` budget, handles `--switch-model`, and clears freshness nudges.
 
-**Flow, search:** embed each query once; `SqliteVecStore.knn` per source (exact cosine, optional `content_type`), merge by chunk id keeping the highest score, optionally rerank the top candidates, return `SearchResult`s.
+**Flow, search:** embed each query once; `SqliteVecStore.knn` per source (exact cosine, optional `content_type`), merge by chunk id keeping the highest score, optionally rerank the top candidates, return `SearchResult`s. `offset` pages the ranked list: every stage works to `offset + n`, bounded by the rerank candidate ceiling and by `store.MAX_K`. A page cut short by either logs a warning saying so, since a short page otherwise looks like the end of the results.
 
 **Flow, serve/attach:** `KBServer` takes the writer lock, binds the socket, mints a `local.key` and serves; with `--watch` a `Watcher` runs inside it. A CLI command runs `attach.attach()`, which takes the first URL it finds: `--attach`, `BASIC_KB_ATTACH_URL`, then `attach_cli.url`. With none it runs locally; with one it resolves a key, checks identity and version over `/health` and forwards every call, raising rather than falling back. `serve`, `watch` and `keys` own the store and never attach. ADR 0003 covers the lock, 0004 the attach design.
 

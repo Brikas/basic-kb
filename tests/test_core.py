@@ -272,6 +272,40 @@ def test_multi_query_fuses_into_one_list(indexed_kb, notes, embedder):
     assert embedder.query_calls[-2:] == [["coffee grinder"], ["tax receipts"]]
 
 
+def test_offset_pages_through_one_ranked_list(indexed_kb, sources):
+    """Page two continues where page one stopped, on the same ranking."""
+    whole = indexed_kb.search(sources, ["coffee burr grinder"], n=6)
+    assert len(whole) >= 4                                   # enough to page
+
+    first = indexed_kb.search(sources, ["coffee burr grinder"], n=2)
+    second = indexed_kb.search(sources, ["coffee burr grinder"], n=2, offset=2)
+    assert [h.doc for h in first] == [h.doc for h in whole[:2]]
+    assert [h.doc for h in second] == [h.doc for h in whole[2:4]]
+    assert not ({h.doc for h in first} & {h.doc for h in second})
+
+
+def test_offset_past_the_end_is_empty_and_a_negative_one_is_refused(indexed_kb, sources):
+    assert indexed_kb.search(sources, ["coffee burr grinder"], n=5, offset=10_000) == []
+    with pytest.raises(ValueError, match="offset must be zero or greater"):
+        indexed_kb.search(sources, ["coffee"], offset=-1)
+
+
+def test_offset_pages_each_group_separately(indexed_kb, notes):
+    groups = indexed_kb.search_grouped([notes], ["coffee grinder", "tax receipts"], n=1, offset=1)
+    assert [q for q, _ in groups] == ["coffee grinder", "tax receipts"]
+    firsts = indexed_kb.search_grouped([notes], ["coffee grinder", "tax receipts"], n=1)
+    for (_, page_two), (_, page_one) in zip(groups, firsts):
+        assert [h.doc for h in page_two] != [h.doc for h in page_one]
+
+
+def test_reranking_stops_at_the_ceiling_however_deep_the_offset(indexed_kb, sources):
+    """The candidate pool is what costs money, so paging never widens it."""
+    indexed_kb.reranker = rr = FakeReranker()
+    indexed_kb.search(sources, ["coffee burr grinder"], n=2, offset=500,
+                      cand_multiplier=3, cand_min=1, cand_max=4)
+    assert rr.calls[-1][1] <= 4
+
+
 def test_search_grouped_returns_one_block_per_query(indexed_kb, notes):
     groups = indexed_kb.search_grouped([notes], ["coffee grinder", "tax receipts"], n=2)
     assert [q for q, _ in groups] == ["coffee grinder", "tax receipts"]
