@@ -120,6 +120,16 @@ def test_key_file_is_read_when_the_client_does_not_sit_next_to_the_store(served_
     assert attach(cfg).health()["auth"] is True
 
 
+def test_a_client_with_neither_key_is_told_about_the_env_var(config, tmp_path, monkeypatch):
+    """One config serves the serving machine and every client. A client has no local.key and
+    never will, so the missing env var is its answer, not a server that might be down."""
+    monkeypatch.delenv("BASIC_KB_API_KEY", raising=False)
+    cfg = replace(config, attach_url="https://kb.example.com",
+                  attach_key_env="BASIC_KB_API_KEY", attach_key_file=tmp_path / "absent.key")
+    with pytest.raises(BasicKBError, match="BASIC_KB_API_KEY is unset"):
+        attach(cfg)
+
+
 def test_missing_or_empty_key_file_stops_the_run(config, tmp_path, monkeypatch):
     monkeypatch.delenv("BASIC_KB_API_KEY", raising=False)
     cfg = replace(config, attach_url="http://127.0.0.1:9", attach_key_file=tmp_path / "absent.key")

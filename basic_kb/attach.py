@@ -58,9 +58,17 @@ def resolve_attach_key(config: Config, api_key: Optional[str] = None) -> Optiona
                 f"the environment or in the dotenv the config points at.")
     if config.attach_key_file:
         if not config.attach_key_file.exists():
-            # A server writes its local key on start and removes it on exit, so an absent
-            # one usually means the instance is down rather than misconfigured. Say that,
-            # or the next person goes hunting for a key problem that does not exist.
+            # A server writes its local key on start and removes it on exit, so an absent one
+            # usually means the instance is down. When the config also names an env var, the
+            # same config is serving client machines that were never meant to have that file,
+            # and for them the missing env var is the answer. Name both, or whichever machine
+            # is not the one you happen to be thinking about gets sent hunting.
+            if config.attach_key_env:
+                raise BasicKBError(
+                    f"No key to present: {config.attach_key_env} is unset and "
+                    f"{config.attach_key_file} does not exist. A machine that only queries the "
+                    f"served instance needs {config.attach_key_env} set. On the machine serving "
+                    f"it, that file is written at start, so its absence means the server is down.")
             raise BasicKBError(
                 f"attach_cli.key_file {config.attach_key_file} does not exist. If that is a "
                 f"server's local key, the served instance is probably not running — start it, "
