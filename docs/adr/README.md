@@ -8,3 +8,5 @@ Small, numbered, append-only records of load-bearing choices — Context, Decisi
 | [0002](0002-native-bearer-api-keys.md) | Native bearer API keys for the served API, off by default, flat, wrapper-friendly | Accepted | 2026-09-11 |
 | [0003](0003-serve-attach-writer-lock.md) | Serve the engine over HTTP, attach the CLI to it, and gate writers with an OS lock | Accepted; discovery superseded by 0004 | 2026-09-11 |
 | [0004](0004-container-and-configured-attach.md) | Serve from a container, and replace discovery with a configured attach | Accepted | 2026-09-19 |
+| [0005](0005-external-source-types-by-import-path.md) | Load source types from an import path named in config | Accepted | 2026-10-14 |
+| [0006](0006-transform-stage-before-embedding.md) | A transform stage between chunking and embedding | Accepted | 2026-10-14 |
