@@ -32,9 +32,10 @@ import logging
 import sqlite3
 import struct
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 logger = logging.getLogger("basic_kb")
 
@@ -94,18 +95,31 @@ class SqliteVecStore:
     def exists(self) -> bool:
         return self.path.exists()
 
-    def _connect(self, create: bool = False) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self, create: bool = False) -> Iterator[sqlite3.Connection]:
+        """One connection for one `with` block: committed on success, rolled back on
+        error, and closed on exit.
+
+        sqlite3.Connection's own context manager commits but leaves the connection open
+        until garbage collection. An open connection keeps the -wal and -shm files alive,
+        so a long-lived process (a server) whose store file is replaced by a fresh build
+        reads the new file through the old WAL and fails with `disk I/O error`.
+        """
         if not create and not self.path.exists():
             raise FileNotFoundError(self.path)
         if create:
             self.store_dir.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(self.path, timeout=30)
-        _load_extension(con)
-        con.execute("PRAGMA journal_mode=WAL")    # readers never block the one writer
-        con.execute("PRAGMA synchronous=NORMAL")
-        if create:
-            self._ensure_schema(con)
-        return con
+        try:
+            _load_extension(con)
+            con.execute("PRAGMA journal_mode=WAL")    # readers never block the one writer
+            con.execute("PRAGMA synchronous=NORMAL")
+            if create:
+                self._ensure_schema(con)
+            with con:
+                yield con
+        finally:
+            con.close()
 
     def _ensure_schema(self, con: sqlite3.Connection) -> None:
         con.executescript(

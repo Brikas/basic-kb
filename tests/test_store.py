@@ -220,3 +220,24 @@ def test_chunk_ids_by_file_and_subset(store):
     by_file = store.chunk_ids_by_file("a")
     assert set(by_file) == {"f.md", "g.md"} and len(by_file["f.md"]) == 2
     assert set(store.chunk_ids_by_file("a", ["g.md"])) == {"g.md"}
+
+
+# --- connections ----------------------------------------------------------------------------------------------
+
+def _db_files(store: SqliteVecStore) -> list[str]:
+    return sorted(p.name for p in store.store_dir.iterdir() if p.name.startswith(store.path.name))
+
+
+def test_calls_close_their_connection(store):
+    put(store, "a", "f.md", ["alpha beta"])
+    store.knn("a", embed(["alpha"])[0], k=1)
+    assert _db_files(store) == ["kb.sqlite3"]     # an open connection would keep -wal and -shm
+
+
+def test_store_file_replaced_under_a_live_store_is_read(store, tmp_path):
+    put(store, "a", "f.md", ["alpha beta"])
+    store.knn("a", embed(["alpha"])[0], k=1)
+    fresh = SqliteVecStore(tmp_path / "fresh", vacuum=VacuumPolicy(enabled=False))
+    put(fresh, "a", "g.md", ["epsilon zeta"])
+    fresh.path.replace(store.path)
+    assert [r.chunk_id.split("::")[0] for r in store.knn("a", embed(["epsilon"])[0], k=5)] == ["g.md"]
