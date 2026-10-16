@@ -70,11 +70,12 @@ class FastEmbedEmbedder(EmbedderBase):
     DEFAULT_BATCH_SIZE = 8
 
     def __init__(self, alias: str = DEFAULT_MODEL, threads: Optional[int] = None,
-                 batch_size: int = DEFAULT_BATCH_SIZE) -> None:
+                 batch_size: int = DEFAULT_BATCH_SIZE, custom_model: Optional[dict] = None) -> None:
         self._alias = alias
         self._model_id = self.SUPPORTED.get(alias, alias)
         self._threads = threads   # cap ONNX threads (CPU cores) used; None = all
         self._batch_size = max(1, int(batch_size))
+        self._custom = _validate_custom_model(custom_model) if custom_model else None
         self._model: Any = None
 
     def _load(self):
@@ -87,6 +88,8 @@ class FastEmbedEmbedder(EmbedderBase):
                     f"extra: pip install 'basic-kb[local]'. An instance that embeds through an API "
                     f"needs no local model - give it an `embedding:` block instead."
                 ) from e
+            if self._custom:
+                _register_custom_model(TextEmbedding, self._model_id, self._custom)
             self._model = TextEmbedding(self._model_id, show_progress=False, threads=self._threads)
 
     @property
@@ -224,9 +227,52 @@ QWEN3_QUERY_PREFIX = ("Instruct: Given a web search query, retrieve relevant pas
                       "Query:")
 
 
+_POOLINGS = {"cls": "CLS", "mean": "MEAN", "last_token": "LAST_TOKEN"}
+_CUSTOM_KEYS = {"pooling", "normalize", "dim", "model_file", "additional_files", "hf_repo"}
+
+
+def _validate_custom_model(spec: dict) -> dict:
+    """Check an `embedding.custom_model` block up front, so a typo fails at startup
+    rather than at the first embed."""
+    unknown = set(spec) - _CUSTOM_KEYS
+    if unknown:
+        raise ValueError(f"embedding.custom_model: unknown key(s) {sorted(unknown)}; "
+                         f"allowed: {sorted(_CUSTOM_KEYS)}")
+    pooling = str(spec.get("pooling", "")).lower()
+    if pooling not in _POOLINGS:
+        raise ValueError(f"embedding.custom_model.pooling must be one of {sorted(_POOLINGS)}, got {pooling!r}")
+    if not isinstance(spec.get("dim"), int):
+        raise ValueError("embedding.custom_model.dim must be the model's output dimension, an integer")
+    return {**spec, "pooling": pooling}
+
+
+def _register_custom_model(text_embedding_cls: Any, model_id: str, spec: dict) -> None:
+    """Register an ONNX model FastEmbed does not list, under its own id.
+
+    Registration is process-global in FastEmbed and refuses a second call for the
+    same id, so an id that is already known (listed, or registered by an earlier
+    embedder in this process) is left alone.
+    """
+    from fastembed.common.model_description import ModelSource, PoolingType
+
+    known = {m["model"].lower() for m in text_embedding_cls.list_supported_models()}
+    if model_id.lower() in known:
+        return
+    text_embedding_cls.add_custom_model(
+        model=model_id,
+        pooling=PoolingType[_POOLINGS[spec["pooling"]]],
+        normalization=bool(spec.get("normalize", True)),
+        sources=ModelSource(hf=spec.get("hf_repo") or model_id),
+        dim=spec["dim"],
+        model_file=spec.get("model_file", "onnx/model.onnx"),
+        additional_files=list(spec.get("additional_files") or []),
+    )
+
+
 def _build_local(config, threads: Optional[int] = None) -> EmbedderBase:
     """FastEmbed/ONNX on this machine. The thread cap applies here only."""
-    return FastEmbedEmbedder(alias=config.embedding_model, threads=threads, batch_size=config.embed_batch_size)
+    return FastEmbedEmbedder(alias=config.embedding_model, threads=threads, batch_size=config.embed_batch_size,
+                             custom_model=config.embedding.get("custom_model"))
 
 
 def _build_openai_compatible(config, threads: Optional[int] = None) -> EmbedderBase:

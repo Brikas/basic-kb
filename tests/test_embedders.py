@@ -61,6 +61,43 @@ def test_build_embedder_unknown_provider_lists_options(config):
         build_embedder(replace(config, embedding={"provider": "magic"}))
 
 
+# --- custom ONNX models on the local backend ---------------------------------------------------
+
+GRANITE = "ibm-granite/granite-embedding-311m-multilingual-r2"
+GRANITE_SPEC = {"pooling": "cls", "normalize": True, "dim": 768, "model_file": "onnx/model.onnx"}
+
+
+@pytest.mark.parametrize("spec,match", [
+    ({**GRANITE_SPEC, "pooling": "max"}, "pooling"),
+    ({**GRANITE_SPEC, "dimension": 768}, "unknown key"),
+    ({k: v for k, v in GRANITE_SPEC.items() if k != "dim"}, "dim"),
+])
+def test_custom_model_block_fails_at_build_time(config, spec, match):
+    cfg = replace(config, embedding_model=GRANITE, embedding={"provider": "local", "custom_model": spec})
+    with pytest.raises(ValueError, match=match):
+        build_embedder(cfg)
+
+
+def test_custom_model_keeps_its_own_id(config):
+    cfg = replace(config, embedding_model=GRANITE, embedding={"custom_model": GRANITE_SPEC})
+    e = build_embedder(cfg)
+    assert e.model_id == GRANITE and e._model is None
+
+
+@pytest.mark.model
+def test_custom_model_loads_and_ranks_across_languages():
+    """Two embedders in one process: the second must not trip FastEmbed's
+    one-registration-per-id rule."""
+    for _ in range(2):
+        e = FastEmbedEmbedder(GRANITE, threads=2, custom_model=GRANITE_SPEC)
+        docs = e.embed(["Kunden sagde, at prisen var for høj til deres budget.",
+                        "The webinar registration page supports custom fields."])
+        q = e.query_embed(["the customer thought it was too expensive"])[0]
+        assert len(q) == 768
+        scores = [sum(a * b for a, b in zip(q, d)) for d in docs]
+        assert scores[0] > scores[1]
+
+
 def test_registered_provider_is_selectable_from_config(config, monkeypatch):
     monkeypatch.setitem(EMBEDDER_PROVIDERS, "fake", lambda cfg, threads=None: FakeEmbedder(model_id=cfg.embedding_model))
     e = build_embedder(replace(config, embedding={"provider": "FAKE"}))

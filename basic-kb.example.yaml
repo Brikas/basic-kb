@@ -13,6 +13,16 @@ embedding_model: bge-small-en-v1.5   # local alias/HF id, or the provider's mode
 #   concurrency: 64                   # requests in flight at once (throughput scales ~linearly; stay under the provider cap)
 #   query_prefix: ""                  # instruction-aware models; Qwen3-Embedding gets its official one by default
 #   passage_prefix: ""
+#   custom_model:                     # provider local only: an ONNX model FastEmbed does not list, from its HF repo
+#     pooling: cls                    # cls | mean | last_token — read it from the repo's 1_Pooling/config.json
+#     normalize: true
+#     dim: 768
+#     model_file: onnx/model.onnx
+#     additional_files: []            # e.g. [onnx/model.onnx_data] for models split into external data
+#     hf_repo: ""                     # default: embedding_model
+#   Example — multilingual, Apache-2.0, no prefixes:
+#     embedding_model: ibm-granite/granite-embedding-311m-multilingual-r2
+#     embedding: {custom_model: {pooling: cls, normalize: true, dim: 768, model_file: onnx/model.onnx}}
 
 # Switching provider or model changes the vector space: run `basic-kb index --switch-model` (wipes + rebuilds all).
 # embed_batch_size: 8    # texts per embedding pass. Peak RAM grows with batch x seq_len^2 and is never
