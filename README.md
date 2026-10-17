@@ -55,7 +55,7 @@ basic-kb serve --watch --auth
 
 `GET /health /info /status /scan`, `POST /search /index /vacuum /preview`.
 
-A CLI run attaches when it has a URL — `--attach URL`, `BASIC_KB_ATTACH_URL`, or `attach_cli:` in the config — and reaches the server instead of loading models again. The env var is there so one committed config serves every machine: the box running the server points it at its own loopback, everyone else falls through to the configured host. `--no-attach` works on the store directly. One writer per store, enforced by an OS lock: [ADR 0003](docs/adr/0003-serve-attach-writer-lock.md), [ADR 0004](docs/adr/0004-container-and-configured-attach.md).
+A CLI run attaches when it has a URL — `--attach URL`, `BASIC_KB_ATTACH_URL`, or `attach_cli:` in the config — and reaches the server instead of loading models again. The env var is there so one committed config serves every machine: the box running the server points it at its own loopback, everyone else falls through to the configured host. A machine serving two instances gives each config its own variable with `attach_cli.url_env`, and a server whose instance name differs from the config's is refused. `--no-attach` works on the store directly. One writer per store, enforced by an OS lock: [ADR 0003](docs/adr/0003-serve-attach-writer-lock.md), [ADR 0004](docs/adr/0004-container-and-configured-attach.md).
 
 Auth is off by default ([ADR 0002](docs/adr/0002-native-bearer-api-keys.md)). With `--auth` every route needs `Authorization: Bearer <key>`:
 

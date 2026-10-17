@@ -1,8 +1,14 @@
 """Deciding whether a command runs against a served instance or against the local store.
 
-One rule, one path: a URL is given (`--attach URL`), set for the machine
-(`BASIC_KB_ATTACH_URL`) or configured (`attach_cli.url`), in that order — or there is none
-and the work happens locally. There is no discovery, no state file, and nothing to go stale.
+One rule, one path: a URL is given (`--attach URL`), set for the machine (the variable
+`attach_cli.url_env` names, else `BASIC_KB_ATTACH_URL`) or configured (`attach_cli.url`),
+in that order — or there is none and the work happens locally. There is no discovery, no
+state file, and nothing to go stale.
+
+`BASIC_KB_ATTACH_URL` is one variable per machine, so it can only describe one instance. A
+machine with two served instances gives each config its own `url_env`, and a config that
+names one ignores the shared variable. Whatever the URL, the server's instance name must
+match the config's, so a URL meant for another instance fails at connect time.
 
 A URL is a promise that the work happens there, so anything that stops it raises rather
 than quietly falling back. A command that silently searched a stale local copy because the
@@ -101,7 +107,8 @@ def attach(
     if no_attach or _env_says_no_attach():
         return None
 
-    env_url = os.environ.get(ATTACH_URL_ENV, "").strip() or None
+    env_name = config.attach_url_env or ATTACH_URL_ENV
+    env_url = os.environ.get(env_name, "").strip() or None
     url = attach_url or env_url or config.attach_url
     if not url:
         return None
@@ -112,6 +119,12 @@ def attach(
         on_note(f"--attach {url} overrides the configured {config.attach_url}")
 
     remote = RemoteKnowledgeBase(url, api_key=resolve_attach_key(config, api_key))
-    remote.health(timeout=10.0)     # identity and version check; raises on anything wrong
+    info = remote.health(timeout=10.0)     # identity and version check; raises on anything wrong
+    served = info.get("name")
+    if served and config.name_declared and served != config.name:
+        source = ("--attach" if attach_url else f"${env_name}" if env_url else "attach_cli.url")
+        raise BasicKBError(
+            f"{url} serves {served!r}, but this config is {config.name!r}. The URL came from {source}. "
+            f"A machine serving several instances gives each config its own attach_cli.url_env.")
     logger.info("attach: using the served instance at %s", url)
     return remote

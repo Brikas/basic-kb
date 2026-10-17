@@ -166,6 +166,8 @@ class Config:
     # the config a thin client: the server resolves sources, chunking and freshness, so
     # nothing below it is read. The key is only ever named here, never written.
     attach_url: Optional[str] = None
+    attach_url_env: Optional[str] = None     # this instance's own URL override variable, instead of BASIC_KB_ATTACH_URL
+    name_declared: bool = True               # False when `name:` is absent and `name` is only the file stem
     attach_key_env: Optional[str] = None
     attach_key_file: Optional[Path] = None   # a file holding the key, e.g. the server's local.key
     # Watch/auto-reindex is configured PER SOURCE (a `watch:` block on each source),
@@ -251,11 +253,12 @@ def load_config(config_path: Path) -> Config:
             f"Config {config_path} uses `attach:`, which is now `attach_cli:` — `serve:` and "
             f"`attach:` side by side read as the same thing. Rename the block.")
     att = data.get("attach_cli")
-    attach_key_file = None
+    attach_key_file = attach_url_env = None
     if isinstance(att, str):
         attach_url, attach_key_env = att.strip(), None
     elif isinstance(att, dict):
         attach_url = str(att["url"]).strip() if att.get("url") else None
+        attach_url_env = str(att["url_env"]).strip() if att.get("url_env") else None
         attach_key_env = str(att["key_env"]).strip() if att.get("key_env") else None
         attach_key_file = _resolve(base_dir, att["key_file"]) if att.get("key_file") else None
         if att.get("key"):
@@ -325,6 +328,8 @@ def load_config(config_path: Path) -> Config:
         serve_watch=bool(srv.get("watch", False)),
         serve_docs=bool(srv.get("docs", True)),
         attach_url=attach_url,
+        attach_url_env=attach_url_env,
+        name_declared="name" in data,
         attach_key_env=attach_key_env,
         attach_key_file=attach_key_file,
     )

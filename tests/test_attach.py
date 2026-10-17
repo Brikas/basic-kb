@@ -62,6 +62,23 @@ def test_env_url_attaches_when_the_config_names_none(served, config, monkeypatch
     assert attach(config).url == served.url
 
 
+def test_url_env_names_this_instances_own_variable(served, config, monkeypatch):
+    # Two instances on one machine: the shared variable points at the other one.
+    monkeypatch.setenv("BASIC_KB_ATTACH_URL", "http://127.0.0.1:9")
+    cfg = replace(config, attach_url="http://127.0.0.1:9", attach_url_env="TEST_KB_ATTACH_URL")
+    monkeypatch.setenv("TEST_KB_ATTACH_URL", served.url)
+    assert attach(cfg).url == served.url
+    monkeypatch.delenv("TEST_KB_ATTACH_URL")
+    assert attach(replace(cfg, attach_url=served.url)).url == served.url   # shared variable ignored
+
+
+def test_a_server_of_another_instance_is_refused(served, config, monkeypatch):
+    monkeypatch.setenv("BASIC_KB_ATTACH_URL", served.url)
+    with pytest.raises(BasicKBError, match=r"serves 'test-instance', but this config is 'other'.*BASIC_KB_ATTACH_URL"):
+        attach(replace(config, name="other"))
+    assert attach(replace(config, name="basic-kb", name_declared=False)).url == served.url
+
+
 def test_unreachable_server_raises_rather_than_running_locally(config):
     cfg = replace(config, attach_url="http://127.0.0.1:9")
     with pytest.raises(RemoteError, match="cannot reach"):
