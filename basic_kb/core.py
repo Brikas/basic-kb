@@ -418,7 +418,17 @@ class KnowledgeBase:
         prev_manifest: dict = {} if force else stored_manifest
         entries = [(f, self._rel_path(source, f), _file_hash(f)) for f in files]
         seen: dict[str, str] = {rp: h for _, rp, h in entries}
-        to_process = [(f, rp, h) for f, rp, h in entries if prev_manifest.get(rp) != h]
+        # A changed pipeline (chunker, sizes, transforms, source options or version) rewrites
+        # every chunk while no file hash moves, so every file counts as changed. The guard
+        # below then asks before the whole source re-embeds. A store that never recorded a
+        # fingerprint just records one.
+        fingerprint = source.pipeline_fingerprint(chunk_size, overlap, min_chunk)
+        recorded = self.store.pipeline(source.source_id)
+        pipeline_changed = bool(prev_manifest) and recorded is not None and recorded != fingerprint
+        if pipeline_changed:
+            self._emit(on_progress, f"Pipeline changed for {source.source_id!r} (chunker, sizes, transforms, "
+                                    f"options or version): every file re-chunks.")
+        to_process = [(f, rp, h) for f, rp, h in entries if pipeline_changed or prev_manifest.get(rp) != h]
         deleted_files = [rp for rp in prev_manifest if rp not in seen] if limit is None else []
         work_total = len(to_process)
         result.unchanged = len(entries) - work_total
@@ -468,7 +478,7 @@ class KnowledgeBase:
                 processed += 1
                 try:
                     doc = source.parse_file(f)
-                    chunks = chunker.chunk(doc) if doc is not None else []
+                    chunks = source.chunk_document(chunker, doc) if doc is not None else []
                 except Exception as e:
                     # One unreadable file must not abandon a run that has already
                     # embedded hundreds. Record it and carry on; the manifest simply
@@ -516,6 +526,10 @@ class KnowledgeBase:
 
         result.total_chunks = self.store.count(source.source_id)
         self.store.set_indexed_at(source.source_id)
+        # Only a full, clean run brings every chunk up to this pipeline. A --limit run saw a
+        # subset, and a failed file kept its old manifest entry and old chunks.
+        if limit is None and not result.errors and self.store.exists():
+            self.store.set_pipeline(source.source_id, fingerprint)
         self._emit(on_progress, (
             f"\nDone [{source.source_id}].\n"
             f"  files:  new={result.added} updated={result.updated} "
@@ -619,7 +633,8 @@ class KnowledgeBase:
             if doc is None:
                 out.append(PreviewFile(rel_path=rel, body_chars=0))
                 continue
-            chunks = [PreviewChunk(text=c.text, breadcrumb=c.metadata.get("breadcrumb")) for c in chunker.chunk(doc)]
+            chunks = [PreviewChunk(text=c.text, breadcrumb=c.metadata.get("breadcrumb"))
+                      for c in source.chunk_document(chunker, doc)]
             out.append(PreviewFile(rel_path=rel, body_chars=len(doc.body), chunks=chunks))
         return out
 
@@ -681,7 +696,7 @@ class KnowledgeBase:
                 logger.debug("reindex_paths: unchanged %s/%s", source.source_id, rp)
                 continue
             doc = source.parse_file(p)
-            prepared.append((rp, chunker.chunk(doc) if doc is not None else [], file_hash))
+            prepared.append((rp, source.chunk_document(chunker, doc) if doc is not None else [], file_hash))
 
         vectors = self._embed_wave(source, [(rp, ch) for rp, ch, _ in prepared])
         for rp, chunks, file_hash in prepared:
@@ -764,6 +779,33 @@ class KnowledgeBase:
             out.append((q, hits))
         return out
 
+    @staticmethod
+    def _hit_key(source_id: str, row) -> str:
+        """Identity of a search hit. A source that declares a `dedup_key` in a chunk's metadata
+        says "these chunks are the same content": a conversation turn replayed into a second
+        file by a resume or fork carries the same key in both, and surfaces once."""
+        dedup = row.metadata.get("dedup_key")
+        return f"{source_id}::dedup::{dedup}" if dedup else f"{source_id}::{row.chunk_id}"
+
+    # How far _knn_distinct widens k to make up for collapsed duplicates: at most this
+    # multiple of the requested count.
+    _DEDUP_MAX_WIDEN = 8
+
+    def _knn_distinct(self, source_id: str, q_emb, k: int, content_type_filter):
+        """knn that returns k *distinct* hits when the source declares dedup keys.
+
+        Duplicates collapse after retrieval, so k raw rows can be fewer than k hits. Widen
+        k (doubling) until enough distinct hits come back or the source runs out. A source
+        without dedup keys takes exactly one query, as before.
+        """
+        want, fetch = k, k
+        while True:
+            rows = self.store.knn(source_id, q_emb, fetch, content_type_filter)
+            distinct = len({self._hit_key(source_id, r) for r in rows})
+            if distinct >= want or len(rows) < fetch or fetch >= want * self._DEDUP_MAX_WIDEN:
+                return rows
+            fetch *= 2
+
     def _require_store(self) -> None:
         if not self.store.exists():
             raise IndexNotFound(
@@ -811,7 +853,7 @@ class KnowledgeBase:
             for q_emb in q_embs:
                 try:
                     _tr = time.perf_counter()
-                    rows = self.store.knn(source.source_id, q_emb, fetch_n, content_type_filter)
+                    rows = self._knn_distinct(source.source_id, q_emb, fetch_n, content_type_filter)
                     t_retrieve += time.perf_counter() - _tr
                 except Exception as e:
                     # Swallowing this returned an empty list indistinguishable from
@@ -821,7 +863,7 @@ class KnowledgeBase:
                     ) from e
 
                 for row in rows:
-                    full_id = f"{source.source_id}::{row.chunk_id}"
+                    full_id = self._hit_key(source.source_id, row)
                     score = 1.0 - row.distance
                     if full_id not in best or score > best[full_id].score:
                         best[full_id] = SearchResult(doc=row.doc, metadata=row.metadata, score=score)

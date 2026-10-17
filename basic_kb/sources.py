@@ -4,12 +4,18 @@ Built-in source types (selected via `type:` in an instance config):
   transcript — speaker-tagged .md transcripts (tl;dv style)
   markdown   — .md files with optional YAML frontmatter (web copy, notes, docs)
 
+A `type:` containing a colon is an import path to a DataSourceBase subclass living outside
+this repo, `package.module:ClassName` (ADR 0005). Any key of its config entry that the
+engine does not consume itself is passed to its constructor as a keyword argument.
+
 Each source is a partition of the store, keyed by its `id`.
-Add a new type by subclassing DataSourceBase and registering it in SOURCE_TYPES.
+Add a built-in type by subclassing DataSourceBase and registering it in SOURCE_TYPES.
 """
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import json
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -17,7 +23,9 @@ from typing import TYPE_CHECKING, Optional, Union
 
 from .chunkers import ChunkerBase, build_chunker
 from .errors import UnknownSource
-from .models import ParsedDocument
+from .models import Chunk, ParsedDocument
+from .plugins import is_import_path, load_import_path
+from .transforms import TransformBase, apply_transforms, build_transforms
 
 if TYPE_CHECKING:
     from .config import Config
@@ -111,6 +119,14 @@ class DataSourceBase(ABC):
     """
 
     type_name: str = ""  # value matched against `type:` in config; set by subclass
+    # The `transforms:` of this source's config entry, run over every chunk before it is
+    # embedded (ADR 0006). Set by build_source, so a subclass constructor never sees them.
+    transforms: tuple[TransformBase, ...] = ()
+    # The config keys that shape chunk output (type, chunker, transforms, source options).
+    # Set by build_source; part of pipeline_fingerprint.
+    pipeline_config: dict = {}
+    # Bump in a subclass whenever a code change alters what parse_file or the chunker produce.
+    pipeline_version: str = "1"
 
     def __init__(
         self,
@@ -182,6 +198,29 @@ class DataSourceBase(ABC):
     def make_chunker(self, chunk_size: int, overlap: int, min_chunk: int) -> ChunkerBase:
         """Build this source's chunker from its configured name."""
         return build_chunker(self._chunker, chunk_size, overlap, min_chunk)
+
+    def pipeline_fingerprint(self, chunk_size: int, overlap: int, min_chunk: int) -> str:
+        """A hash of everything that decides chunk output besides file content.
+
+        File hashes only notice edited files. A changed chunker, size, transform or source
+        option rewrites every chunk while no file changes, so the index compares this too.
+        """
+        parts = {
+            "class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "version": self.pipeline_version,
+            "config": self.pipeline_config,
+            "sizes": [chunk_size, overlap, min_chunk],
+            "transforms": [[t.name, t.version] for t in self.transforms],
+        }
+        return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+    def chunk_document(self, chunker: ChunkerBase, doc: ParsedDocument) -> list[Chunk]:
+        """What gets embedded for `doc`: the chunker's output after this source's transforms.
+
+        Every path that embeds or previews goes through here, so no chunk reaches the
+        embedder untransformed.
+        """
+        return apply_transforms(self.transforms, chunker.chunk(doc))
 
 
 class TranscriptSource(DataSourceBase):
@@ -280,6 +319,26 @@ SOURCE_TYPES: dict[str, type[DataSourceBase]] = {
     cls.type_name: cls for cls in (TranscriptSource, MarkdownSource)
 }
 
+# Keys of a source entry the engine consumes itself. An external source type receives every
+# other key as a constructor keyword argument; `watch` belongs to the watcher.
+_ENGINE_SOURCE_KEYS = frozenset({
+    "id", "type", "path", "label", "description", "exclude", "chunker", "watch", "transforms"})
+
+
+def resolve_source_type(type_name: str, base_dir: Path) -> type[DataSourceBase]:
+    """The class a `type:` value names: a SOURCE_TYPES key, or an import path (ADR 0005)."""
+    if not is_import_path(type_name):
+        cls = SOURCE_TYPES.get(type_name)
+        if cls is None:
+            raise ValueError(
+                f"Unknown source type {type_name!r}. Options: {', '.join(sorted(SOURCE_TYPES))}, "
+                f"or an import path 'package.module:ClassName'.")
+        return cls
+    obj = load_import_path(type_name, base_dir, what="Source type")
+    if not (isinstance(obj, type) and issubclass(obj, DataSourceBase)):
+        raise ValueError(f"Source type {type_name!r} is not a subclass of basic_kb DataSourceBase.")
+    return obj
+
 
 def build_source(cfg: dict, base_dir: Path, content_type_filter: Optional[str] = None) -> DataSourceBase:
     """Build a DataSource from one entry in a config's `sources:` list.
@@ -287,15 +346,13 @@ def build_source(cfg: dict, base_dir: Path, content_type_filter: Optional[str] =
     `path` is resolved relative to base_dir (the config file's directory).
     Example cfg entry:
         {id: notes, type: markdown, path: data/notes, chunker: recursive,
-         label: "My notes", description: "..."}
+         label: "My notes", description: "...", transforms: [redact-secrets]}
     """
-    type_name = cfg.get("type", "markdown")
-    cls = SOURCE_TYPES.get(type_name)
-    if cls is None:
-        raise ValueError(
-            f"Unknown source type {type_name!r} for source {cfg.get('id')!r}. "
-            f"Options: {', '.join(sorted(SOURCE_TYPES))}"
-        )
+    type_name = str(cfg.get("type", "markdown"))
+    try:
+        cls = resolve_source_type(type_name, base_dir)
+    except ValueError as e:
+        raise ValueError(f"Source {cfg.get('id')!r}: {e}") from e
     raw_path = Path(cfg["path"]).expanduser()
     directory = raw_path if raw_path.is_absolute() else base_dir / raw_path
     kwargs: dict = dict(
@@ -309,7 +366,16 @@ def build_source(cfg: dict, base_dir: Path, content_type_filter: Optional[str] =
         kwargs["chunker"] = cfg["chunker"]
     if cls is MarkdownSource and content_type_filter:
         kwargs["content_type_filter"] = content_type_filter
-    return cls(**kwargs)
+    if is_import_path(type_name):
+        kwargs.update({k: v for k, v in cfg.items() if k not in _ENGINE_SOURCE_KEYS})
+    try:
+        source = cls(**kwargs)
+    except TypeError as e:
+        raise ValueError(f"Source {cfg.get('id')!r} ({type_name}): {e}") from e
+    source.transforms = tuple(build_transforms(cfg.get("transforms") or [], base_dir))
+    source.pipeline_config = {k: v for k, v in cfg.items()
+                              if k not in ("id", "path", "label", "description", "exclude", "watch")}
+    return source
 
 
 def resolve_sources(config: "Config", selector: Union[str, list[str], None] = "all",

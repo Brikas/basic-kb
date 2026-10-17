@@ -112,7 +112,7 @@ throttle:
 # (--source notes,docs), or all (default). See --source list.
 sources:
   - id: notes
-    type: markdown          # markdown | transcript
+    type: markdown          # markdown | transcript | an import path, e.g. mysource:MySource (ADR 0005)
     path: data/notes        # folder of .md files (searched recursively)
     chunker: recursive      # recursive (no headings) | breadcrumb (heading-aware)
     label: My Notes
@@ -123,7 +123,9 @@ sources:
       - "*.log"           #   trailing slash = a folder and everything under it
       - "archive/old*"      #   contains a slash = anchored at the source root
       # - "!keep.md"        #   leading '!' re-includes a path an earlier line excluded
-    watch:                  # auto-reindex THIS source on edits (via `basic-kb watch`)
+    # transforms:           # run over every chunk before embedding, in order (ADR 0006)
+    #   - redact-secrets    #   mask credentials as [REDACTED:kind]; changing this re-embeds the source
+    watch:                # auto-reindex THIS source on edits (via `basic-kb watch`)
       enabled: true         # false to exclude this source from watching
       debounce_seconds: 30  # reindex a file this long after it goes quiet (0 = immediately)
 

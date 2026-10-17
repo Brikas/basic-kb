@@ -246,6 +246,18 @@ class SqliteVecStore:
             logger.warning("store: unparseable indexed_at for source=%s: %r", source, raw)
             return None
 
+    def pipeline(self, source: str) -> Optional[str]:
+        """The pipeline fingerprint this source's chunks were made with, or None if never recorded."""
+        if not self.exists():
+            return None
+        with self._connect() as con:
+            return self._meta_get(con, f"pipeline:{source}")
+
+    def set_pipeline(self, source: str, fingerprint: str) -> None:
+        with self._connect() as con:
+            self._meta_set(con, f"pipeline:{source}", fingerprint)
+            con.commit()
+
     def sources(self) -> list[str]:
         """Source ids that have anything indexed (manifest entries)."""
         if not self.exists():

@@ -35,7 +35,9 @@ Config (config.py)  ──►  KnowledgeBase.from_config  ──►  KnowledgeBa
                                                          ├── SqliteVecStore      one SQLite file: vec0 + chunks + manifest (store.py)
                                                          └── WriterLock          one writer per store, OS-enforced (lock.py)
 
-DataSourceBase  SOURCE_TYPES registry (sources.py)  ──►  ChunkerBase  _CHUNKER_FACTORIES (chunkers.py, textsplit.py)
+DataSourceBase  SOURCE_TYPES registry or import path (sources.py, plugins.py)
+  ──►  ChunkerBase  _CHUNKER_FACTORIES or the source's own make_chunker (chunkers.py, textsplit.py)
+  ──►  TransformBase  TRANSFORM_TYPES registry or import path, per source (transforms.py)
 
 Surfaces over the same operations (core.OPERATIONS):
   cli.py + render.py      argparse, attach decision, human/JSON rendering
@@ -48,11 +50,11 @@ Surfaces over the same operations (core.OPERATIONS):
   serialize.py            to_jsonable / from_dict for every result dataclass (models.py)
 ```
 
-**Flow, index:** `resolve_sources` builds each configured source; every file is hashed and only files whose hash differs from the store's `files` table are processed; the source's chunker splits the body; chunk ids are `rel_path::sha1(text)[:16]` so `SqliteVecStore.sync_file` embeds only chunks whose text is new and keeps the rest; one commit per file. `index_many` runs several sources with a shared `--limit` budget, handles `--switch-model`, and clears freshness nudges.
+**Flow, index:** `resolve_sources` builds each configured source; every file is hashed and only files whose hash differs from the store's `files` table are processed; `source.chunk_document` runs the source's chunker and then its transforms (ADR 0006), and every embedding path goes through it; chunk ids are `rel_path::sha1(text)[:16]` so `SqliteVecStore.sync_file` embeds only chunks whose text is new and keeps the rest; one commit per file. `index_many` runs several sources with a shared `--limit` budget, handles `--switch-model`, and clears freshness nudges.
 
-**Flow, search:** embed each query once; `SqliteVecStore.knn` per source (exact cosine, optional `content_type`), merge by chunk id keeping the highest score, optionally rerank the top candidates, return `SearchResult`s.
+**Flow, search:** embed each query once; `SqliteVecStore.knn` per source (exact cosine, optional `content_type`), merge by chunk id keeping the highest score, optionally rerank the top candidates, return `SearchResult`s. A chunk whose metadata carries a `dedup_key` merges with every other chunk of the same source holding that key, so content a source knows to be duplicated (a conversation turn replayed into a second file) surfaces once; `_knn_distinct` widens k until enough distinct hits come back.
 
-**Flow, serve/attach:** `KBServer` takes the writer lock, binds the socket, mints a `local.key` and serves; with `--watch` a `Watcher` runs inside it. A CLI command runs `attach.attach()`, which takes the first URL it finds: `--attach`, `BASIC_KB_ATTACH_URL`, then `attach_cli.url`. With none it runs locally; with one it resolves a key, checks identity and version over `/health` and forwards every call, raising rather than falling back. `serve`, `watch` and `keys` own the store and never attach. ADR 0003 covers the lock, 0004 the attach design.
+**Flow, serve/attach:** `KBServer` takes the writer lock, binds the socket, mints a `local.key` and serves; with `--watch` a `Watcher` runs inside it. A CLI command runs `attach.attach()`, which takes the first URL it finds: `--attach`, the variable `attach_cli.url_env` names (else `BASIC_KB_ATTACH_URL`), then `attach_cli.url`. With none it runs locally; with one it resolves a key, checks version over `/health`, refuses a server whose instance name differs from a declared `name:`, and forwards every call, raising rather than falling back. `serve`, `watch` and `keys` own the store and never attach. ADR 0003 covers the lock, 0004 the attach design.
 
 ---
 
@@ -67,14 +69,16 @@ Surfaces over the same operations (core.OPERATIONS):
 | `basic_kb/rerankers.py` | RerankerBase, FastEmbedReranker, RerankAPIBase + protocol subclasses, `RERANKER_TYPES`, `build_reranker` |
 | `basic_kb/textsplit.py` | Recursive character splitter (`split_text`) |
 | `basic_kb/chunkers.py` | ChunkerBase, RecursiveChunker, BreadcrumbHeadingChunker, `build_chunker` |
-| `basic_kb/sources.py` | DataSourceBase, MarkdownSource, TranscriptSource, `build_source`, `resolve_sources`, `path_excluded` |
+| `basic_kb/sources.py` | DataSourceBase, MarkdownSource, TranscriptSource, `build_source`, `resolve_source_type`, `resolve_sources`, `path_excluded` |
+| `basic_kb/plugins.py` | `load_import_path`: `package.module:Name` with the config's folder on `sys.path` (ADR 0005) |
+| `basic_kb/transforms.py` | TransformBase, RedactSecrets, `apply_transforms`, `build_transforms`, `TRANSFORM_TYPES` (ADR 0006) |
 | `basic_kb/store.py` | SqliteVecStore: vec0 + chunks + files tables, KNN, auto-VACUUM policy, model guard |
 | `basic_kb/lock.py` | WriterLock over `filelock`; `StoreBusy` |
 | `basic_kb/core.py` | KnowledgeBase: `from_config`, index / index_many / reindex_paths / search / search_grouped / status / scan / info / vacuum / preview; `OPERATIONS` |
 | `basic_kb/freshness.py` | FreshnessSettings, FreshnessTracker (state file `freshness_state.json`) |
 | `basic_kb/watcher.py` | Watcher, WatchEvent, WatchSettings, `resolve_settings` |
 | `basic_kb/keys.py` | ApiKeyStore (`api-keys.json`), LocalKey (`local.key`) |
-| `basic_kb/attach.py` | `attach()`, `resolve_attach_key()`, `BASIC_KB_ATTACH_URL` / `BASIC_KB_NO_ATTACH` |
+| `basic_kb/attach.py` | `attach()`, `resolve_attach_key()`, `BASIC_KB_ATTACH_URL` or the config's `url_env` / `BASIC_KB_NO_ATTACH` |
 | `basic_kb/client.py` | RemoteKnowledgeBase, RemoteError, `resolve_api_key` |
 | `basic_kb/server.py` | FastAPI app (`create_app`), KBServer, request models, error mapping, `require_key` |
 | `basic_kb/config.py` | Instance config, local override merge, dotenv resolution, `find_config` |
@@ -82,7 +86,7 @@ Surfaces over the same operations (core.OPERATIONS):
 | `basic_kb/cli.py` | argparse, commands, attach wiring |
 | `basic_kb/__init__.py` | Public API, `basic_kb.open`, `basic_kb.connect` |
 | `<store_dir>/` | `kb.sqlite3`, `writer.lock`, `local.key`, `api-keys.json`, `freshness_state.json` |
-| `docs/adr/` | 0001 sqlite-vec + exact search; 0002 API keys; 0003 serve, attach, writer lock; 0004 container + configured attach |
+| `docs/adr/` | 0001 sqlite-vec + exact search; 0002 API keys; 0003 serve, attach, writer lock; 0004 container + configured attach; 0005 external source types by import path; 0006 transform stage before embedding |
 
 ---
 
@@ -101,6 +105,7 @@ Surfaces over the same operations (core.OPERATIONS):
 ## sqlite-vec store details
 
 - Two-level incrementality: file hash (`files` table) decides whether a file is looked at; chunk hash (`chunks.chunk_id`) decides what gets embedded. The positional index of a chunk lives in metadata (`position`), so reordering never forces a re-embed.
+- A third check covers changes no file hash sees: `DataSourceBase.pipeline_fingerprint` hashes the source's config, chunk sizes, `pipeline_version` and each transform's `version`, stored as `meta.pipeline:<source>` after a full clean run. A mismatch makes every file count as changed, so the mass-change guard asks first. Bump `pipeline_version` / `TransformBase.version` with any code change that alters output.
 - One `vec0` table for all sources: `source` is a partition key, `content_type` a filterable metadata column, `embedding FLOAT[d] distance_metric=cosine`; `rowid` equals `chunks.id`. Metadata columns reject NULL, so a missing content_type is stored as `''`.
 - The vector table is created on first write with a fixed dimension. `model_id`/`dim` live in `meta`; `check_model()` refuses index and search with a different model. A model switch goes through `prepare_model_switch(sources, accept)`: refuse unless `accept` (CLI `--switch-model`, API `switch_model: true`), then `clear_all()`. `--force` alone never switches models.
 - Every store method opens its own WAL connection and closes it; reads are thread-safe, writes are serialised by the KnowledgeBase.
@@ -112,6 +117,8 @@ Surfaces over the same operations (core.OPERATIONS):
 - **Embedding provider:** a factory `(config, threads=None) -> EmbedderBase` in `EMBEDDER_PROVIDERS`.
 - **Reranker:** subclass `RerankerBase` (or `RerankAPIBase` for bearer-auth HTTP) and register in `RERANKER_TYPES`.
 - **Source type / chunker:** subclass and register in `SOURCE_TYPES` / `_CHUNKER_FACTORIES`.
+- **Source type outside this repo:** subclass `DataSourceBase` in a module next to the instance config and name it as `type: module:ClassName`. Every key of the source entry outside `_ENGINE_SOURCE_KEYS` reaches the constructor as a keyword argument; the source returns its own chunker from `make_chunker`. Tests: `tests/test_plugins.py`.
+- **Transform:** subclass `TransformBase` and register in `TRANSFORM_TYPES`, or name an outside class by import path in a source's `transforms:`. Remember that changing a transform's output changes chunk ids, so every touched chunk re-embeds.
 - **Operation:** a `KnowledgeBase` method, the same method on `RemoteKnowledgeBase`, a route in `server.py`, a CLI command or flag, and its name in `core.OPERATIONS`; then tests for each surface.
 
 ---

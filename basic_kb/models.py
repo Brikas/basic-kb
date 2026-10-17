@@ -7,7 +7,7 @@ from typing import Optional
 
 # Metadata an agent cannot act on: indexing bookkeeping, and `file`, which `rel_path`
 # already contains together with the folder it sits in. Stripped unless `detailed`.
-BOOKKEEPING_METADATA = frozenset({"content_hash", "position", "chunk_index", "file"})
+BOOKKEEPING_METADATA = frozenset({"content_hash", "position", "chunk_index", "file", "dedup_key"})
 
 
 @dataclass

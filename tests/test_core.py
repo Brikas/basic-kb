@@ -203,6 +203,38 @@ def test_guard_accepts_assume_yes_and_skips_when_disabled_or_forced(kb, tmp_path
     assert not kb.index(src, force=True, **CH).aborted
 
 
+def test_pipeline_change_re_chunks_every_file_behind_the_guard(kb, tmp_path):
+    from basic_kb.sources import build_source
+    write_tree(tmp_path / "many", {f"n{i}.md": f"# Note {i}\n\nThe staging DB_PASSWORD=Tr0ub4dor{i}x is here.\n"
+                                   for i in range(6)})
+    plain = build_source({"id": "many", "type": "markdown", "path": "many", "chunker": "recursive"}, tmp_path)
+    assert kb.index(plain, **CH).added == 6
+    assert kb.index(plain, **CH).unchanged == 6                     # same pipeline: nothing to do
+
+    redacting = build_source({"id": "many", "type": "markdown", "path": "many", "chunker": "recursive",
+                              "transforms": ["redact-secrets"]}, tmp_path)
+    r = kb.index(redacting, **CH)                                   # no file changed, the pipeline did
+    assert r.aborted and "6 changed" in r.abort_reason
+    r = kb.index(redacting, assume_yes=True, **CH)
+    assert r.updated == 6 and r.chunks_embedded == 6
+    hits = kb.search([redacting], ["staging password"], n=10)
+    assert hits and all("Tr0ub4dor" not in h.doc for h in hits)
+    assert kb.index(redacting, **CH).unchanged == 6                 # recorded: quiet again
+
+    import basic_kb.transforms as t
+    monkey = type("RedactV2", (t.RedactSecrets,), {"version": "2"})
+    redacting.transforms = (monkey(),)
+    assert kb.index(redacting, **CH).aborted                        # a transform code bump counts too
+
+
+def test_a_limited_run_does_not_record_the_pipeline(kb, tmp_path):
+    src = many_source(tmp_path / "many")
+    kb.index(src, limit=2, **CH)
+    assert kb.store.pipeline("many") is None
+    kb.index(src, **CH)
+    assert kb.store.pipeline("many") == src.pipeline_fingerprint(**CH)
+
+
 def test_guard_has_a_five_file_floor(kb, tmp_path):
     src = many_source(tmp_path / "many", n=4)
     kb.index(src, **CH)

@@ -18,19 +18,9 @@ specifics; the engine stays generic).
 
 See temple1\notes\research\qmd-codebase-analysis.md
 
-## Chunk filter / transform hook
+## LogSeq property stripping
 
-A pluggable, per-source step that runs over each chunk (or its source text) before
-embedding, able to **drop** a chunk or **rewrite** its text/attributes. Today a source
-goes parse → chunk → embed with no place to clean things in between.
-
-Motivating cases (LogSeq):
-- Strip UI-only properties that carry no meaning — e.g. `collapsed:: true`. Pure editor
-  state; it only pollutes embeddings.
-- More generally: per-source line/attribute filters (strip patterns or a predicate).
-
-Open design points: filter at parse time vs. a distinct post-chunk stage;
-config-declared list of strip patterns (simple) vs. a code hook (richer logic).
+A transform on the per-source transform stage ([ADR 0006](docs/adr/0006-transform-stage-before-embedding.md)) that strips UI-only properties carrying no meaning — e.g. `collapsed:: true`. Pure editor state; it only pollutes embeddings. Config-declared strip patterns cover it.
 
 ## Reference / link expansion
 
@@ -52,5 +42,4 @@ opt-in for plain refs only.
 ## LogSeq-aware chunker
 
 A breadcrumb-style chunker that uses the bullet **hierarchy** (nesting) as context, the
-way the `breadcrumb` chunker uses headings. Lands as a new source/chunker type once the
-hook above exists.
+way the `breadcrumb` chunker uses headings. Lands as a new source/chunker type.
