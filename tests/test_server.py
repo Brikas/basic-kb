@@ -59,7 +59,8 @@ def test_search_fused_and_separate_with_notices(client):
     assert r.status_code == 200
     body = r.json()
     assert body["mode"] == "fused" and 1 <= len(body["hits"]) <= 3 and "grinder" in body["hits"][0]["doc"]
-    assert body["hits"][0]["sort_key"] == body["hits"][0]["score"]
+    assert body["hits"][0]["sort_key"] == body["hits"][0]["fused_score"]   # no reranker: fusion orders
+    assert "vector" in body["hits"][0]["matched_by"]
     assert body["notices"] == []                    # freshness is disabled in the fixture config
     r = client.post("/search", json={"queries": ["coffee grinder", "tax receipts"], "separate": True, "n": 2,
                                      "sources": ["notes"]})

@@ -57,7 +57,8 @@ def ago(ts: Optional[float]) -> str:
 def print_results(hits: list[SearchResult], max_chars: int) -> None:
     """Human rendering of hits.
 
-    Header: rank, title, `[source · content_type]`, scores. Second line: where the chunk
+    Header: rank, title, `[source · content_type]`, cosine score, rerank score, and the rank
+    each retriever gave the hit, e.g. `(keyword #1, vector #4)`. Second line: where the chunk
     came from — the url for web content, else the path inside the source — omitted when
     it would only repeat the title (LogSeq pages: title == filename stem).
     """
@@ -69,6 +70,8 @@ def print_results(hits: list[SearchResult], max_chars: int) -> None:
         score_str = f"score={round(r.score, 3)}"
         if r.rerank_score is not None:
             score_str += f"  rerank={round(r.rerank_score, 4)}"
+        if r.matched_by:
+            score_str += "  (" + ", ".join(f"{kind} #{rank}" for kind, rank in sorted(r.matched_by.items())) + ")"
 
         title = meta.get("title", "?")
         tags = [meta.get("source", "?")]

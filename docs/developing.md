@@ -32,7 +32,9 @@ Config (config.py)  ──►  KnowledgeBase.from_config  ──►  KnowledgeBa
                                                          ├── RerankerBase        RERANKER_TYPES registry (rerankers.py)
                                                          │   ├── FastEmbedReranker            local cross-encoder
                                                          │   └── RerankAPIBase → Jina-/DeepInfra-compatible protocols
-                                                         ├── SqliteVecStore      one SQLite file: vec0 + chunks + manifest (store.py)
+                                                         ├── SqliteVecStore      one SQLite file: vec0 + chunks + FTS5 + manifest (store.py)
+                                                         │   ├── lexical.py      free-text query -> safe FTS5 MATCH
+                                                         │   └── fusion.py       reciprocal rank fusion of ranked lists
                                                          └── WriterLock          one writer per store, OS-enforced (lock.py)
 
 DataSourceBase  SOURCE_TYPES registry or import path (sources.py, plugins.py)
@@ -52,7 +54,7 @@ Surfaces over the same operations (core.OPERATIONS):
 
 **Flow, index:** `resolve_sources` builds each configured source; every file is hashed and only files whose hash differs from the store's `files` table are processed; `source.chunk_document` runs the source's chunker and then its transforms (ADR 0006), and every embedding path goes through it; chunk ids are `rel_path::sha1(text)[:16]` so `SqliteVecStore.sync_file` embeds only chunks whose text is new and keeps the rest; one commit per file. `index_many` runs several sources with a shared `--limit` budget, handles `--switch-model`, and clears freshness nudges.
 
-**Flow, search:** embed each query once; `SqliteVecStore.knn` per source (exact cosine, optional `content_type`), merge by chunk id keeping the highest score, optionally rerank the top candidates, return `SearchResult`s. A chunk whose metadata carries a `dedup_key` merges with every other chunk of the same source holding that key, so content a source knows to be duplicated (a conversation turn replayed into a second file) surfaces once; `_knn_distinct` widens k until enough distinct hits come back.
+**Flow, search:** embed each query once; for every query build one vector list (`SqliteVecStore.knn` per source, merged by cosine) and one keyword list (`keyword_search` over all requested sources at once, BM25 from the `chunks_fts` index), each `clamp(n × multiplier, min, max)` deep; fuse every list with reciprocal rank fusion (`fusion.rrf`, `rrf_k`, default 20); give keyword-only hits a cosine from their stored vector (`cosine_distances`); rerank the fused top candidates against `queries[0]`; return `SearchResult`s with `score` (cosine), `fused_score` and `matched_by`. `retrieval` picks `hybrid` (default), `vector` or `keyword`. Lists are per retriever, not per source: cosine is comparable across sources (one model) and BM25 is too (one index). A chunk whose metadata carries a `dedup_key` merges with every other chunk of the same source holding that key, so content a source knows to be duplicated (a conversation turn replayed into a second file) surfaces once; `_knn_distinct` and `_keyword_distinct` widen k until enough distinct hits come back.
 
 **Flow, serve/attach:** `KBServer` takes the writer lock, binds the socket, mints a `local.key` and serves; with `--watch` a `Watcher` runs inside it. A CLI command runs `attach.attach()`, which takes the first URL it finds: `--attach`, the variable `attach_cli.url_env` names (else `BASIC_KB_ATTACH_URL`), then `attach_cli.url`. With none it runs locally; with one it resolves a key, checks version over `/health`, refuses a server whose instance name differs from a declared `name:`, and forwards every call, raising rather than falling back. `serve`, `watch` and `keys` own the store and never attach. ADR 0003 covers the lock, 0004 the attach design.
 
@@ -72,7 +74,9 @@ Surfaces over the same operations (core.OPERATIONS):
 | `basic_kb/sources.py` | DataSourceBase, MarkdownSource, TranscriptSource, `build_source`, `resolve_source_type`, `resolve_sources`, `path_excluded` |
 | `basic_kb/plugins.py` | `load_import_path`: `package.module:Name` with the config's folder on `sys.path` (ADR 0005) |
 | `basic_kb/transforms.py` | TransformBase, RedactSecrets, `apply_transforms`, `build_transforms`, `TRANSFORM_TYPES` (ADR 0006) |
-| `basic_kb/store.py` | SqliteVecStore: vec0 + chunks + files tables, KNN, auto-VACUUM policy, model guard |
+| `basic_kb/store.py` | SqliteVecStore: vec0 + chunks + files tables, `chunks_fts` keyword index, KNN, keyword search, auto-VACUUM policy, model guard |
+| `basic_kb/lexical.py` | `build_match` (free text → FTS5 MATCH, never a syntax error), `source_filter`, the tokenizer name |
+| `basic_kb/fusion.py` | `rrf`, `RETRIEVAL_MODES`, defaults for `retrieval` and `rrf_k` |
 | `basic_kb/lock.py` | WriterLock over `filelock`; `StoreBusy` |
 | `basic_kb/core.py` | KnowledgeBase: `from_config`, index / index_many / reindex_paths / search / search_grouped / status / scan / info / vacuum / preview; `OPERATIONS` |
 | `basic_kb/freshness.py` | FreshnessSettings, FreshnessTracker (state file `freshness_state.json`) |
@@ -109,7 +113,9 @@ Surfaces over the same operations (core.OPERATIONS):
 - One `vec0` table for all sources: `source` is a partition key, `content_type` a filterable metadata column, `embedding FLOAT[d] distance_metric=cosine`; `rowid` equals `chunks.id`. Metadata columns reject NULL, so a missing content_type is stored as `''`.
 - The vector table is created on first write with a fixed dimension. `model_id`/`dim` live in `meta`; `check_model()` refuses index and search with a different model. A model switch goes through `prepare_model_switch(sources, accept)`: refuse unless `accept` (CLI `--switch-model`, API `switch_model: true`), then `clear_all()`. `--force` alone never switches models.
 - Every store method opens its own WAL connection and closes it; reads are thread-safe, writes are serialised by the KnowledgeBase.
-- Auto-vacuum counts deleted rows in `meta.deleted_since_vacuum`; a `database is locked` during VACUUM is logged and retried on the next write.
+- Auto-vacuum counts deleted rows in `meta.deleted_since_vacuum`; a `database is locked` during VACUUM is logged and retried on the next write. VACUUM is preceded by FTS5 `optimize`, since VACUUM alone leaves the keyword index's segments as they are.
+- `chunks_fts` is an FTS5 external-content table over `chunks(source, doc)`, `rowid == chunks.id`, tokenizer `unicode61 remove_diacritics 2`. Triggers on `chunks` keep it in step, so it shares every write transaction with the vectors. Schema 2 added it: `_ensure_fts` builds it on a version-1 store's next write with `rebuild` (from stored text, nothing re-embedded); the server does this at start and a local search does it under both locks.
+- `keyword_search` matches first in a materialized CTE, then joins `chunks` and filters by exact source and content_type. An inner LIMIT there would let out-of-scope matches fill the window and return a false empty. The `source :` column filter only narrows the match set: it is token-based, so `remote-box` also admits `remote-box-old`, which the exact check removes.
 - Extension loading needs `sqlite3.Connection.enable_load_extension`; a Python build without it gets a `StoreError` naming the fix.
 
 ## Adding things
@@ -148,6 +154,14 @@ Linux mtime granularity is coarse enough for two writes to share a timestamp. `A
 ### `urllib` gets 403 from Cloudflare on the Jina API
 
 Bare `urllib.request` sends a minimal User-Agent that Cloudflare blocks. Use `requests` (a declared dependency).
+
+### INSERT OR REPLACE on `chunks` corrupts the keyword index
+
+The replace's implicit delete skips the FTS5 delete trigger, so the old text stays indexed and `integrity-check` reports a malformed image. The store writes `chunks` with plain INSERT, UPDATE and DELETE only; `INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')` repairs an index that went wrong.
+
+### `unicode61` folds accents but not every Nordic letter
+
+`remove_diacritics 2` folds é to e and å to a, but ø and æ are letters of their own: `modet` does not find `mødet`. Vector search still bridges that gap in hybrid mode.
 
 ### FastEmbed ONNX runs CPU-only by default
 

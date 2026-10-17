@@ -6,13 +6,15 @@ way. Driven mostly by the LogSeq personal-KB use case, but each item should land
 specifics; the engine stays generic).
 
 ## List
-- Fusion
-  - get inspired by qmd ->  Reciprocal Rank Fusion, k=60, top-rank bonus (+0.05/+0.02), position-aware blend (75/60/40% RRF-vs-rerank by rank band) 
+- Evaluation
+  - Build a nice eval method and library: labelled queries per instance, metrics per retrieval mode, reranker and model, so changes are measured instead of judged by feel.
 - Query Expansion
   - inspired by qmd: fine-tuned local 1.7B model emits lex:/vec:/hyde: sub-queries.
     - Custom fine-tuned tobil/qmd-query-expansion-1.7B (from Qwen3-1.7B), own training pipeline in finetune/
-- Keyword index and Hybrid search
-  - BM25 (like qmd)
+- Fusion tuning, once the eval exists
+  - qmd's top-rank bonus (+0.05/+0.02) and rank-band blend of fusion vs reranker score (75/60/40%); both unablated upstream.
+- Trigram keyword index, opt-in
+  - Finds camelCase and word fragments; measured at ~6.5× the unicode61 index and ~7× slower.
 - Deamon
   - Models stay resident, auto-unload after 5min idle (like qmd)
 

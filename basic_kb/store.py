@@ -14,6 +14,11 @@ Layout (one database per instance, `<store_dir>/kb.sqlite3`):
                                                (the old manifest.json); powers scan/stale
     chunks (id, source, rel_path, chunk_id, doc, meta_json, content_type, date)
     vec    vec0(source partition key, content_type, embedding)  rowid == chunks.id
+    chunks_fts  fts5(source, doc), external content over `chunks`, rowid == chunks.id;
+                kept in step by triggers on `chunks` (keyword side of hybrid search)
+
+Never write `chunks` with INSERT OR REPLACE: the implicit delete skips the FTS trigger and
+leaves the keyword index corrupt. Plain INSERT, UPDATE and DELETE keep it consistent.
 
 Every public method opens its own connection and closes it, so the store is safe to
 call from any thread; writers still have to be serialised by the caller (SQLite has
@@ -37,10 +42,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
+from .lexical import FTS_TOKENIZER, source_filter
+
 logger = logging.getLogger("basic_kb")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # 2: chunks_fts keyword index; a version-1 store builds it on first write
 DB_FILENAME = "kb.sqlite3"
+
+_FTS_SCHEMA = f"""
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+        source, doc, content='chunks', content_rowid='id', tokenize='{FTS_TOKENIZER}');
+    CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts(rowid, source, doc) VALUES (new.id, new.source, new.doc);
+    END;
+    CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, source, doc) VALUES ('delete', old.id, old.source, old.doc);
+    END;
+    CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE OF source, doc ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, source, doc) VALUES ('delete', old.id, old.source, old.doc);
+        INSERT INTO chunks_fts(rowid, source, doc) VALUES (new.id, new.source, new.doc);
+    END;
+"""
 
 from .errors import StoreError  # noqa: E402  (re-exported for callers that import it from here)
 
@@ -55,11 +77,14 @@ class VacuumPolicy:
 
 @dataclass
 class ChunkRow:
-    """One chunk as the store returns it from a KNN query."""
+    """One chunk as the store returns it from a vector or keyword query."""
     chunk_id: str        # "<rel_path>::<suffix>", unique within a source
     doc: str
     metadata: dict
-    distance: float      # cosine distance; score = 1 - distance
+    distance: Optional[float] = None   # cosine distance (score = 1 - distance); None from a keyword query
+    rowid: int = 0                     # chunks.id, shared by vec and chunks_fts
+    source: str = ""
+    bm25: Optional[float] = None       # FTS5 bm25(), lower is better; keyword queries only
 
 
 def _pack(vec: list[float]) -> bytes:
@@ -140,6 +165,53 @@ class SqliteVecStore:
         con.execute("INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
         con.execute("INSERT OR IGNORE INTO meta VALUES ('deleted_since_vacuum', '0')")
         con.commit()
+        self._ensure_fts(con)
+
+    def _ensure_fts(self, con: sqlite3.Connection) -> None:
+        """Create the keyword index and its triggers, filling it from existing chunks once.
+
+        A store written before schema 2 has chunks but no index; `rebuild` reads every
+        chunk's text back from `chunks`, so nothing is re-embedded. A Python whose SQLite
+        lacks FTS5 is refused with the fix rather than left without keyword search.
+        """
+        if self._has_table(con, "chunks_fts"):
+            return
+        t = time.perf_counter()
+        try:
+            con.executescript(_FTS_SCHEMA)
+        except sqlite3.OperationalError as e:
+            if "fts5" in str(e).lower():
+                raise StoreError(
+                    f"this Python's SQLite ({sqlite3.sqlite_version}) has no FTS5, which keyword and "
+                    f"hybrid search need. python.org, Homebrew, Debian and the official Docker "
+                    f"images all ship it; use one of those.") from e
+            raise
+        n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]
+        if n:
+            con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
+        self._meta_set(con, "schema_version", str(SCHEMA_VERSION))
+        con.commit()
+        logger.info("store: keyword index built over %d chunks in %.0f ms", n, (time.perf_counter() - t) * 1000)
+
+    @staticmethod
+    def _has_table(con: sqlite3.Connection, name: str) -> bool:
+        return con.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (name,)).fetchone() is not None
+
+    def keyword_index_ready(self) -> bool:
+        """True when the keyword index exists. A store from before schema 2 gets it on its
+        next write, or from `ensure_schema()`; until then keyword search would find nothing."""
+        if getattr(self, "_fts_ready", False):
+            return True                      # the table is never dropped once it exists
+        if not self.exists():
+            return False
+        with self._connect() as con:
+            self._fts_ready = self._has_table(con, "chunks_fts")
+        return self._fts_ready
+
+    def ensure_schema(self) -> None:
+        """Bring the store to the current schema now (a write: the caller holds the locks)."""
+        with self._connect(create=True):
+            pass
 
     @staticmethod
     def _meta_get(con: sqlite3.Connection, key: str) -> Optional[str]:
@@ -470,6 +542,11 @@ class SqliteVecStore:
         before = self.path.stat().st_size
         try:
             with self._connect() as con:
+                # VACUUM alone leaves FTS5's segments as they are; merging them first is what
+                # actually returns a deleted chunk's index space.
+                if self._has_table(con, "chunks_fts"):
+                    con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('optimize')")
+                    con.commit()
                 con.execute("VACUUM")
                 self._meta_set(con, "deleted_since_vacuum", "0")
                 con.commit()
@@ -499,5 +576,61 @@ class SqliteVecStore:
             if self._meta_get(con, "dim") is None:
                 return []
             rows = con.execute(sql, params).fetchall()
-        return [ChunkRow(chunk_id=cid, doc=doc, metadata=json.loads(mj), distance=float(dist))
-                for _, dist, cid, doc, mj in rows]
+        return [ChunkRow(chunk_id=cid, doc=doc, metadata=json.loads(mj), distance=float(dist),
+                         rowid=rid, source=source)
+                for rid, dist, cid, doc, mj in rows]
+
+    def keyword_search(self, sources: list[str], match: str, k: int,
+                       content_type: Optional[str] = None) -> list[ChunkRow]:
+        """Top-k chunks by BM25 for an FTS5 MATCH expression (see lexical.build_match), over
+        several sources at once: one index means one IDF, so BM25 is comparable across them.
+
+        The match runs first and is materialized, then rows are joined and filtered by the
+        exact source and content_type. An inner LIMIT would let stronger out-of-scope matches
+        fill the window and return a false empty (qmd #922). The source column filter keeps
+        that match set small; it can admit a source whose id contains another's tokens, which
+        the exact check below removes.
+        """
+        if not self.exists() or not sources:
+            return []
+        expr = f"doc : ({match})"
+        scope = source_filter(sources)
+        if scope:
+            expr = f"{scope} AND {expr}"
+        marks = ",".join("?" * len(sources))
+        sql = ("WITH m AS MATERIALIZED (SELECT rowid, bm25(chunks_fts, 0.0, 1.0) AS score "
+               "FROM chunks_fts WHERE chunks_fts MATCH ?) "
+               "SELECT c.id, m.score, c.source, c.chunk_id, c.doc, c.meta_json "
+               f"FROM m JOIN chunks c ON c.id = m.rowid WHERE c.source IN ({marks})")
+        params: list = [expr, *sources]
+        if content_type:
+            sql += " AND c.content_type = ?"
+            params.append(content_type)
+        sql += " ORDER BY m.score ASC, c.id ASC LIMIT ?"
+        params.append(int(k))
+        with self._connect() as con:
+            if not self._has_table(con, "chunks_fts"):
+                raise StoreError(
+                    f"store at {self.path} has no keyword index yet (schema 1). Any index run, or "
+                    f"opening it with a current basic-kb, builds it; or search with --retrieval vector.")
+            rows = con.execute(sql, params).fetchall()
+        return [ChunkRow(chunk_id=cid, doc=doc, metadata=json.loads(mj), rowid=rid, source=src,
+                         bm25=float(score))
+                for rid, score, src, cid, doc, mj in rows]
+
+    def cosine_distances(self, rowids: list[int], query: list[float]) -> dict[int, float]:
+        """Cosine distance from `query` to the stored vectors of these chunks, so a hit found
+        only by keyword still carries a similarity comparable with vector hits."""
+        if not rowids or not self.exists():
+            return {}
+        out: dict[int, float] = {}
+        with self._connect() as con:
+            if self._meta_get(con, "dim") is None:
+                return {}
+            for i in range(0, len(rowids), 500):
+                part = rowids[i:i + 500]
+                marks = ",".join("?" * len(part))
+                out.update(con.execute(
+                    f"SELECT rowid, vec_distance_cosine(embedding, ?) FROM vec WHERE rowid IN ({marks})",
+                    [_pack(query), *part]).fetchall())
+        return {int(r): float(d) for r, d in out.items()}

@@ -61,6 +61,8 @@ reranker:
 #   max_chars: 0          # truncate each result to N chars; 0 = full (--max-chars). DEF=0
 #   timing: false         # print per-phase timings to stderr. DEF=false
 #   content_type: help  # default frontmatter content_type filter for markdown sources (--content-type)
+#   retrieval: hybrid     # hybrid | vector | keyword (--retrieval). DEF=hybrid
+#   rrf_k: 20             # rank-fusion constant; a hit at rank r adds 1/(rrf_k + r) (--rrf-k). DEF=20
 
 log_file: logs/basic-kb.log   # write a timestamped event log (index/search/scan) here; path relative to this config
 log_level: INFO               # DEBUG | INFO | WARNING

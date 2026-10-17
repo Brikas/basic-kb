@@ -112,6 +112,8 @@ class SearchRequest(BaseModel):
     cand_min: Optional[int] = None
     cand_max: Optional[int] = None
     strict_rerank: bool = False
+    retrieval: Optional[str] = None      # hybrid | vector | keyword; None = the config's search.retrieval
+    rrf_k: Optional[float] = None        # None = the config's search.rrf_k
 
 
 class IndexRequest(BaseModel):
@@ -245,6 +247,8 @@ def create_app(state: ServerState) -> "FastAPI":
             cand_multiplier=req.cand_multiplier or cfg.cand_multiplier,
             cand_min=req.cand_min or cfg.cand_min, cand_max=req.cand_max or cfg.cand_max,
             strict_rerank=req.strict_rerank,
+            retrieval=req.retrieval or cfg.search_retrieval,
+            rrf_k=cfg.search_rrf_k if req.rrf_k is None else req.rrf_k,
         )
         shape = dict(detailed=req.detailed, max_chars=req.max_chars or 0)
         if req.separate:
@@ -367,6 +371,10 @@ class KBServer:
             # Refuse to serve a store built with another model; every search would be
             # refused anyway, and a watcher would idle forever. The message says what to run.
             self.kb.prepare_model_switch(all_sources, accept=False)
+            # A store from before the keyword index gets it now, under the lock just taken,
+            # so no search ever finds the schema half-way.
+            if self.kb.store.exists():
+                self.kb.store.ensure_schema()
 
             keys = ApiKeyStore(store_dir) if self.auth else None
             if self.auth:

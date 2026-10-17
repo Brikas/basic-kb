@@ -16,6 +16,7 @@ from typing import Optional
 
 from .chunkers import DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK, DEFAULT_OVERLAP
 from .embedders import DEFAULT_MODEL
+from .fusion import DEFAULT_RETRIEVAL, DEFAULT_RRF_K, RETRIEVAL_MODES
 
 
 def load_env_file(path: Path) -> int:
@@ -140,6 +141,8 @@ class Config:
     search_max_chars: Optional[int] = None    # truncate each result (else 0 = full)
     search_content_type: Optional[str] = None # default frontmatter content_type filter
     search_timing: bool = False               # print per-phase search timings to stderr
+    search_retrieval: str = DEFAULT_RETRIEVAL # hybrid | vector | keyword (see fusion.py)
+    search_rrf_k: float = DEFAULT_RRF_K       # rank-fusion constant; smaller favours agreement near the top
     freshness_enabled: bool = True     # post-search staleness reminder
     freshness_stale_after_days: float = 3  # nag only once a source has been stale this long
     freshness_remind_every_days: float = 1  # then re-nag at most this often (once/day) until re-indexed
@@ -229,6 +232,13 @@ def load_config(config_path: Path) -> Config:
     search_n = srch.get("n")
     search_max_chars = srch.get("max_chars")
     search_content_type = srch.get("content_type")
+    search_retrieval = str(srch.get("retrieval") or DEFAULT_RETRIEVAL)
+    if search_retrieval not in RETRIEVAL_MODES:
+        raise ValueError(f"Config {config_path}: search.retrieval must be one of "
+                         f"{', '.join(RETRIEVAL_MODES)}, got {search_retrieval!r}.")
+    search_rrf_k = float(srch.get("rrf_k", DEFAULT_RRF_K))
+    if search_rrf_k < 0:
+        raise ValueError(f"Config {config_path}: search.rrf_k must be >= 0, got {search_rrf_k}.")
 
     fresh = data.get("freshness", {}) or {}
 
@@ -304,6 +314,8 @@ def load_config(config_path: Path) -> Config:
         search_max_chars=int(search_max_chars) if search_max_chars is not None else None,
         search_content_type=str(search_content_type) if search_content_type is not None else None,
         search_timing=bool(srch.get("timing", data.get("timing", False))),
+        search_retrieval=search_retrieval,
+        search_rrf_k=search_rrf_k,
         freshness_enabled=bool(fresh.get("enabled", True)),
         # `every_days` is the old key (single re-check interval); kept as a fallback
         # for the staleness-age threshold so existing configs don't break.

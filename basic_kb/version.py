@@ -6,10 +6,10 @@ response field, a newly required request field, a changed route. Adding an optio
 breaks nothing and needs no bump. Say what broke in the commit message: these two numbers
 are what turns a confusing failure at some call site into one clear message at connect time.
 """
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 MIN_CLIENT_VERSION = "0.3.0"   # oldest client this server will answer
-MIN_SERVER_VERSION = "0.3.0"   # oldest server this client will talk to
+MIN_SERVER_VERSION = "0.4.0"   # oldest server this client will talk to; 0.4.0: an older server ignores `retrieval`
 
 
 def parse_version(value: str) -> tuple:

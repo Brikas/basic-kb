@@ -20,6 +20,8 @@ from .config import Config
 from .embedders import EmbedderBase, build_embedder
 from .errors import IndexNotFound, MassChangeRefused, QueryFailed, StoreError
 from .freshness import FreshnessSettings, FreshnessTracker
+from .fusion import DEFAULT_RETRIEVAL, DEFAULT_RRF_K, RETRIEVAL_MODES, rrf
+from .lexical import build_match
 from .lock import WriterLock
 from .models import (
     FileError, IndexResult, InstanceInfo, PreviewChunk, PreviewFile, ReindexResult, ScanResult, SearchResult,
@@ -737,18 +739,22 @@ class KnowledgeBase:
         cand_max: int = 200,
         strict_rerank: bool = False,
         timing: bool = False,
+        retrieval: str = DEFAULT_RETRIEVAL,
+        rrf_k: float = DEFAULT_RRF_K,
     ) -> list[SearchResult]:
         """Fused multi-query search: all queries pool into ONE ranked list of n hits.
 
-        Each query is run against every source; hits are merged by score (highest wins
-        per chunk) and optionally reranked. Best when the queries are re-framings of the
-        same information need (they reinforce recall). For n hits *per* query instead,
-        use search_grouped(). With timing=True, prints per-phase durations.
+        `retrieval` is "hybrid" (vectors and keywords), "vector" or "keyword". Every query
+        yields one ranked list per retriever, across all sources; the lists are merged by
+        reciprocal rank fusion (`rrf_k`) and the top candidates optionally reranked. Best when
+        the queries are re-framings of the same information need (they reinforce recall). For
+        n hits *per* query instead, use search_grouped(). With timing=True, logs per-phase
+        durations.
         """
         self._require_store()
         return self._run_query_group(
             sources, queries, n, content_type_filter, rerank_candidates,
-            cand_multiplier, cand_min, cand_max, strict_rerank, timing,
+            cand_multiplier, cand_min, cand_max, strict_rerank, timing, retrieval, rrf_k,
         )
 
     def search_grouped(
@@ -763,6 +769,8 @@ class KnowledgeBase:
         cand_max: int = 200,
         strict_rerank: bool = False,
         timing: bool = False,
+        retrieval: str = DEFAULT_RETRIEVAL,
+        rrf_k: float = DEFAULT_RRF_K,
     ) -> list[tuple[str, list[SearchResult]]]:
         """Batch search (msearch-style): each query independently returns its OWN top-n.
 
@@ -774,7 +782,8 @@ class KnowledgeBase:
         for q in queries:
             hits = self._run_query_group(
                 sources, [q], n, content_type_filter, rerank_candidates,
-                cand_multiplier, cand_min, cand_max, strict_rerank, timing, timing_label=q,
+                cand_multiplier, cand_min, cand_max, strict_rerank, timing, retrieval, rrf_k,
+                timing_label=q,
             )
             out.append((q, hits))
         return out
@@ -812,102 +821,185 @@ class KnowledgeBase:
                 f"No index at {self.store.path}. Run: python -m basic_kb index"
             )
 
+    def _ensure_keyword_index(self) -> None:
+        """Build the keyword index of a store written before it existed: a one-time write,
+        so it takes both locks. A served instance does this at start, before any reader."""
+        if self.store.keyword_index_ready():
+            return
+        with self._write_lock, self.writer_lock:
+            self.store.ensure_schema()
+
+    def _keyword_distinct(self, source_ids: list[str], match: str, k: int, content_type_filter):
+        """keyword_search that returns k distinct hits when sources declare dedup keys,
+        widening k the way _knn_distinct does."""
+        want, fetch = k, k
+        while True:
+            rows = self.store.keyword_search(source_ids, match, fetch, content_type_filter)
+            distinct = len({self._hit_key(r.source, r) for r in rows})
+            if distinct >= want or len(rows) < fetch or fetch >= want * self._DEDUP_MAX_WIDEN:
+                return rows
+            fetch *= 2
+
     def _run_query_group(
         self, sources: list[DataSourceBase], queries: list[str], n: int,
         content_type_filter: Optional[str], rerank_candidates: Optional[int],
         cand_multiplier: int, cand_min: int, cand_max: int,
-        strict_rerank: bool, timing: bool, timing_label: str = "",
+        strict_rerank: bool, timing: bool, retrieval: str = DEFAULT_RETRIEVAL,
+        rrf_k: float = DEFAULT_RRF_K, timing_label: str = "",
     ) -> list[SearchResult]:
-        """Run one group of queries into a single ranked list (embed→retrieve→merge→rerank).
+        """Run one group of queries into a single ranked list.
 
-        The reranker scores against queries[0], so a group is one information need.
+        embed → per query, one vector list (cosine) and one keyword list (BM25), each across
+        all sources → reciprocal rank fusion → rerank the top candidates against queries[0],
+        so a group is one information need.
+
+        Lists are per retriever, not per source. Cosine scores are comparable across sources
+        (one model) and so are BM25 scores (one index, one IDF); fusing per source would give
+        a small source's weak top hit the same credit as a large source's strong one.
         """
+        if retrieval not in RETRIEVAL_MODES:
+            raise ValueError(f"retrieval must be one of {', '.join(RETRIEVAL_MODES)}, got {retrieval!r}")
+        use_vector = retrieval in ("hybrid", "vector")
+        use_keyword = retrieval in ("hybrid", "keyword")
         t0 = time.perf_counter()
-        t_embed = t_retrieve = t_rerank = 0.0
-        best: dict[str, SearchResult] = {}
-        missing: list[str] = []      # sources with nothing indexed yet
-        resolved = 0                 # sources that actually got queried
+        t_embed = t_retrieve = t_keyword = t_rerank = 0.0
 
+        # Depth of each ranked list, and how many fused hits reach the reranker:
+        # clamp(n × multiplier, min, max). If min exceeds max (misconfig), min wins.
+        depth = min(max(n * cand_multiplier, cand_min), max(cand_max, cand_min))
         if self.reranker and rerank_candidates is None:
-            # How many top hits to rerank: clamp(n × multiplier, min, max).
-            # If min exceeds max (misconfig), min wins.
-            hi = max(cand_max, cand_min)
-            rerank_candidates = min(max(n * cand_multiplier, cand_min), hi)
-        fetch_n = (rerank_candidates or n) if self.reranker else n
+            rerank_candidates = depth
+        pool = (rerank_candidates or n) if self.reranker else n
 
         self.store.check_model(self.embedder.model_id)       # wrong model = confident nonsense; refuse
-        # Embed each query once; the same vector serves every source.
-        _te = time.perf_counter()
-        q_embs = [self.embedder.query_embed([q])[0] for q in queries]
-        t_embed += time.perf_counter() - _te
+        if use_keyword:
+            self._ensure_keyword_index()
 
+        indexed: list[str] = []
+        missing: list[str] = []      # sources with nothing indexed yet
         for source in sources:
-            if not self.store.source_indexed(source.source_id):
+            if self.store.source_indexed(source.source_id):
+                indexed.append(source.source_id)
+            else:
                 # One un-indexed source among several is a normal, recoverable state.
-                # Every source missing is not — that is caught after the loop.
                 logger.warning("search: no index for source=%s", source.source_id)
                 missing.append(source.source_id)
-                continue
-            resolved += 1
-
-            for q_emb in q_embs:
-                try:
-                    _tr = time.perf_counter()
-                    rows = self._knn_distinct(source.source_id, q_emb, fetch_n, content_type_filter)
-                    t_retrieve += time.perf_counter() - _tr
-                except Exception as e:
-                    # Swallowing this returned an empty list indistinguishable from
-                    # "nothing matched" — a broken store looked like a healthy one.
-                    raise QueryFailed(
-                        f"Query failed on source {source.source_id!r}: {e}"
-                    ) from e
-
-                for row in rows:
-                    full_id = self._hit_key(source.source_id, row)
-                    score = 1.0 - row.distance
-                    if full_id not in best or score > best[full_id].score:
-                        best[full_id] = SearchResult(doc=row.doc, metadata=row.metadata, score=score)
-
-        if resolved == 0:
+        if not indexed:
             raise IndexNotFound(
                 "None of the requested sources are indexed "
                 f"({', '.join(missing) or 'no sources given'}). "
                 "An empty result would be indistinguishable from no matches."
             )
 
-        hits = sorted(best.values(), key=lambda r: r.score, reverse=True)
+        # Embed each query once. A keyword-only run embeds too: every hit's `score` is its
+        # cosine similarity, whichever retriever found it.
+        _te = time.perf_counter()
+        q_embs = [self.embedder.query_embed([q])[0] for q in queries]
+        t_embed += time.perf_counter() - _te
+
+        hits: dict[str, SearchResult] = {}   # hit key -> the representative row, as a result
+        rowids: dict[str, int] = {}
+        best_cos: dict[str, float] = {}
+        lists: list[list[str]] = []
+        kinds: list[str] = []
+
+        def take(key: str, row, cosine: Optional[float]) -> None:
+            """Keep, per hit, the row with the highest cosine seen (as the merge always did)."""
+            if key not in hits or (cosine is not None and cosine > best_cos.get(key, -2.0)):
+                hits[key] = SearchResult(doc=row.doc, metadata=row.metadata,
+                                         score=cosine if cosine is not None else 0.0)
+                rowids[key] = row.rowid
+            if cosine is not None and cosine > best_cos.get(key, -2.0):
+                best_cos[key] = cosine
+
+        try:
+            for q, q_emb in zip(queries, q_embs):
+                if use_vector:
+                    _tr = time.perf_counter()
+                    rows = [r for sid in indexed
+                            for r in self._knn_distinct(sid, q_emb, depth, content_type_filter)]
+                    t_retrieve += time.perf_counter() - _tr
+                    rows.sort(key=lambda r: r.distance)
+                    ranked = []
+                    for r in rows:
+                        key = self._hit_key(r.source, r)
+                        take(key, r, 1.0 - r.distance)
+                        ranked.append(key)
+                    lists.append(list(dict.fromkeys(ranked)))
+                    kinds.append("vector")
+                match = build_match(q) if use_keyword else None
+                if match is not None:
+                    _tk = time.perf_counter()
+                    rows = self._keyword_distinct(indexed, match, depth, content_type_filter)
+                    t_keyword += time.perf_counter() - _tk
+                    ranked = []
+                    for r in rows:
+                        key = self._hit_key(r.source, r)
+                        take(key, r, None)
+                        ranked.append(key)
+                    lists.append(list(dict.fromkeys(ranked)))
+                    kinds.append("keyword")
+        except StoreError:
+            raise
+        except Exception as e:
+            # Swallowing this returned an empty list indistinguishable from "nothing
+            # matched" — a broken store looked like a healthy one.
+            raise QueryFailed(f"Query failed on sources {indexed}: {e}") from e
+
+        # A hit only the keyword list found still gets a cosine, from its stored vector.
+        unknown = [key for key in hits if key not in best_cos]
+        if unknown:
+            for q_emb in q_embs:
+                dists = self.store.cosine_distances([rowids[key] for key in unknown], q_emb)
+                for key in unknown:
+                    d = dists.get(rowids[key])
+                    if d is not None and 1.0 - d > best_cos.get(key, -2.0):
+                        best_cos[key] = 1.0 - d
+            for key in unknown:
+                if key not in best_cos:
+                    logger.warning("search: hit %s has no stored vector; score left at 0", key)
+                hits[key].score = best_cos.get(key, 0.0)
+
+        for ranked, kind in zip(lists, kinds):
+            for rank, key in enumerate(ranked, start=1):
+                found = hits[key].matched_by
+                found[kind] = min(found.get(kind, rank), rank)
+        ordered = []
+        for key, fused in rrf(lists, k=rrf_k):
+            hits[key].fused_score = fused
+            ordered.append(hits[key])
 
         _trr = time.perf_counter()
-        if self.reranker and hits:
-            candidates = hits[: rerank_candidates or n]
+        if self.reranker and ordered:
+            candidates = ordered[:pool]
             try:
-                hits = self.reranker.rerank(queries[0], candidates, top_n=n)
+                result = self.reranker.rerank(queries[0], candidates, top_n=n)
             except Exception as e:
                 if strict_rerank:
                     raise
-                logger.warning("reranking failed, falling back to cosine scores: %s", e)
-                hits = hits[:n]
+                logger.warning("reranking failed, falling back to the fused order: %s", e)
+                result = ordered[:n]
         else:
-            hits = hits[:n]
+            result = ordered[:n]
         t_rerank = time.perf_counter() - _trr
 
         if timing:
             label = f" [{timing_label}]" if timing_label else ""
             logger.info(
-                "timing (ms)%s: embed=%.0f retrieve=%.0f rerank=%.0f total=%.0f "
+                "timing (ms)%s: embed=%.0f vector=%.0f keyword=%.0f rerank=%.0f total=%.0f "
                 "[cold process — embed & rerank include one-time model load]",
-                label, t_embed * 1000, t_retrieve * 1000, t_rerank * 1000,
+                label, t_embed * 1000, t_retrieve * 1000, t_keyword * 1000, t_rerank * 1000,
                 (time.perf_counter() - t0) * 1000,
             )
 
         logger.info(
-            "search: sources=%s queries=%r n=%d candidates=%s hits=%d "
-            "embed_ms=%d retrieve_ms=%d rerank_ms=%d reranker=%s",
-            [s.source_id for s in sources], queries, n, rerank_candidates, len(hits),
-            t_embed * 1000, t_retrieve * 1000, t_rerank * 1000,
+            "search: sources=%s queries=%r n=%d retrieval=%s lists=%d candidates=%s hits=%d "
+            "embed_ms=%d vector_ms=%d keyword_ms=%d rerank_ms=%d reranker=%s",
+            [s.source_id for s in sources], queries, n, retrieval, len(lists), rerank_candidates,
+            len(result), t_embed * 1000, t_retrieve * 1000, t_keyword * 1000, t_rerank * 1000,
             type(self.reranker).__name__ if self.reranker else None,
         )
-        return hits
+        return result
 
     def info(self, sources: list[DataSourceBase], name: str = "") -> InstanceInfo:
         """Describe the knowledge base: what each source holds and how big it is.

@@ -11,6 +11,8 @@ Multi-query search, merged into one ranked list (re-framings of one need = bette
   python -m basic_kb search "price too high" "budget concern" --config CFG
 Batch mode — each query returns its own top-n block (different needs in one call):
   python -m basic_kb search "coffee gear" "tax deadlines" --separate --config CFG
+Retrieval — hybrid (default) fuses vector and keyword lists; one side alone:
+  python -m basic_kb search "basic_kb/core.py ECONNREFUSED" --retrieval keyword
 
 Embedding / chunking overrides (override config defaults for one run):
   --model NAME  --chunk-size N  --overlap N  --min-chunk N
@@ -39,6 +41,7 @@ from .freshness import FreshnessTracker
 from .keys import ApiKeyStore
 from .version import __version__
 from .core import DEFAULT_N, KnowledgeBase, cores_to_threads, lower_process_priority, setup_file_logging
+from .fusion import RETRIEVAL_MODES
 from .embedders import FastEmbedEmbedder
 from .render import (
     emit_json, print_info, print_inspect, print_origin, print_results, print_sources, print_status,
@@ -367,6 +370,12 @@ def cmd_search(args: argparse.Namespace, config: Config) -> None:
         strict_rerank=getattr(args, "rerank", False),
         timing=timing,
     )
+    # A served instance applies its own `search:` defaults; a client config's would override
+    # them, so an attached run sends only what the flags say.
+    attached = isinstance(kb, RemoteKnowledgeBase)
+    common["retrieval"] = getattr(args, "retrieval", None) or (None if attached else config.search_retrieval)
+    rrf_k = getattr(args, "rrf_k", None)
+    common["rrf_k"] = rrf_k if rrf_k is not None else (None if attached else config.search_rrf_k)
 
     # Batch mode: each query gets its OWN top-n block (no cross-query merging).
     as_json = getattr(args, "json", False)
@@ -677,6 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
             "        instance instead of opening the store; --no-attach runs locally, --attach URL\n"
             "        [--api-key K] points at a different one. `status` says which it used.\n\n"
             "Search flags:  --n N (results)  --separate (batch: n per query)  --max-chars N  --content-type T  --timing\n"
+            "               --retrieval hybrid|vector|keyword  --rrf-k K\n"
             "Reranking:     --reranker local|jina-compatible|deepinfra-compatible|none  --reranker-model M  --no-rerank  --rerank (strict)\n"
             "Index flags:   --force  --switch-model  --limit N [--limit-per-source]  --preview [--file NAME]  --yes  --no-reindex-guard\n"
             "Throttle:      --throttle  --cores-fraction F  --priority low|normal  --pause-ms MS [--pause-every N]\n"
@@ -756,6 +766,15 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--fused", "--merge", dest="fused", action="store_true",
                       help="Force fused mode (one merged ranked list), overriding a "
                            "`search.separate: true` default in the config.")
+    p_search.add_argument("--retrieval", choices=RETRIEVAL_MODES, default=None,
+                          help="Which ranked lists to build and fuse: hybrid (vectors and keywords), "
+                               "vector (meaning only) or keyword (BM25 only). Default: "
+                               "`search.retrieval` in the config, else hybrid. Example: "
+                               "search \"ECONNREFUSED traefik\" --retrieval keyword")
+    p_search.add_argument("--rrf-k", type=float, default=None, metavar="K",
+                          help="Rank-fusion constant: a hit at rank r in a list adds 1/(K+r). Smaller "
+                               "favours hits several lists agree on near the top. Default: "
+                               "`search.rrf_k`, else 20. Example: --rrf-k 60")
     p_search.add_argument("--n", type=int, default=None, metavar="N",
                           help=f"Number of results (default: {DEFAULT_N}, or `search.n` in the config). "
                                f"In --separate mode, per query.")

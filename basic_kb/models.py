@@ -12,14 +12,22 @@ BOOKKEEPING_METADATA = frozenset({"content_hash", "position", "chunk_index", "fi
 
 @dataclass
 class SearchResult:
+    """One hit. `score` is cosine similarity to the query (for a keyword-only hit, read from
+    its stored vector). `fused_score` is the rank-fusion score that ordered the candidates,
+    `matched_by` the best 1-based rank each retriever gave it, e.g. {"vector": 3, "keyword": 1}.
+    The reranker's score, when there is one, decides the final order."""
     doc: str
     metadata: dict
     score: float
     rerank_score: Optional[float] = None
+    fused_score: Optional[float] = None
+    matched_by: dict = field(default_factory=dict)
 
     @property
     def sort_key(self) -> float:
-        return self.rerank_score if self.rerank_score is not None else self.score
+        if self.rerank_score is not None:
+            return self.rerank_score
+        return self.fused_score if self.fused_score is not None else self.score
 
     def trimmed(self, detailed: bool = False, max_chars: int = 0) -> "SearchResult":
         """A copy shaped for a machine reader. `detailed` keeps every stored field;
@@ -31,7 +39,8 @@ class SearchResult:
         meta = self.metadata if detailed else {
             k: v for k, v in self.metadata.items() if k not in BOOKKEEPING_METADATA}
         doc = self.doc if not max_chars else self.doc[:max_chars]
-        return SearchResult(doc=doc, metadata=meta, score=self.score, rerank_score=self.rerank_score)
+        return SearchResult(doc=doc, metadata=meta, score=self.score, rerank_score=self.rerank_score,
+                            fused_score=self.fused_score, matched_by=dict(self.matched_by))
 
 
 @dataclass

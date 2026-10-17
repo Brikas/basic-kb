@@ -1,6 +1,6 @@
 # basic-kb
 
-A small, config-driven semantic search engine over markdown/text. Run locally (FastEmbed/ONNX) or through any OpenAI-compatible API, vectors live in a single SQLite file via sqlite-vec with exact cosine search. Supports reranking.
+A small, config-driven search engine over markdown/text. Hybrid by default: exact cosine search over vectors (sqlite-vec) and BM25 keyword search (SQLite FTS5) in one SQLite file, fused by reciprocal rank, then optionally reranked. Embeds locally (FastEmbed/ONNX) or through any OpenAI-compatible API.
 
 An **instance** is a config file: a store dir and a list of sources. Three ways to drive it, kept on par by a test: CLI, module, HTTP API.
 
@@ -18,7 +18,7 @@ Run from the folder holding `basic-kb.yaml` ([example](basic-kb.example.yaml)); 
 
 ```bash
 basic-kb index                  # incremental; --force --switch-model --limit N --preview
-basic-kb search "a statement the note would contain"   # --n --separate --source --content-type
+basic-kb search "a statement the note would contain"   # --n --separate --source --content-type --retrieval
 basic-kb status                 # counts, staleness, index age
 basic-kb scan                   # what changed since the last index
 basic-kb info                   # what each source holds
