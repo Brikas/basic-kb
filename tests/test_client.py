@@ -25,6 +25,22 @@ def test_health_and_info(remote, served):
     assert isinstance(inf, InstanceInfo) and inf.total_chunks == 8 and inf.sources[0].chunks_per_file == 1.5
 
 
+def test_index_waits_past_the_default_timeout_while_other_calls_keep_it(served, monkeypatch):
+    # An index run answers only when it is done, which can take hours.
+    import basic_kb.core as core_mod
+    import time
+    remote = RemoteKnowledgeBase(served.url, timeout=0.5)
+    real = core_mod.KnowledgeBase.index_many
+    monkeypatch.setattr(core_mod.KnowledgeBase, "index_many",
+                        lambda self, *a, **k: (time.sleep(1.5), real(self, *a, **k))[1])
+    assert [r.source_id for r in remote.index_many("notes")] == ["notes"]
+    seen = []
+    real_request = remote._session.request
+    monkeypatch.setattr(remote._session, "request", lambda *a, **k: seen.append(k["timeout"]) or real_request(*a, **k))
+    remote.info()
+    assert seen == [0.5]
+
+
 def test_status_and_scan_accept_objects_or_ids(remote, sources, notes):
     st = remote.status(sources)
     assert [type(s) for s in st] == [SourceStatus, SourceStatus] and st[0].pending == 0

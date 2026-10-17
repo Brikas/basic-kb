@@ -28,6 +28,10 @@ from .version import MIN_SERVER_VERSION, __version__, parse_version
 
 API_KEY_ENV = "BASIC_KB_API_KEY"
 
+# Passed as `timeout` for calls that legitimately run for hours, like an index run: the
+# server answers only when the work is done.
+WAIT_FOREVER = object()
+
 
 class RemoteError(BasicKBError):
     """The server could not be reached, or answered with something the client cannot map."""
@@ -65,11 +69,16 @@ class RemoteKnowledgeBase:
     # --- transport -----------------------------------------------------------------------
 
     def _request(self, method: str, path: str, *, json: Any = None, params: Optional[dict] = None,
-                 timeout: Optional[float] = None) -> Any:
+                 timeout: Any = None) -> Any:
+        """`timeout` None means this client's default; WAIT_FOREVER means no read timeout at all."""
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        if timeout is WAIT_FOREVER:
+            timeout = (10.0, None)                 # still fail fast on connect, never on a long read
+        elif timeout is None:
+            timeout = self.timeout
         try:
             r = self._session.request(method, self.url + path, json=json, params=params, headers=headers,
-                                      timeout=self.timeout if timeout is None else timeout)
+                                      timeout=timeout)
         except requests.RequestException as e:
             raise RemoteError(f"cannot reach the basic-kb server at {self.url}: {e}") from e
         if r.status_code >= 400:
@@ -185,12 +194,12 @@ class RemoteKnowledgeBase:
         if on_progress is not None:
             on_progress(f"Indexing on the served instance at {self.url} (progress is reported when it finishes)…")
         try:
-            data = self._request("POST", "/index", json=body, timeout=None)
+            data = self._request("POST", "/index", json=body, timeout=WAIT_FOREVER)
         except MassChangeRefused as refused:
             if on_confirm is None or not on_confirm(refused):
                 raise
             body["yes"] = True
-            data = self._request("POST", "/index", json=body, timeout=None)
+            data = self._request("POST", "/index", json=body, timeout=WAIT_FOREVER)
         results = [from_dict(IndexResult, d) for d in data]
         if on_progress is not None:
             for r in results:
